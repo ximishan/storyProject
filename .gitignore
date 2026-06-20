@@ -1,0 +1,9 @@
+node_modules/
+dist/
+release/
+release-*/
+*.log
+*.tsbuildinfo
+.smoke-output/
+.fail-output/
+.feature-smoke/

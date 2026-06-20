@@ -1,0 +1,2 @@
+file 'D:\storybound\source\.workflow-smoke\阶段流程冒烟测试_workflow\render\001.mp4'
+file 'D:\storybound\source\.workflow-smoke\阶段流程冒烟测试_workflow\render\002.mp4'

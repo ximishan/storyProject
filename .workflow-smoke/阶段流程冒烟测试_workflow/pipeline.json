@@ -1,0 +1,37 @@
+{
+  "title": "阶段流程冒烟测试",
+  "summary": "雨停以后，少年走出车站。远方的灯光亮起，他终于找到了回家的路。",
+  "narration": "雨停以后，少年走出车站。远方的灯光亮起，他终于找到了回家的路。",
+  "scenes": [
+    {
+      "index": 1,
+      "narration": "雨停以后，少年推开车站大门。",
+      "visual": "雨停以后，少年走出车站。",
+      "image_prompt": "雨后车站，少年推门而出，电影感光影",
+      "duration_hint": 3,
+      "speaker_role": "A",
+      "speaker_name": "",
+      "speaker_id": "",
+      "image_path": "D:\\storybound\\source\\.workflow-smoke\\阶段流程冒烟测试_workflow\\images\\1.png",
+      "image_provider": "placeholder",
+      "source_url": "",
+      "audio_path": "D:\\storybound\\source\\.workflow-smoke\\阶段流程冒烟测试_workflow\\audio\\1.wav",
+      "duration": 4.05
+    },
+    {
+      "index": 2,
+      "narration": "远方的灯光亮起，他终于找到了回家的路。",
+      "visual": "远方的灯光亮起，他终于找到了回家的路。",
+      "image_prompt": "cinematic风格，远方的灯光亮起，他终于找到了回家的路。，主体明确，构图完整，适合9:16短视频画面，无文字无水印",
+      "duration_hint": 4.523809523809524,
+      "speaker_role": "A",
+      "speaker_name": "",
+      "speaker_id": "",
+      "image_path": "D:\\storybound\\source\\.workflow-smoke\\阶段流程冒烟测试_workflow\\images\\2.png",
+      "image_provider": "placeholder",
+      "source_url": "",
+      "audio_path": "D:\\storybound\\source\\.workflow-smoke\\阶段流程冒烟测试_workflow\\audio\\2.wav",
+      "duration": 4.85
+    }
+  ]
+}

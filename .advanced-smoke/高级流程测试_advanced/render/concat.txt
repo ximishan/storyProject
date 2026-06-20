@@ -1,0 +1,2 @@
+file 'D:\storybound\source\.advanced-smoke\高级流程测试_advanced\render\001.mp4'
+file 'D:\storybound\source\.advanced-smoke\高级流程测试_advanced\render\002.mp4'

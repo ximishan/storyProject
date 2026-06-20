@@ -1,0 +1,53 @@
+{
+  "id": "advanced-flow",
+  "title": "高级流程测试",
+  "input_text": "我在橱窗里看到一盏灯，点击链接即可购买。后来我带着它走进雨夜。故事最终告诉我们，微光也能照亮回家的路。",
+  "track": "character-story",
+  "style": "cinematic",
+  "ratio": "9:16",
+  "target_scenes": 2,
+  "target_length": 90,
+  "rewrite_intensity": "deep",
+  "narrative_pov": "third",
+  "keep_promotion": 0,
+  "material_source": "ai",
+  "tts_speed": 1,
+  "reference_image_path": "D:\\storybound\\source\\.advanced-smoke\\reference.png",
+  "cover_image_mode": "title",
+  "cover_template": {
+    "title_position": "center",
+    "title_color": "#FFE066",
+    "prompt": "电影海报"
+  },
+  "draft_template": {
+    "canvas": {
+      "width": 1080,
+      "height": 1920,
+      "ratio": "9:16"
+    },
+    "image": {
+      "ratio": "9:16",
+      "fit": "cover",
+      "top": 0,
+      "height": 1,
+      "animation": "缩放"
+    },
+    "title": {
+      "visible": true,
+      "fontSize": 30,
+      "color": "#FFE066",
+      "y": 0.08
+    },
+    "caption": {
+      "visible": true,
+      "fontSize": 22,
+      "color": "#88FFCC",
+      "y": -0.16,
+      "maxCharsPerLine": 12
+    },
+    "audio": {
+      "narrationVolume": 10,
+      "bgmVolume": 2
+    }
+  }
+}
