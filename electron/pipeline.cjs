@@ -1,185 +1,17 @@
 const fs = require("node:fs");
 const path = require("node:path");
-const { ProxyAgent } = require("undici");
-const { generateSceneImage, synthesizeSpeech, mediaDuration, resolveResource } = require("./services.cjs");
+const {
+  generateSceneImage, generateRunningHubVideo, synthesizeSpeech,
+  mediaDuration, resolveResource
+} = require("./services.cjs");
 const { renderVideo } = require("./media.cjs");
 const { generateJianyingDraft } = require("./draft.cjs");
 const { generateCover } = require("./cover.cjs");
-
-const systemPromptTemplates = Object.fromEntries(
-  require("../shared/system-prompt-templates.json").map(item => [item.id, item])
-);
-
-const systemPrompt = `你是一名专业短视频编导。请把用户提供的原始文案整理成可制作的视频脚本。
-必须只返回合法 JSON，不要使用 Markdown 代码块。JSON 结构如下：
-{
-  "title": "视频标题",
-  "summary": "一句话简介",
-  "narration": "优化后的完整旁白",
-  "scenes": [
-    {
-      "index": 1,
-      "narration": "本镜头对应旁白",
-      "visual": "画面内容说明",
-      "image_prompt": "详细的中文图片生成提示词",
-      "duration_hint": 5
-    }
-  ]
-}
-旁白应自然、有节奏；每个镜头只表达一个明确视觉重点；保持原文核心事实，不编造具体数据。`;
-
-function llmFetch(url, options, proxyUrl) {
-  return fetch(url, {
-    ...options,
-    ...(proxyUrl ? { dispatcher: new ProxyAgent(proxyUrl) } : {})
-  });
-}
-
-async function callLanguageModel(config, task) {
-  const llm = config.llm;
-  if (llm?.provider === "local" || llm?.protocol === "local") {
-    let sourceText = task.input_text;
-    const processingMode = task.processing_mode || "auto";
-    if (processingMode !== "direct") {
-      if (!task.keep_promotion) sourceText = sourceText.replace(/(?:点击|下单|购买|链接|橱窗|优惠|关注)[^。！？]*[。！？]?/g, "");
-      if (task.narrative_pov === "first") sourceText = sourceText.replace(/(?:他|她|主人公|这个人)/g, "我");
-      if (task.narrative_pov === "third") sourceText = sourceText.replace(/\b我\b/g, "他");
-    }
-    if (processingMode === "auto" && task.rewrite_intensity === "deep") {
-      sourceText = sourceText.replace(/后来/g, "此后").replace(/但是/g, "然而").replace(/因为/g, "缘由在于");
-    } else if (processingMode === "auto" && task.rewrite_intensity === "original") {
-      sourceText = `故事要从一个容易被忽略的瞬间说起。${sourceText}回头看，这段经历真正留下的，是选择背后的意义。`;
-    }
-    if (task.target_length && sourceText.length > Number(task.target_length) * 1.15) {
-      sourceText = sourceText.slice(0, Number(task.target_length));
-    }
-    const pieces = sourceText
-      .split(/(?<=[。！？!?；;])|\n+/)
-      .map(item => item.trim())
-      .filter(Boolean);
-    const targetFromLength = task.target_length ? Math.max(1, Math.round(Number(task.target_length) / 35)) : 0;
-    const target = Math.max(1, Number(task.target_scenes || targetFromLength || 8));
-    let scenes = [];
-    const chunkSize = Math.max(1, Math.ceil(pieces.length / target));
-    for (let i = 0; i < pieces.length; i += chunkSize) {
-      const narration = pieces.slice(i, i + chunkSize).join("");
-      scenes.push({
-        index: scenes.length + 1,
-        narration,
-        visual: narration,
-        image_prompt: `${task.style}风格，${narration}，主体明确，构图完整，适合${task.ratio}短视频画面，无文字无水印`,
-        duration_hint: Math.max(3, Math.min(12, narration.length / 4.2))
-      });
-    }
-    if (!scenes.length) throw new Error("原始文案为空");
-    if (task.task_type === "podcast") {
-      const pair = podcastSpeakerPair(task.podcast_speakers);
-      scenes = scenes.map((scene, index) => ({
-        ...scene,
-        speaker_role: index % 2 ? "B" : "A",
-        speaker_name: index % 2 ? pair[1].name : pair[0].name,
-        speaker_id: index % 2 ? pair[1].id : pair[0].id
-      }));
-    }
-    const narration = scenes.map(scene => scene.narration).join("");
-    return JSON.stringify({
-      title: task.title,
-      summary: task.input_text.slice(0, 80),
-      narration,
-      scenes
-    });
-  }
-  if (!llm?.api_key) throw new Error("尚未配置语言模型 API Key，请先前往设置");
-  const systemTemplate = systemPromptTemplates[task.prompt_template_id] || {};
-  const customRewrite = task.prompt_template?.step1_rewrite_system_prompt || systemTemplate.step1_rewrite_system_prompt || "";
-  const customMetadata = task.prompt_template?.step1_metadata_system_prompt || systemTemplate.step1_metadata_system_prompt || "";
-  const customScenes = task.prompt_template?.step3_system_prompt || systemTemplate.step3_system_prompt || "";
-  const skeletonModules = task.prompt_template?.step3_skeleton_modules_json || systemTemplate.step3_skeleton_modules_json || "[]";
-  const imageSeedPools = task.prompt_template?.image_seed_pools_json || systemTemplate.image_seed_pools_json || "[]";
-  const referenceKind = task.prompt_template?.reference_kind || systemTemplate.reference_kind || "";
-  const userPrompt = `内容类型：${task.track}
-视频形态：${task.task_type === "podcast" ? "双人播客，两位主播轮流对话；每个 scenes 项必须提供 speaker_role(A/B)" : "单人旁白"}
-处理模式：${task.processing_mode || "auto"}（auto=完整改写，semi=保留原文仅智能分句，direct=机械分句）
-视觉风格：${task.style}
-画面比例：${task.ratio}
-改写强度：${task.rewrite_intensity || "standard"}
-叙事视角：${task.narrative_pov || "original"}
-目标字数：${task.target_length || "跟随原文"}
-目标分镜数：${task.target_scenes || "根据篇幅自动决定"}
-是否保留推广内容：${task.keep_promotion ? "保留" : "删除"}
-${customRewrite ? `\n自定义文案要求：${customRewrite}` : ""}
-${customMetadata ? `\n元数据提取要求：${customMetadata}` : ""}
-${customScenes ? `\n自定义分镜要求：${customScenes}` : ""}
-分镜骨架模块：${skeletonModules}
-图片种子池：${imageSeedPools}
-参考图类型：${referenceKind || "自动"}
-
-原始文案：
-${task.input_text}`;
-
-  if (llm.protocol === "anthropic") {
-    const endpoint = `${llm.base_url.replace(/\/$/, "")}/v1/messages`;
-    const response = await llmFetch(endpoint, {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": llm.api_key,
-        "anthropic-version": "2023-06-01"
-      },
-      body: JSON.stringify({
-        model: llm.model,
-        max_tokens: 8192,
-        system: systemPrompt,
-        messages: [{ role: "user", content: userPrompt }]
-      })
-    }, llm.proxy_url);
-    const payload = await response.json();
-    if (!response.ok) throw new Error(payload?.error?.message || `模型请求失败 (${response.status})`);
-    return payload.content?.filter(item => item.type === "text").map(item => item.text).join("\n") || "";
-  }
-
-  const endpoint = `${llm.base_url.replace(/\/$/, "")}/chat/completions`;
-  const response = await llmFetch(endpoint, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      authorization: `Bearer ${llm.api_key}`
-    },
-    body: JSON.stringify({
-      model: llm.model,
-      temperature: 0.7,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt }
-      ]
-    })
-  }, llm.proxy_url);
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload?.error?.message || `模型请求失败 (${response.status})`);
-  return payload.choices?.[0]?.message?.content || "";
-}
-
-function parseModelJson(text) {
-  const cleaned = text.trim()
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/\s*```$/, "");
-  const data = JSON.parse(cleaned);
-  if (!data.title || !data.narration || !Array.isArray(data.scenes)) {
-    throw new Error("语言模型返回的数据结构不完整");
-  }
-  data.scenes = data.scenes.map((scene, index) => ({
-    index: index + 1,
-    narration: String(scene.narration || ""),
-    visual: String(scene.visual || ""),
-    image_prompt: String(scene.image_prompt || scene.visual || ""),
-    duration_hint: Number(scene.duration_hint) || 5,
-    speaker_role: scene.speaker_role === "B" ? "B" : "A",
-    speaker_name: String(scene.speaker_name || ""),
-    speaker_id: String(scene.speaker_id || "")
-  }));
-  return data;
-}
+const { planVideoScript } = require("./llm-planner.cjs");
+const {
+  atomicWriteJson, atomicWriteFile, readJsonSafe, fileLooksUsable,
+  retryOperation, fingerprint
+} = require("./checkpoint.cjs");
 
 function podcastSpeakerPair(id) {
   if (id === "liufei-xiaolei") {
@@ -202,7 +34,7 @@ function shouldPauseAfter(task, step) {
 }
 
 function safeFolderName(value) {
-  return value.replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim().slice(0, 60) || "untitled";
+  return String(value || "").replace(/[<>:"/\\|?*\x00-\x1F]/g, "_").trim().slice(0, 60) || "untitled";
 }
 
 function taskOutputDir(task, config, baseOutputDir) {
@@ -212,18 +44,90 @@ function taskOutputDir(task, config, baseOutputDir) {
   );
 }
 
-async function preparePipeline({ task, config, baseOutputDir, emit }) {
+function initialSceneState(scene) {
+  return {
+    image_status: "pending",
+    image_attempts: 0,
+    image_error: "",
+    image_remote_task_id: "",
+    image_remote_provider: "",
+    audio_status: "pending",
+    audio_attempts: 0,
+    audio_error: "",
+    video_status: "pending",
+    video_attempts: 0,
+    video_remote_task_id: "",
+    video_remote_model: "",
+    render_clip_status: "pending",
+    ...scene
+  };
+}
+
+function mergeSceneState(scene, previous) {
+  if (!previous || previous.narration !== scene.narration || previous.image_prompt !== scene.image_prompt) {
+    return initialSceneState(scene);
+  }
+  return initialSceneState({ ...scene, ...previous, index: scene.index, narration: scene.narration, image_prompt: scene.image_prompt });
+}
+
+function usableAsset(filePath, minBytes = 256) {
+  return fileLooksUsable(filePath, minBytes);
+}
+
+async function usableMedia(app, config, filePath) {
+  if (!usableAsset(filePath, 1024)) return false;
+  try {
+    const duration = await mediaDuration(app, config, filePath);
+    return Number.isFinite(duration) && duration > 0.05;
+  } catch {
+    return false;
+  }
+}
+
+function removePartial(filePath) {
+  if (!filePath) return;
+  try { fs.rmSync(filePath, { force: true }); } catch {}
+}
+
+function pipelineSnapshot(script, scenes, runtime) {
+  return {
+    ...script,
+    checkpoint_version: 2,
+    runtime: {
+      ...runtime,
+      checkpoint_version: 2,
+      updated_at: new Date().toISOString()
+    },
+    scenes
+  };
+}
+
+async function preparePipeline({ task, config, baseOutputDir, emit, checkpoint = () => {} }) {
   const outputDir = taskOutputDir(task, config, baseOutputDir);
   fs.mkdirSync(outputDir, { recursive: true });
-  fs.writeFileSync(path.join(outputDir, "source.json"), JSON.stringify(task, null, 2), "utf8");
+  checkpoint({ outputDir, currentStage: "planning", currentStep: 1 });
 
-  emit(1, "正在分析原始文案");
-  emit(2, "正在重写旁白并拆分镜头");
-  const raw = await callLanguageModel(config, task);
-  fs.writeFileSync(path.join(outputDir, "model-response.txt"), raw, "utf8");
+  const sourceSnapshot = { ...task };
+  delete sourceSnapshot.shouldCancel;
+  if (sourceSnapshot.prompt_template?.api_key) sourceSnapshot.prompt_template.api_key = "***";
+  atomicWriteJson(path.join(outputDir, "source.json"), sourceSnapshot);
 
-  emit(3, "正在校验脚本结构");
-  const script = parseModelJson(raw);
+  emit(1, "正在分析原始文案与模板规则");
+  emit(2, "正在改写文案、提取人物档案并生成分镜");
+  const script = await planVideoScript({
+    config,
+    task,
+    outputDir,
+    onStage: (stage, status) => checkpoint({
+      outputDir,
+      currentStage: stage,
+      currentStep: stage === "03-scenes" ? 3 : 2,
+      detail: status
+    })
+  });
+  atomicWriteJson(path.join(outputDir, "model-response.txt"), script);
+
+  emit(3, "正在校验分镜、提示词和参考图标记");
   if (task.task_type === "podcast") {
     const pair = podcastSpeakerPair(task.podcast_speakers);
     script.scenes = script.scenes.map((scene, index) => {
@@ -232,81 +136,146 @@ async function preparePipeline({ task, config, baseOutputDir, emit }) {
     });
     script.narration = script.scenes.map(scene => `${scene.speaker_name}：${scene.narration}`).join("\n");
   }
-  const selectedSystemTemplate = systemPromptTemplates[task.prompt_template_id] || {};
-  const imagePromptTemplate = task.prompt_template?.image_prompt_template || selectedSystemTemplate.image_prompt_template || "";
-  if (imagePromptTemplate) {
-    script.scenes = script.scenes.map(scene => ({
-      ...scene,
-      image_prompt: imagePromptTemplate
-        .replaceAll("{visual_action}", scene.image_prompt || scene.visual)
-        .replaceAll("{ratio}", task.ratio || "9:16")
-        .replaceAll("{character_card}", "")
-        .replaceAll("{product_card}", "")
-        .replaceAll("{era_and_location}", "")
-        .replace(/\s*，\s*，+/g, "，")
-    }));
-  }
-  fs.writeFileSync(path.join(outputDir, "script.json"), JSON.stringify(script, null, 2), "utf8");
-  fs.writeFileSync(path.join(outputDir, "narration.txt"), script.narration, "utf8");
-  return { outputDir, script };
+  script.scenes = script.scenes.map(initialSceneState);
+  const runtime = {
+    current_stage: "script_ready",
+    current_step: 3,
+    planning_status: "completed",
+    render_status: "pending",
+    cover_status: "pending",
+    draft_status: "pending",
+    final_video: "",
+    subtitle_path: "",
+    draft_dir: "",
+    cover_path: ""
+  };
+  const prepared = pipelineSnapshot(script, script.scenes, runtime);
+  atomicWriteJson(path.join(outputDir, "script.json"), prepared);
+  atomicWriteFile(path.join(outputDir, "narration.txt"), script.narration, "utf8");
+  atomicWriteJson(path.join(outputDir, "pipeline.json"), prepared);
+  checkpoint({ outputDir, pipeline: prepared, currentStage: "script_ready", currentStep: 3 });
+  return { outputDir, script: prepared };
 }
 
-async function completePipeline({ app, task, config, outputDir, script, emit }) {
+async function completePipeline({ app, task, config, outputDir, script, emit, checkpoint = () => {} }) {
   const imagesDir = path.join(outputDir, "images");
   const audioDir = path.join(outputDir, "audio");
   fs.mkdirSync(imagesDir, { recursive: true });
   fs.mkdirSync(audioDir, { recursive: true });
 
   const pipelinePath = path.join(outputDir, "pipeline.json");
-  let persisted = null;
-  if (fs.existsSync(pipelinePath)) {
-    try { persisted = JSON.parse(fs.readFileSync(pipelinePath, "utf8")); } catch {}
-  }
+  const persisted = readJsonSafe(pipelinePath, null);
+  const baseScript = persisted?.scenes?.length ? persisted : script;
+  if (!Array.isArray(baseScript?.scenes) || !baseScript.scenes.length) throw new Error("断点数据中没有可用分镜");
   const workingScenes = script.scenes.map(scene => {
-    const previous = persisted?.scenes?.find(item => Number(item.index) === Number(scene.index));
-    if (!previous || previous.narration !== scene.narration || previous.image_prompt !== scene.image_prompt) {
-      return { ...scene };
-    }
-    return {
-      ...scene, image_path: previous.image_path, image_provider: previous.image_provider,
-      source_url: previous.source_url, audio_path: previous.audio_path, duration: previous.duration
-    };
+    const previous = baseScript?.scenes?.find(item => Number(item.index) === Number(scene.index));
+    return mergeSceneState(scene, previous);
   });
-  const persist = () => fs.writeFileSync(
-    pipelinePath,
-    JSON.stringify({ ...script, scenes: workingScenes }, null, 2),
-    "utf8"
-  );
+  const runtime = {
+    current_stage: "images",
+    current_step: 4,
+    planning_status: "completed",
+    render_status: "pending",
+    cover_status: "pending",
+    draft_status: "pending",
+    final_video: "",
+    subtitle_path: "",
+    draft_dir: "",
+    cover_path: "",
+    ...(baseScript.runtime || {}),
+    ...(script.runtime || {})
+  };
+  const persist = (patch = {}) => {
+    Object.assign(runtime, patch);
+    const snapshot = pipelineSnapshot(script, workingScenes, runtime);
+    atomicWriteJson(pipelinePath, snapshot);
+    checkpoint({
+      outputDir,
+      pipeline: snapshot,
+      currentStage: runtime.current_stage,
+      currentStep: runtime.current_step,
+      detail: runtime.detail || ""
+    });
+    return snapshot;
+  };
+  persist({ current_stage: "images", current_step: 4, detail: "检查图片断点" });
 
   const singlePodcastImage = task.task_type === "podcast" && task.podcast_image_mode === "single";
-  if (singlePodcastImage && workingScenes[0]?.image_path && fs.existsSync(workingScenes[0].image_path)) {
-    workingScenes.forEach(scene => { scene.image_path = workingScenes[0].image_path; });
+  for (const scene of workingScenes) {
+    if (usableAsset(scene.image_path, 512)) scene.image_status = "completed";
+    else if (scene.image_status === "completed") scene.image_status = scene.image_remote_task_id ? "interrupted" : "pending";
+  }
+  if (singlePodcastImage && usableAsset(workingScenes[0]?.image_path, 512)) {
+    workingScenes.forEach(scene => {
+      scene.image_path = workingScenes[0].image_path;
+      scene.image_provider = workingScenes[0].image_provider;
+      scene.source_url = workingScenes[0].source_url;
+      scene.image_status = "completed";
+    });
   }
   const pendingImages = singlePodcastImage
-    ? ((!workingScenes[0]?.image_path || !fs.existsSync(workingScenes[0].image_path)) ? [workingScenes[0]] : [])
-    : workingScenes.filter(scene => !scene.image_path || !fs.existsSync(scene.image_path));
+    ? ((!usableAsset(workingScenes[0]?.image_path, 512)) ? [workingScenes[0]] : [])
+    : workingScenes.filter(scene => !usableAsset(scene.image_path, 512));
   workingScenes.filter(scene => !pendingImages.includes(scene))
     .forEach(scene => emit(4, `复用已生成画面 ${scene.index}/${workingScenes.length}`));
+
   const imageSection = config[config.image_provider] || {};
   const imageConcurrency = Math.max(1, Math.min(6, Number(imageSection.concurrency || 1)));
   let imageCursor = 0;
   const imageWorker = async () => {
     while (imageCursor < pendingImages.length) {
       const scene = pendingImages[imageCursor++];
+      if (!scene) continue;
       if (task.shouldCancel?.()) throw new Error("任务已取消");
-      emit(4, `正在生成画面 ${scene.index}/${workingScenes.length}`);
+      scene.image_status = "running";
+      scene.image_attempts = Number(scene.image_attempts || 0) + 1;
+      scene.image_error = "";
+      persist({ current_stage: "images", current_step: 4, detail: `生成画面 ${scene.index}` });
+      emit(4, `${scene.image_remote_task_id ? "恢复远程画面任务" : "正在生成画面"} ${scene.index}/${workingScenes.length}`);
       const imagePath = path.join(imagesDir, `${scene.index}.png`);
       const stylePrefix = task.style_config?.prefix || "";
       const styleSuffix = task.style_config?.suffix || "";
-      const imageResult = await generateSceneImage({
-        app, config, prompt: [stylePrefix, scene.image_prompt, styleSuffix].filter(Boolean).join("，"), destination: imagePath,
-        ratio: task.ratio, index: scene.index, materialSource: task.material_source,
-        referenceImagePath: task.reference_image_path || ""
-      });
-      scene.image_path = imagePath;
-      scene.image_provider = imageResult.provider || "";
-      scene.source_url = imageResult.sourceUrl || "";
-      persist();
+      const requestId = `storybound-${task.id}-image-${scene.index}-${fingerprint(scene.image_prompt).slice(0, 12)}`;
+      try {
+        const imageResult = await retryOperation(async () => generateSceneImage({
+          app,
+          config,
+          prompt: [stylePrefix, scene.image_prompt, styleSuffix].filter(Boolean).join("，"),
+          destination: imagePath,
+          ratio: task.ratio,
+          index: scene.index,
+          materialSource: task.material_source,
+          referenceImagePath: scene.use_reference ? (task.reference_image_path || "") : "",
+          resumeTaskId: scene.image_remote_task_id || "",
+          requestId,
+          onRemoteTask: remote => {
+            scene.image_remote_task_id = remote.taskId || "";
+            scene.image_remote_provider = remote.provider || "";
+            scene.image_status = "remote_running";
+            persist({ current_stage: "images", current_step: 4, detail: `画面 ${scene.index} 已提交远程任务` });
+          }
+        }), {
+          attempts: 3,
+          onRetry: (error, attempt, delay) => {
+            scene.image_error = String(error?.message || error);
+            persist({ detail: `画面 ${scene.index} 第 ${attempt} 次失败，${delay}ms 后重试` });
+            emit(4, `第 ${scene.index} 镜网络异常，正在重试`);
+          }
+        });
+        scene.image_path = imagePath;
+        scene.image_provider = imageResult.provider || "";
+        scene.source_url = imageResult.sourceUrl || "";
+        scene.image_remote_task_id = imageResult.taskId || scene.image_remote_task_id || "";
+        scene.image_status = "completed";
+        scene.image_error = "";
+        persist({ detail: `画面 ${scene.index} 完成` });
+      } catch (error) {
+        if (!usableAsset(imagePath, 512)) removePartial(imagePath);
+        scene.image_status = "failed";
+        scene.image_error = String(error?.message || error);
+        persist({ detail: `画面 ${scene.index} 失败` });
+        throw error;
+      }
     }
   };
   await Promise.all(Array.from({ length: Math.min(imageConcurrency, pendingImages.length) }, () => imageWorker()));
@@ -315,89 +284,253 @@ async function completePipeline({ app, task, config, outputDir, script, emit }) 
       scene.image_path = workingScenes[0].image_path;
       scene.image_provider = workingScenes[0].image_provider;
       scene.source_url = workingScenes[0].source_url;
+      scene.image_status = "completed";
     });
   }
-  persist();
+  persist({ current_stage: "images_completed", current_step: 4, detail: "图片全部完成" });
 
   if (shouldPauseAfter(task, 4)) {
     emit(4, "图片已全部生成，请检查画廊后继续");
     return {
       paused: true, pauseStep: 4, outputDir,
-      script: { ...script, scenes: workingScenes },
+      script: persist({ current_stage: "review_images", current_step: 4 }),
       finalVideo: "", subtitlePath: "", draftDir: "", coverPath: ""
     };
   }
 
   const generatedScenes = [];
+  persist({ current_stage: "audio", current_step: 5, detail: "检查配音断点" });
   for (const scene of workingScenes) {
     if (task.shouldCancel?.()) throw new Error("任务已取消");
-    if (!scene.audio_path || !fs.existsSync(scene.audio_path)) {
+    let audioReady = await usableMedia(app, config, scene.audio_path);
+    if (!audioReady && scene.audio_path) {
+      removePartial(scene.audio_path);
+      scene.audio_path = "";
+    }
+    if (!audioReady) {
+      scene.audio_status = "running";
+      scene.audio_attempts = Number(scene.audio_attempts || 0) + 1;
+      scene.audio_error = "";
+      persist({ current_stage: "audio", current_step: 5, detail: `生成配音 ${scene.index}` });
       emit(5, `正在合成配音 ${scene.index}/${workingScenes.length}`);
       const audioExt = config.tts?.provider === "system" ? "wav" : "mp3";
       const audioPath = path.join(audioDir, `${scene.index}.${audioExt}`);
-      await synthesizeSpeech({
-        app, config, text: scene.narration, destination: audioPath,
-        speed: Number(task.tts_speed || 1),
-        speaker: task.task_type === "podcast" ? scene.speaker_id : task.speaker
-      });
-      scene.audio_path = audioPath;
-      scene.duration = await mediaDuration(app, config, audioPath);
-      persist();
+      try {
+        await retryOperation(async () => synthesizeSpeech({
+          app,
+          config,
+          text: scene.narration,
+          destination: audioPath,
+          speed: Number(task.tts_speed || 1),
+          speaker: task.task_type === "podcast" ? scene.speaker_id : task.speaker
+        }), {
+          attempts: 3,
+          onRetry: (error, attempt, delay) => {
+            scene.audio_error = String(error?.message || error);
+            persist({ detail: `配音 ${scene.index} 第 ${attempt} 次失败，${delay}ms 后重试` });
+            emit(5, `第 ${scene.index} 镜配音网络异常，正在重试`);
+          }
+        });
+        scene.audio_path = audioPath;
+        scene.duration = await mediaDuration(app, config, audioPath);
+        scene.audio_status = "completed";
+        scene.audio_error = "";
+        persist({ detail: `配音 ${scene.index} 完成` });
+      } catch (error) {
+        if (!(await usableMedia(app, config, audioPath))) removePartial(audioPath);
+        scene.audio_status = "failed";
+        scene.audio_error = String(error?.message || error);
+        persist({ detail: `配音 ${scene.index} 失败` });
+        throw error;
+      }
     } else {
       emit(5, `复用已生成配音 ${scene.index}/${workingScenes.length}`);
+      scene.audio_status = "completed";
       if (!scene.duration) scene.duration = await mediaDuration(app, config, scene.audio_path);
     }
     generatedScenes.push(scene);
   }
-  persist();
+  persist({ current_stage: "audio_completed", current_step: 5, detail: "配音全部完成" });
 
   if (shouldPauseAfter(task, 5)) {
     emit(5, "配音已全部生成，请检查后继续");
     return {
       paused: true, pauseStep: 5, outputDir,
-      script: { ...script, scenes: workingScenes },
+      script: persist({ current_stage: "review_audio", current_step: 5 }),
       finalVideo: "", subtitlePath: "", draftDir: "", coverPath: ""
     };
   }
 
+  const dynamicLimit = Number(task.video_intro || 0);
+  const dynamicEnabled = task.material_source === "ai" && task.task_type !== "podcast" && dynamicLimit !== 0;
+  if (dynamicEnabled) {
+    persist({ current_stage: "dynamic_video", current_step: 6, detail: "检查动态画面断点" });
+    const selectedScenes = generatedScenes.filter(scene => dynamicLimit === -1 || Number(scene.index) <= dynamicLimit);
+    if (!config.runninghub?.api_key) {
+      selectedScenes.forEach(scene => {
+        scene.video_status = "skipped";
+        scene.video_error = "未配置 RunningHub API Key，已保留静态图片";
+      });
+      persist({ detail: "动态画面未配置，使用图片运镜" });
+      emit(6, "未配置 RunningHub API Key，动态分镜将使用图片运镜兜底");
+    } else {
+      const videosDir = path.join(outputDir, "videos");
+      fs.mkdirSync(videosDir, { recursive: true });
+      for (const scene of selectedScenes) {
+        if (task.shouldCancel?.()) throw new Error("任务已取消");
+        if (await usableMedia(app, config, scene.video_path)) {
+          scene.video_status = "completed";
+          emit(6, `复用动态画面 ${scene.index}/${workingScenes.length}`);
+          continue;
+        }
+        if (scene.video_path) removePartial(scene.video_path);
+        const videoPath = path.join(videosDir, `${scene.index}.mp4`);
+        scene.video_status = "running";
+        scene.video_attempts = Number(scene.video_attempts || 0) + 1;
+        scene.video_error = "";
+        persist({ detail: `生成动态画面 ${scene.index}` });
+        emit(6, `${scene.video_remote_task_id ? "恢复动态画面任务" : "正在生成动态画面"} ${scene.index}/${workingScenes.length}`);
+        try {
+          const videoResult = await retryOperation(async () => generateRunningHubVideo({
+            config,
+            imagePath: scene.image_path,
+            prompt: `${scene.visual || scene.image_prompt || scene.narration}，自然运镜，主体动作连贯，镜头稳定，避免人物变形、闪烁、文字和水印`,
+            ratio: task.ratio,
+            durationSec: Number(task.video_intro_duration || 0) || Number(scene.duration || scene.duration_hint || 6),
+            destination: videoPath,
+            resumeTaskId: scene.video_remote_task_id || "",
+            resumeModel: scene.video_remote_model || "primary",
+            onRemoteTask: remote => {
+              scene.video_remote_task_id = remote.taskId || "";
+              scene.video_remote_model = remote.model || "primary";
+              scene.video_provider = remote.provider || "";
+              scene.video_status = "remote_running";
+              persist({ detail: `动态画面 ${scene.index} 已提交远程任务` });
+            }
+          }), {
+            attempts: 3,
+            onRetry: (error, attempt, delay) => {
+              scene.video_error = String(error?.message || error);
+              persist({ detail: `动态画面 ${scene.index} 第 ${attempt} 次失败，${delay}ms 后重试` });
+            }
+          });
+          scene.video_path = videoPath;
+          scene.video_provider = videoResult.provider || "runninghub-video";
+          scene.video_source_url = videoResult.sourceUrl || "";
+          scene.video_remote_task_id = videoResult.taskId || scene.video_remote_task_id || "";
+          scene.video_status = "completed";
+          scene.video_error = "";
+        } catch (error) {
+          removePartial(videoPath);
+          scene.video_path = "";
+          scene.video_provider = "";
+          scene.video_source_url = "";
+          scene.video_status = "failed_fallback";
+          scene.video_error = error instanceof Error ? error.message : String(error);
+          emit(6, `第 ${scene.index} 镜动态生成失败，已改用图片运镜`);
+        }
+        persist({ detail: `动态画面 ${scene.index} 处理完成` });
+      }
+    }
+  }
+
   emit(6, "正在合成字幕与 MP4");
+  persist({ current_stage: "render", current_step: 6, render_status: "running", detail: "合成最终视频" });
   const configuredBgm = task.bgm_id === "none" ? "" : task.bgm_path || (config.media?.use_default_bgm
     ? resolveResource(app, "default-bgm.mp3")
     : config.media?.bgm_path || "");
-  const video = await renderVideo({
-    app, config, scenes: generatedScenes, outputDir,
-    ratio: task.ratio, bgmPath: configuredBgm, template: task.draft_template, videoIntro: task.video_intro
+  let video;
+  const expectedFinal = runtime.final_video || path.join(outputDir, "final.mp4");
+  if (await usableMedia(app, config, expectedFinal)) {
+    video = { finalVideo: expectedFinal, subtitlePath: runtime.subtitle_path || path.join(outputDir, "subtitles.srt") };
+    emit(6, "复用已完成的视频合成结果");
+  } else {
+    removePartial(expectedFinal);
+    video = await renderVideo({
+      app, config, scenes: generatedScenes, outputDir,
+      ratio: task.ratio, bgmPath: configuredBgm, template: task.draft_template, videoIntro: task.video_intro
+    });
+  }
+  persist({
+    render_status: "completed",
+    final_video: video.finalVideo,
+    subtitle_path: video.subtitlePath,
+    detail: "视频合成完成"
   });
 
-  const coverPath = await generateCover({
-    app, config, task, outputDir, script: { ...script, scenes: generatedScenes },
-    sourceImage: generatedScenes[0]?.image_path, template: task.cover_template
-  });
+  let coverPath = runtime.cover_path || "";
+  if (task.cover_image_mode === "off") {
+    runtime.cover_status = "skipped";
+    coverPath = "";
+  } else if (usableAsset(coverPath, 512)) {
+    runtime.cover_status = "completed";
+  } else {
+    persist({ current_stage: "cover", current_step: 6, cover_status: "running", detail: "生成封面" });
+    coverPath = await generateCover({
+      app, config, task, outputDir, script: { ...script, scenes: generatedScenes },
+      sourceImage: generatedScenes[0]?.image_path, template: task.cover_template
+    });
+    runtime.cover_status = coverPath ? "completed" : "skipped";
+  }
+  persist({ cover_status: runtime.cover_status, cover_path: coverPath, detail: "封面处理完成" });
 
   emit(7, "正在生成剪映草稿");
-  let draft = null;
-  try {
-    draft = await generateJianyingDraft({
-      app, config, task: { ...task, pipeline_data: JSON.stringify({ ...script, scenes: generatedScenes }) }, outputDir, scenes: generatedScenes, bgmPath: configuredBgm
-    });
-  } catch (error) {
-    fs.writeFileSync(path.join(outputDir, "draft-error.txt"), String(error?.stack || error), "utf8");
+  let draftDir = runtime.draft_dir || "";
+  if (draftDir && fs.existsSync(draftDir)) {
+    runtime.draft_status = "completed";
+    emit(7, "复用已生成剪映草稿");
+  } else {
+    persist({ current_stage: "draft", current_step: 7, draft_status: "running", detail: "生成剪映草稿" });
+    try {
+      const draft = await generateJianyingDraft({
+        app,
+        config,
+        task: { ...task, pipeline_data: JSON.stringify(pipelineSnapshot(script, generatedScenes, runtime)) },
+        outputDir,
+        scenes: generatedScenes,
+        bgmPath: configuredBgm
+      });
+      draftDir = draft?.draft_dir || "";
+      runtime.draft_status = "completed";
+    } catch (error) {
+      atomicWriteFile(path.join(outputDir, "draft-error.txt"), String(error?.stack || error), "utf8");
+      runtime.draft_status = "failed_optional";
+    }
   }
 
   emit(8, "全部生成完成");
+  const finalScript = persist({
+    current_stage: "completed",
+    current_step: 8,
+    detail: "全部完成",
+    render_status: "completed",
+    draft_status: runtime.draft_status,
+    final_video: video.finalVideo,
+    subtitle_path: video.subtitlePath,
+    draft_dir: draftDir,
+    cover_path: coverPath,
+    completed_at: new Date().toISOString()
+  });
   return {
     outputDir,
-    script: { ...script, scenes: generatedScenes },
+    script: finalScript,
     finalVideo: video.finalVideo,
     subtitlePath: video.subtitlePath,
-    draftDir: draft?.draft_dir || "",
+    draftDir,
     coverPath
   };
 }
 
-async function runPipeline({ app, task, config, baseOutputDir, emit }) {
-  const prepared = await preparePipeline({ task, config, baseOutputDir, emit });
-  return completePipeline({ app, task, config, ...prepared, emit });
+async function runPipeline({ app, task, config, baseOutputDir, emit, checkpoint = () => {} }) {
+  const outputDir = taskOutputDir(task, config, baseOutputDir);
+  const existing = readJsonSafe(path.join(outputDir, "pipeline.json"), null);
+  if (existing?.scenes?.length) {
+    checkpoint({ outputDir, pipeline: existing, currentStage: existing.runtime?.current_stage || "resume", currentStep: existing.runtime?.current_step || task.current_step || 3 });
+    emit(Math.max(3, Number(existing.runtime?.current_step || task.current_step || 3)), "检测到上次断点，正在继续执行");
+    return completePipeline({ app, task, config, outputDir, script: existing, emit, checkpoint });
+  }
+  const prepared = await preparePipeline({ task, config, baseOutputDir, emit, checkpoint });
+  return completePipeline({ app, task, config, ...prepared, emit, checkpoint });
 }
 
 async function regenerateScene({ app, task, config, outputDir, script, sceneIndex, kind, emit = () => {} }) {
@@ -407,31 +540,53 @@ async function regenerateScene({ app, task, config, outputDir, script, sceneInde
     emit(4, `正在重新生成第 ${scene.index} 镜画面`);
     fs.mkdirSync(path.join(outputDir, "images"), { recursive: true });
     const imagePath = path.join(outputDir, "images", `${scene.index}.png`);
+    scene.image_status = "running";
+    scene.image_remote_task_id = "";
+    scene.image_error = "";
     const imageResult = await generateSceneImage({
       app, config,
       prompt: [task.style_config?.prefix, scene.image_prompt, task.style_config?.suffix].filter(Boolean).join("，"),
       destination: imagePath, ratio: task.ratio, index: scene.index,
-      materialSource: task.material_source, referenceImagePath: task.reference_image_path || ""
+      materialSource: task.material_source, referenceImagePath: scene.use_reference ? (task.reference_image_path || "") : "",
+      requestId: `storybound-${task.id}-image-${scene.index}-${Date.now()}`
     });
     scene.image_path = imagePath;
     scene.image_provider = imageResult.provider || "";
     scene.source_url = imageResult.sourceUrl || "";
+    scene.image_status = "completed";
+    scene.video_path = "";
+    scene.video_provider = "";
+    scene.video_source_url = "";
+    scene.video_remote_task_id = "";
+    scene.video_status = "pending";
+    scene.video_error = "图片已更新，动态画面将在继续任务时重新生成";
   } else if (kind === "audio") {
     emit(5, `正在重新生成第 ${scene.index} 镜配音`);
     fs.mkdirSync(path.join(outputDir, "audio"), { recursive: true });
     const extension = config.tts?.provider === "system" ? "wav" : "mp3";
     const audioPath = path.join(outputDir, "audio", `${scene.index}.${extension}`);
-    await synthesizeSpeech({ app, config, text: scene.narration, destination: audioPath, speed: Number(task.tts_speed || 1) });
+    scene.audio_status = "running";
+    await synthesizeSpeech({ app, config, text: scene.narration, destination: audioPath, speed: Number(task.tts_speed || 1), speaker: task.task_type === "podcast" ? scene.speaker_id : task.speaker });
     scene.audio_path = audioPath;
     scene.duration = await mediaDuration(app, config, audioPath);
+    scene.audio_status = "completed";
+    scene.audio_error = "";
   }
-  fs.writeFileSync(path.join(outputDir, "pipeline.json"), JSON.stringify(script, null, 2), "utf8");
+  script.runtime = {
+    ...(script.runtime || {}),
+    current_stage: "review",
+    current_step: kind === "image" ? 4 : 5,
+    render_status: "pending",
+    final_video: "",
+    updated_at: new Date().toISOString()
+  };
+  atomicWriteJson(path.join(outputDir, "pipeline.json"), script);
   return script;
 }
 
 async function renderPrepared({ app, task, config, outputDir, script, emit }) {
   for (const scene of script.scenes) {
-    if (!scene.image_path || !fs.existsSync(scene.image_path) || !scene.audio_path || !fs.existsSync(scene.audio_path)) {
+    if (!usableAsset(scene.image_path, 512) || !(await usableMedia(app, config, scene.audio_path))) {
       throw new Error(`第 ${scene.index} 镜素材不完整，请先生成图片和配音`);
     }
   }
@@ -446,14 +601,33 @@ async function renderPrepared({ app, task, config, outputDir, script, emit }) {
     const draft = await generateJianyingDraft({ app, config, task, outputDir, scenes: script.scenes, bgmPath });
     draftDir = draft.draft_dir || "";
   } catch (error) {
-    fs.writeFileSync(path.join(outputDir, "draft-error.txt"), String(error?.stack || error), "utf8");
+    atomicWriteFile(path.join(outputDir, "draft-error.txt"), String(error?.stack || error), "utf8");
   }
   emit(8, "重新合成完成");
   const coverPath = await generateCover({
     app, config, task, outputDir, script,
     sourceImage: script.scenes[0]?.image_path, template: task.cover_template
   });
+  script.runtime = {
+    ...(script.runtime || {}),
+    current_stage: "completed",
+    current_step: 8,
+    render_status: "completed",
+    final_video: video.finalVideo,
+    subtitle_path: video.subtitlePath,
+    draft_dir: draftDir,
+    cover_path: coverPath,
+    completed_at: new Date().toISOString()
+  };
+  atomicWriteJson(path.join(outputDir, "pipeline.json"), script);
   return { outputDir, script, finalVideo: video.finalVideo, subtitlePath: video.subtitlePath, draftDir, coverPath };
 }
 
-module.exports = { runPipeline, preparePipeline, completePipeline, regenerateScene, renderPrepared };
+module.exports = {
+  runPipeline,
+  preparePipeline,
+  completePipeline,
+  regenerateScene,
+  renderPrepared,
+  taskOutputDir
+};

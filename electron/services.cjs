@@ -1,8 +1,10 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const os = require("node:os");
 const { spawn } = require("node:child_process");
 const { ProxyAgent } = require("undici");
+const { testModelConnection } = require("./llm-planner.cjs");
 
 function spawnAsync(command, args, options = {}) {
   return new Promise((resolve, reject) => {
@@ -107,58 +109,153 @@ async function createPlaceholderImage({ app, config, prompt, destination, ratio,
   return { path: destination, provider: "placeholder", index };
 }
 
-async function generateOpenAiImage({ provider, config, prompt, destination, ratio }) {
+function resolveImageEndpoint(baseUrl, endpointPath, kind = "generation") {
+  const rawBase = String(baseUrl || "").trim().replace(/\/+$/, "");
+  if (!rawBase) throw new Error("图片接口尚未填写 Base URL");
+  const targetPath = String(endpointPath || (kind === "edit" ? "/images/edits" : "/images/generations")).trim();
+  if (/^https?:\/\//i.test(targetPath)) return targetPath;
+  const normalizedPath = targetPath.startsWith("/") ? targetPath : `/${targetPath}`;
+  if (/\/images\/(?:generations|edits)$/i.test(rawBase)) {
+    return rawBase.replace(/\/images\/(?:generations|edits)$/i, normalizedPath);
+  }
+  return `${rawBase}${normalizedPath}`;
+}
+
+async function readJsonResponse(response, actionName) {
+  const text = await response.text();
+  let payload = {};
+  if (text.trim()) {
+    try { payload = JSON.parse(text); }
+    catch {
+      throw new Error(`${actionName}返回的不是有效 JSON：${text.slice(0, 240)}`);
+    }
+  }
+  if (!response.ok) {
+    const message = payload?.error?.message || payload?.message || payload?.msg || `${actionName}失败 (${response.status})`;
+    throw new Error(message);
+  }
+  return payload;
+}
+
+function parseExtraBody(section) {
+  try { return JSON.parse(section.extra_body_json || "{}"); }
+  catch { throw new Error("图片接口的额外请求 JSON 格式错误"); }
+}
+
+function appendFormField(form, key, value) {
+  if (value === undefined || value === null) return;
+  if (Array.isArray(value)) {
+    value.forEach(item => appendFormField(form, key, item));
+    return;
+  }
+  if (typeof value === "object") {
+    form.append(key, JSON.stringify(value));
+    return;
+  }
+  form.append(key, String(value));
+}
+
+function normalizeReferenceImagePaths(referenceImagePath) {
+  const values = Array.isArray(referenceImagePath)
+    ? referenceImagePath
+    : String(referenceImagePath || "").split(/[;\n]/);
+  return [...new Set(values.map(value => String(value).trim()).filter(value => value && fs.existsSync(value)))];
+}
+
+async function pollCustomImageTask({ section, baseUrl, taskId, destination }) {
+  const successValues = String(section.success_values || "succeeded,completed,success")
+    .split(",").map(value => value.trim().toLowerCase());
+  for (let attempt = 0; attempt < 120; attempt += 1) {
+    await sleep(2000);
+    const statusUrl = resolveImageEndpoint(baseUrl, section.status_path.replace("{task_id}", encodeURIComponent(taskId)), "generation");
+    const poll = await fetchWithProxy(statusUrl, { headers: { authorization: `Bearer ${section.api_key}` } }, section.proxy_url);
+    const statusPayload = await readJsonResponse(poll, "查询图片任务");
+    const status = String(getByPath(statusPayload, section.status_field || "status") || "").toLowerCase();
+    if (successValues.includes(status)) {
+      const item = getByPath(statusPayload, section.image_field || "data.0.url");
+      await saveImageResponse(item, destination, section.proxy_url);
+      return { path: destination, provider: "custom_image", taskId, sourceUrl: item?.url || (typeof item === "string" ? item : "") };
+    }
+    if (["failed", "error", "cancelled"].includes(status)) throw new Error(statusPayload?.message || `图片任务失败：${status}`);
+  }
+  throw new Error("图片任务等待超时");
+}
+
+async function generateOpenAiImage({ provider, config, prompt, destination, ratio, resumeTaskId = "", onRemoteTask = () => {}, requestId = "" }) {
   const section = provider === "modelscope" ? config.modelscope
     : provider === "custom_image" ? config.custom_image : config.gpt_image;
-  const baseUrl = (section.base_url || (provider === "modelscope"
+  const baseUrl = section.base_url || (provider === "modelscope"
     ? "https://api-inference.modelscope.cn/v1"
-    : "https://api.openai.com/v1")).replace(/\/$/, "");
+    : "https://api.openai.com/v1");
   if (!section.api_key) throw new Error(`${provider} 尚未配置 API Key`);
-  const submitPath = provider === "custom_image" ? section.submit_path || "/images/generations" : "/images/generations";
-  let extraBody = {};
-  try { extraBody = JSON.parse(section.extra_body_json || "{}"); } catch { throw new Error("外部图片接口的额外请求 JSON 格式错误"); }
-  const response = await fetchWithProxy(`${baseUrl}${submitPath.startsWith("/") ? submitPath : `/${submitPath}`}`, {
+  if (provider === "custom_image" && section.async_mode && resumeTaskId) {
+    if (!section.status_path) throw new Error("异步图片接口尚未填写状态查询路径");
+    return pollCustomImageTask({ section, baseUrl, taskId: resumeTaskId, destination });
+  }
+  const endpoint = resolveImageEndpoint(baseUrl, provider === "custom_image" ? section.submit_path : "/images/generations", "generation");
+  const extraBody = parseExtraBody(section);
+  const responseFormat = section.response_format || "b64_json";
+  const body = {
+    model: section.model || "gpt-image-2",
+    prompt,
+    n: 1,
+    size: mappedImageSize(section, ratio),
+    ...(section.quality ? { quality: section.quality } : {}),
+    ...(responseFormat && responseFormat !== "auto" ? { response_format: responseFormat } : {}),
+    ...extraBody
+  };
+  const headers = { "content-type": "application/json", authorization: `Bearer ${section.api_key}` };
+  if (requestId) {
+    headers["idempotency-key"] = requestId;
+    headers["x-idempotency-key"] = requestId;
+  }
+  const response = await fetchWithProxy(endpoint, {
     method: "POST",
-    headers: { "content-type": "application/json", authorization: `Bearer ${section.api_key}` },
-    body: JSON.stringify({
-      model: section.model || "gpt-image-1",
-      prompt,
-      n: 1,
-      size: mappedImageSize(section, ratio),
-      response_format: "b64_json",
-      ...extraBody
-    })
+    headers,
+    body: JSON.stringify(body)
   }, section.proxy_url);
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload?.error?.message || `图片生成失败 (${response.status})`);
+  const payload = await readJsonResponse(response, "图片生成");
   if (provider === "custom_image" && section.async_mode) {
     const taskId = getByPath(payload, section.task_id_field || "task_id");
     if (!taskId || !section.status_path) throw new Error("异步图片接口未返回任务 ID，或尚未填写状态查询路径");
-    const successValues = String(section.success_values || "succeeded,completed,success").split(",").map(value => value.trim().toLowerCase());
-    for (let attempt = 0; attempt < 120; attempt += 1) {
-      await sleep(2000);
-      const statusUrl = `${baseUrl}${section.status_path.replace("{task_id}", encodeURIComponent(taskId))}`;
-      const poll = await fetchWithProxy(statusUrl, { headers: { authorization: `Bearer ${section.api_key}` } }, section.proxy_url);
-      const statusPayload = await poll.json();
-      if (!poll.ok) throw new Error(statusPayload?.error?.message || `查询图片任务失败 (${poll.status})`);
-      const status = String(getByPath(statusPayload, section.status_field || "status") || "").toLowerCase();
-      if (successValues.includes(status)) {
-        await saveImageResponse(getByPath(statusPayload, section.image_field || "data.0.url"), destination, section.proxy_url);
-        return { path: destination, provider };
-      }
-      if (["failed", "error", "cancelled"].includes(status)) throw new Error(statusPayload?.message || `图片任务失败：${status}`);
-    }
-    throw new Error("图片任务等待超时");
+    onRemoteTask({ taskId: String(taskId), provider: "custom_image" });
+    return pollCustomImageTask({ section, baseUrl, taskId: String(taskId), destination });
   }
   const item = payload.data?.[0] || payload.output?.images?.[0] || getByPath(payload, section.image_field);
   await saveImageResponse(item, destination, section.proxy_url);
   return { path: destination, provider };
 }
 
-async function generateRunningHubImage({ config, prompt, destination, ratio, referenceImagePath }) {
+async function pollRunningHubWorkflowImage({ baseUrl, section, taskId, destination }) {
+  for (let attempt = 0; attempt < 180; attempt += 1) {
+    await sleep(2000);
+    const outputResponse = await fetchWithProxy(`${baseUrl}/task/openapi/outputs`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ apiKey: section.api_key, taskId })
+    }, section.proxy_url);
+    const output = await outputResponse.json();
+    if (!outputResponse.ok) throw new Error(output.msg || `RunningHub 查询失败 (${outputResponse.status})`);
+    const files = Array.isArray(output.data) ? output.data : output.data?.outputs || [];
+    const image = files.find(file => /image|png|jpe?g|webp/i.test(`${file.fileType || ""} ${file.fileUrl || ""}`));
+    if (image?.fileUrl) {
+      await downloadFile(image.fileUrl, destination, {}, section.proxy_url);
+      return { path: destination, provider: "runninghub", sourceUrl: image.fileUrl, taskId };
+    }
+    if (Number(output.code || 0) !== 0 && !/running|queue|wait/i.test(output.msg || "")) throw new Error(output.msg || "RunningHub 任务失败");
+  }
+  throw new Error("RunningHub 任务等待超时");
+}
+
+async function generateRunningHubImage({ config, prompt, destination, ratio, referenceImagePath, resumeTaskId = "", onRemoteTask = () => {} }) {
   const section = config.runninghub;
-  if (!section.api_key || !section.workflow_id) throw new Error("RunningHub 尚未配置 API Key 和 Workflow ID");
+  if (!section.api_key) throw new Error("RunningHub 尚未配置 API Key");
+  if (!section.workflow_id) {
+    return generateRunningHubOfficialImage({ config, prompt, destination, ratio, referenceImagePath, resumeTaskId, onRemoteTask });
+  }
   const baseUrl = (section.base_url || "https://www.runninghub.cn").replace(/\/$/, "");
+  if (resumeTaskId) {
+    return pollRunningHubWorkflowImage({ baseUrl, section, taskId: resumeTaskId, destination });
+  }
   let nodeInfoList;
   try { nodeInfoList = JSON.parse(section.node_info_json || "[]"); } catch { throw new Error("RunningHub 节点参数 JSON 格式错误"); }
   if (referenceImagePath && fs.existsSync(referenceImagePath)) {
@@ -190,43 +287,278 @@ async function generateRunningHubImage({ config, prompt, destination, ratio, ref
   if (!createResponse.ok || Number(created.code || 0) !== 0) throw new Error(created.msg || `RunningHub 提交失败 (${createResponse.status})`);
   const taskId = created.data?.taskId || created.data?.task_id || created.taskId;
   if (!taskId) throw new Error("RunningHub 未返回任务 ID");
-  for (let attempt = 0; attempt < 180; attempt += 1) {
-    await sleep(2000);
-    const outputResponse = await fetchWithProxy(`${baseUrl}/task/openapi/outputs`, {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ apiKey: section.api_key, taskId })
-    }, section.proxy_url);
-    const output = await outputResponse.json();
-    if (!outputResponse.ok) throw new Error(output.msg || `RunningHub 查询失败 (${outputResponse.status})`);
-    const files = Array.isArray(output.data) ? output.data : output.data?.outputs || [];
-    const image = files.find(file => /image|png|jpe?g|webp/i.test(`${file.fileType || ""} ${file.fileUrl || ""}`));
-    if (image?.fileUrl) {
-      await downloadFile(image.fileUrl, destination, {}, section.proxy_url);
-      return { path: destination, provider: "runninghub", sourceUrl: image.fileUrl };
-    }
-    if (Number(output.code || 0) !== 0 && !/running|queue|wait/i.test(output.msg || "")) throw new Error(output.msg || "RunningHub 任务失败");
-  }
-  throw new Error("RunningHub 任务等待超时");
+  onRemoteTask({ taskId: String(taskId), provider: "runninghub-workflow" });
+  return pollRunningHubWorkflowImage({ baseUrl, section, taskId: String(taskId), destination });
 }
 
-async function generateReferenceImage({ provider, config, prompt, destination, ratio, referenceImagePath }) {
+
+function nearestRatio(ratio, supported) {
+  if (supported.includes(ratio)) return ratio;
+  const parse = value => {
+    const [width, height] = String(value || "").split(":").map(Number);
+    return width > 0 && height > 0 ? width / height : NaN;
+  };
+  const target = parse(ratio);
+  if (!Number.isFinite(target)) return supported.includes("9:16") ? "9:16" : supported[0];
+  return supported.reduce((best, current) => (
+    Math.abs(parse(current) - target) < Math.abs(parse(best) - target) ? current : best
+  ), supported[0]);
+}
+
+function unwrapRunningHubPayload(payload) {
+  if (payload && typeof payload === "object" && "code" in payload && "data" in payload
+      && !("taskId" in payload) && !("status" in payload)) {
+    const code = Number(payload.code);
+    if (code !== 0 && code !== 200) {
+      throw new Error(payload.msg || payload.message || `RunningHub 业务错误 (${payload.code})`);
+    }
+    return payload.data;
+  }
+  return payload;
+}
+
+async function runningHubV2Request(url, apiKey, body, proxyUrl = "") {
+  const response = await fetchWithProxy(url, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${apiKey}`,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(body)
+  }, proxyUrl);
+  const text = await response.text();
+  let payload;
+  try { payload = text ? JSON.parse(text) : {}; } catch { payload = { message: text }; }
+  if (!response.ok) throw new Error(payload?.message || payload?.msg || `RunningHub HTTP ${response.status}`);
+  return unwrapRunningHubPayload(payload);
+}
+
+async function uploadRunningHubV2Image({ baseUrl, apiKey, imagePath, proxyUrl = "" }) {
+  const form = new FormData();
+  form.append("file", new Blob([fs.readFileSync(imagePath)]), path.basename(imagePath));
+  const response = await fetchWithProxy(`${baseUrl}/openapi/v2/media/upload/binary`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${apiKey}` },
+    body: form
+  }, proxyUrl);
+  const text = await response.text();
+  let payload;
+  try { payload = text ? JSON.parse(text) : {}; } catch { payload = { message: text }; }
+  if (!response.ok) throw new Error(payload?.message || payload?.msg || `RunningHub 上传失败 (${response.status})`);
+  if (Number(payload.code) !== 0 && Number(payload.code) !== 200) {
+    throw new Error(payload.message || payload.msg || `RunningHub 上传失败 (${payload.code})`);
+  }
+  const downloadUrl = payload.data?.download_url || payload.data?.downloadUrl || payload.download_url || payload.downloadUrl;
+  if (!downloadUrl) throw new Error("RunningHub 上传成功但未返回下载地址");
+  return downloadUrl;
+}
+
+async function pollRunningHubV2({ baseUrl, apiKey, taskId, proxyUrl = "", timeoutMs = 15 * 60 * 1000 }) {
+  const startedAt = Date.now();
+  let delay = 3000;
+  let consecutiveErrors = 0;
+  while (Date.now() - startedAt < timeoutMs) {
+    await sleep(delay);
+    let payload;
+    try {
+      payload = await runningHubV2Request(`${baseUrl}/openapi/v2/query`, apiKey, { taskId }, proxyUrl);
+      consecutiveErrors = 0;
+    } catch (error) {
+      consecutiveErrors += 1;
+      if (consecutiveErrors >= 3) throw error;
+      continue;
+    }
+    const status = String(payload?.status || "").toUpperCase();
+    if (status === "SUCCESS") {
+      const results = Array.isArray(payload.results) ? payload.results : [];
+      if (!results.length) throw new Error("RunningHub 任务成功但未返回结果");
+      return results;
+    }
+    if (status === "FAILED") {
+      throw new Error(payload.errorMessage || payload.message || `RunningHub 任务失败 (${payload.errorCode || "UNKNOWN"})`);
+    }
+    delay = Math.min(10000, Math.floor(delay * 1.3));
+  }
+  throw new Error("RunningHub 视频任务等待超时");
+}
+
+async function downloadRunningHubVideoResult({ baseUrl, apiKey, taskId, proxyUrl, destination }) {
+  const results = await pollRunningHubV2({ baseUrl, apiKey, taskId, proxyUrl });
+  const result = results.find(item => String(item.outputType || "").toLowerCase() === "mp4"
+    || /\.mp4(?:\?|$)/i.test(item.url || "")) || results[0];
+  if (!result?.url) throw new Error("RunningHub 视频任务未返回可下载地址");
+  await downloadFile(result.url, destination, {}, proxyUrl);
+  return { sourceUrl: result.url };
+}
+
+async function submitRunningHubVideoModel({
+  baseUrl, apiKey, proxyUrl, imageUrl, prompt, ratio, durationSec, destination, model, onRemoteTask = () => {}
+}) {
+  const primary = model === "fallback" ? {
+    endpoint: "/openapi/v2/rhart-video/ltx-2.3/image-to-video",
+    supportedRatios: ["9:16", "16:9"], minDuration: 5, maxDuration: 20, imageField: "imageUrl"
+  } : {
+    endpoint: "/openapi/v2/rhart-video-g/image-to-video",
+    supportedRatios: ["2:3", "3:2", "1:1", "16:9", "9:16"], minDuration: 6, maxDuration: 30, imageField: "imageUrls"
+  };
+  const duration = Math.min(primary.maxDuration, Math.max(primary.minDuration, Math.ceil(Number(durationSec) || primary.minDuration)));
+  const body = {
+    prompt,
+    aspectRatio: nearestRatio(ratio, primary.supportedRatios),
+    resolution: "720p",
+    duration
+  };
+  body[primary.imageField] = primary.imageField === "imageUrls" ? [imageUrl] : imageUrl;
+  const submitted = await runningHubV2Request(`${baseUrl}${primary.endpoint}`, apiKey, body, proxyUrl);
+  if (String(submitted?.status || "").toUpperCase() === "FAILED") {
+    throw new Error(submitted.errorMessage || "RunningHub 视频提交失败");
+  }
+  const taskId = submitted?.taskId || submitted?.task_id;
+  if (!taskId) throw new Error("RunningHub 视频提交未返回 taskId");
+  onRemoteTask({ taskId: String(taskId), model, provider: model === "fallback" ? "runninghub-video-ltx" : "runninghub-video-x" });
+  const completed = await downloadRunningHubVideoResult({ baseUrl, apiKey, taskId: String(taskId), proxyUrl, destination });
+  return { path: destination, sourceUrl: completed.sourceUrl, taskId: String(taskId), duration };
+}
+
+
+async function generateRunningHubOfficialImage({ config, prompt, destination, ratio, referenceImagePath, resumeTaskId = "", onRemoteTask = () => {} }) {
+  const section = config.runninghub || {};
+  const baseUrl = (section.base_url || "https://www.runninghub.cn").replace(/\/$/, "");
+  const models = {
+    "rh-image-x": {
+      textEndpoint: "/openapi/v2/rhart-image-x-official/text-to-image",
+      editEndpoint: "/openapi/v2/rhart-image-x-official/edit",
+      imageField: "image",
+      supported: ["2:1", "20:9", "16:9", "4:3", "3:2", "1:1", "2:3", "3:4", "9:16", "9:20", "1:2"],
+      outputFormat: true,
+      resolution: false
+    },
+    "rh-image-v2": {
+      textEndpoint: "/openapi/v2/rhart-image-n-g31-flash/text-to-image",
+      editEndpoint: "/openapi/v2/rhart-image-n-g31-flash/image-to-image",
+      imageField: "imageUrls",
+      supported: ["1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3", "5:4", "4:5", "21:9", "1:4", "4:1", "1:8", "8:1"],
+      outputFormat: false,
+      resolution: true
+    },
+    "rh-image-g2": {
+      textEndpoint: "/openapi/v2/rhart-image-g-2/text-to-image",
+      editEndpoint: "/openapi/v2/rhart-image-g-2/image-to-image",
+      imageField: "imageUrls",
+      supported: ["1:1", "3:2", "2:3", "5:4", "4:5", "16:9", "9:16", "21:9", "3:4", "4:3", "9:21", "1:2", "2:1", "1:3", "3:1"],
+      outputFormat: false,
+      resolution: true
+    }
+  };
+  const modelId = models[section.model] ? section.model : "rh-image-g2";
+  if (resumeTaskId) {
+    const completed = await downloadRunningHubImageResult({ baseUrl, section, taskId: resumeTaskId, destination });
+    return { path: destination, provider: modelId, sourceUrl: completed.sourceUrl, taskId: resumeTaskId };
+  }
+  const model = models[modelId];
+  const normalizedRatio = modelId === "rh-image-x" && ratio === "21:9"
+    ? "20:9" : nearestRatio(ratio, model.supported);
+  const body = { prompt, aspectRatio: normalizedRatio };
+  if (model.outputFormat) body.outputFormat = "png";
+  if (model.resolution) body.resolution = section.resolution || "1k";
+  let endpoint = model.textEndpoint;
+  if (referenceImagePath && fs.existsSync(referenceImagePath)) {
+    const imageUrl = await uploadRunningHubV2Image({
+      baseUrl, apiKey: section.api_key, imagePath: referenceImagePath, proxyUrl: section.proxy_url || ""
+    });
+    endpoint = model.editEndpoint;
+    body[model.imageField] = model.imageField === "image" ? imageUrl : [imageUrl];
+  }
+  const submitted = await runningHubV2Request(`${baseUrl}${endpoint}`, section.api_key, body, section.proxy_url || "");
+  if (String(submitted?.status || "").toUpperCase() === "FAILED") {
+    throw new Error(submitted.errorMessage || "RunningHub 图片提交失败");
+  }
+  const taskId = submitted?.taskId || submitted?.task_id;
+  if (!taskId) throw new Error("RunningHub 图片提交未返回 taskId");
+  onRemoteTask({ taskId: String(taskId), provider: modelId });
+  const completed = await downloadRunningHubImageResult({ baseUrl, section, taskId: String(taskId), destination });
+  return { path: destination, provider: modelId, sourceUrl: completed.sourceUrl, taskId: String(taskId) };
+}
+
+async function generateRunningHubVideo({
+  config, imagePath, prompt, ratio, durationSec, destination,
+  resumeTaskId = "", resumeModel = "primary", onRemoteTask = () => {}
+}) {
+  const section = config.runninghub || {};
+  if (!section.api_key) throw new Error("RunningHub 尚未配置 API Key");
+  if (!imagePath || !fs.existsSync(imagePath)) throw new Error("图生视频缺少有效的源图片");
+  const baseUrl = (section.base_url || "https://www.runninghub.cn").replace(/\/$/, "");
+  if (resumeTaskId) {
+    const completed = await downloadRunningHubVideoResult({
+      baseUrl, apiKey: section.api_key, taskId: resumeTaskId,
+      proxyUrl: section.proxy_url || "", destination
+    });
+    return {
+      path: destination,
+      sourceUrl: completed.sourceUrl,
+      taskId: resumeTaskId,
+      provider: resumeModel === "fallback" ? "runninghub-video-ltx" : "runninghub-video-x",
+      usedFallback: resumeModel === "fallback"
+    };
+  }
+  const imageUrl = await uploadRunningHubV2Image({
+    baseUrl, apiKey: section.api_key, imagePath, proxyUrl: section.proxy_url || ""
+  });
+  try {
+    const result = await submitRunningHubVideoModel({
+      baseUrl, apiKey: section.api_key, proxyUrl: section.proxy_url || "", imageUrl,
+      prompt, ratio, durationSec, destination, model: "primary", onRemoteTask
+    });
+    return { ...result, provider: "runninghub-video-x", usedFallback: false };
+  } catch (primaryError) {
+    const message = primaryError instanceof Error ? primaryError.message : String(primaryError);
+    if (/AUDIT|审核|违规|sensitive/i.test(message)) throw primaryError;
+    try {
+      const result = await submitRunningHubVideoModel({
+        baseUrl, apiKey: section.api_key, proxyUrl: section.proxy_url || "", imageUrl,
+        prompt, ratio, durationSec, destination, model: "fallback", onRemoteTask
+      });
+      return { ...result, provider: "runninghub-video-ltx", usedFallback: true };
+    } catch (fallbackError) {
+      const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+      throw new Error(`主模型与兜底模型均失败：${fallbackMessage.slice(0, 220)}`);
+    }
+  }
+}
+
+
+async function generateReferenceImage({ provider, config, prompt, destination, ratio, referenceImagePath, requestId = "" }) {
   const section = provider === "modelscope" ? config.modelscope
     : provider === "custom_image" ? config.custom_image : config.gpt_image;
   if (!section?.api_key) throw new Error(`${provider} 尚未配置 API Key`);
-  const baseUrl = (section.base_url || "https://api.openai.com/v1").replace(/\/$/, "");
+  const referencePaths = normalizeReferenceImagePaths(referenceImagePath);
+  if (!referencePaths.length) throw new Error("参考图不存在或不可读取");
+  const baseUrl = section.base_url || "https://api.openai.com/v1";
+  const endpoint = resolveImageEndpoint(baseUrl, provider === "custom_image" ? section.edit_path : "/images/edits", "edit");
   const form = new FormData();
-  form.append("model", section.model || "gpt-image-1");
-  form.append("prompt", `${prompt}\n保持参考图中的人物身份、面部特征、发型和服装一致。`);
-  form.append("size", imageSize(ratio).apiSize);
-  form.append("image", new Blob([fs.readFileSync(referenceImagePath)]), path.basename(referenceImagePath));
-  const response = await fetchWithProxy(`${baseUrl}/images/edits`, {
+  form.append("model", section.model || "gpt-image-2");
+  form.append("prompt", `${prompt}\n保持参考图中的人物身份、面部特征、发型、服装与整体构图逻辑一致。`);
+  form.append("size", mappedImageSize(section, ratio));
+  if (section.quality) form.append("quality", section.quality);
+  const responseFormat = section.edit_response_format || "b64_json";
+  if (responseFormat && responseFormat !== "auto") form.append("response_format", responseFormat);
+  for (const imagePath of referencePaths) {
+    form.append("image", new Blob([fs.readFileSync(imagePath)]), path.basename(imagePath));
+  }
+  const extraBody = parseExtraBody(section);
+  for (const [key, value] of Object.entries(extraBody)) appendFormField(form, key, value);
+  const headers = { authorization: `Bearer ${section.api_key}` };
+  if (requestId) {
+    headers["idempotency-key"] = requestId;
+    headers["x-idempotency-key"] = requestId;
+  }
+  const response = await fetchWithProxy(endpoint, {
     method: "POST",
-    headers: { authorization: `Bearer ${section.api_key}` },
+    headers,
     body: form
   }, section.proxy_url);
-  const payload = await response.json();
-  if (!response.ok) throw new Error(payload?.error?.message || `参考图生成失败 (${response.status})`);
-  const item = payload.data?.[0];
+  const payload = await readJsonResponse(response, "参考图编辑");
+  const item = payload.data?.[0] || payload.output?.images?.[0] || getByPath(payload, section.image_field);
   await saveImageResponse(item, destination, section.proxy_url);
   return { path: destination, provider };
 }
@@ -302,43 +634,72 @@ async function generateSceneImage(args) {
   throw new Error(`图片服务 ${provider} 尚无可用配置；可切换到本地占位图或 OpenAI 兼容接口`);
 }
 
-async function testConnection(config, kind) {
+async function testConnection(config, kind, app) {
   if (kind === "llm") {
     if (config.llm?.provider === "local") return { ok: true, message: "本地规则模式可用" };
-    const endpoint = (config.llm.base_url || "").replace(/\/$/, "")
-      + (config.llm.protocol === "anthropic" ? "/v1/messages" : "/chat/completions");
-    const response = await fetchWithProxy(endpoint, {
-      method: "POST",
-      headers: config.llm.protocol === "anthropic"
-        ? { "content-type": "application/json", "x-api-key": config.llm.api_key, "anthropic-version": "2023-06-01" }
-        : { "content-type": "application/json", authorization: `Bearer ${config.llm.api_key}` },
-      body: JSON.stringify({
-        model: config.llm.model,
-        max_tokens: 1,
-        messages: [{ role: "user", content: "ping" }]
-      })
-    }, config.llm.proxy_url);
-    return { ok: response.ok, message: response.ok ? "连接成功" : `连接失败 (${response.status})` };
+    try {
+      await testModelConnection(config);
+      return { ok: true, message: `连接成功 · ${config.llm.protocol === "anthropic" ? "Claude 原生" : "OpenAI 兼容"}` };
+    } catch (error) {
+      return { ok: false, message: `连接失败：${error?.message || error}` };
+    }
   }
   if (kind === "tts") {
     const startedAt = Date.now();
-    const audio = await requestVolcengineSpeech(config, "连接测试", 1);
+    if (config.tts?.provider === "system") {
+      if (process.platform !== "win32") return { ok: false, message: "本机系统语音仅支持 Windows" };
+      if (!app) return { ok: false, message: "缺少应用上下文，无法测试本机语音" };
+      const destination = path.join(os.tmpdir(), `storybound-system-tts-test-${crypto.randomUUID()}.wav`);
+      try {
+        await synthesizeSystemVoice({ app, config, text: "你好，这是一段本机默认语音试听。", destination, speed: 1 });
+        const audio = fs.readFileSync(destination);
+        return {
+          ok: audio.length > 0,
+          message: audio.length > 0 ? `本机语音可用 · ${Date.now() - startedAt}ms` : "本机语音未生成音频",
+          provider: "system",
+          dataUrl: `data:audio/wav;base64,${audio.toString("base64")}`
+        };
+      } finally {
+        if (fs.existsSync(destination)) fs.unlinkSync(destination);
+      }
+    }
+    const audio = await requestVolcengineSpeech(config, "你好，这是一段火山引擎语音试听。", 1);
     return {
       ok: audio.length > 0,
-      message: audio.length > 0 ? `连接成功 · ${Date.now() - startedAt}ms` : "连接失败：未返回音频"
+      message: audio.length > 0 ? `火山引擎可用 · ${Date.now() - startedAt}ms` : "连接失败：未返回音频",
+      provider: "volcengine",
+      dataUrl: audio.length > 0 ? `data:audio/mpeg;base64,${audio.toString("base64")}` : ""
     };
   }
   if (kind === "image") {
     if (config.image_provider === "placeholder") return { ok: true, message: "本地图片模式可用" };
     if (config.image_provider === "runninghub") {
       const section = config.runninghub;
-      if (!section.api_key || !section.workflow_id) return { ok: false, message: "请填写 RunningHub API Key 和 Workflow ID" };
-      return { ok: true, message: "RunningHub 配置结构完整；生成图片时会提交工作流验证" };
+      if (!section.api_key) return { ok: false, message: "请填写 RunningHub API Key" };
+      return {
+        ok: true,
+        message: section.workflow_id
+          ? "RunningHub 自定义工作流配置完整"
+          : `RunningHub 官方模型 ${section.model || "rh-image-g2"} 配置完整`
+      };
     }
     const section = config[config.image_provider] || config.gpt_image;
     if (config.image_provider === "custom_image") {
-      if (!section.api_key || !section.base_url || !section.model) return { ok: false, message: "请填写外部接口 Base URL、API Key 和模型" };
-      return { ok: true, message: section.async_mode ? "异步外部接口配置结构完整" : "OpenAI 兼容图片接口配置结构完整" };
+      if (!section.api_key || !section.base_url || !section.model) return { ok: false, message: "请填写 Base URL、API Key 和模型" };
+      if (section.async_mode) return { ok: true, message: "异步外部接口配置结构完整" };
+      const destination = path.join(os.tmpdir(), `storybound-image-test-${crypto.randomUUID()}.png`);
+      try {
+        await generateOpenAiImage({
+          provider: "custom_image",
+          config,
+          prompt: "一个简洁的蓝色圆形图标，纯色背景，无文字",
+          destination,
+          ratio: "1:1"
+        });
+        return { ok: true, message: "连接成功，接口已实际返回测试图片" };
+      } finally {
+        if (fs.existsSync(destination)) fs.unlinkSync(destination);
+      }
     }
     const response = await fetchWithProxy((section.base_url || "https://api.openai.com/v1").replace(/\/$/, "") + "/models", {
       headers: { authorization: `Bearer ${section.api_key}` }
@@ -348,21 +709,42 @@ async function testConnection(config, kind) {
   return { ok: true, message: "配置结构正常" };
 }
 
-async function synthesizeSystemVoice({ app, text, destination, speed }) {
+async function synthesizeSystemVoice({ app, config, text, destination, speed, speaker }) {
+  if (process.platform !== "win32") throw new Error("本机系统语音仅支持 Windows");
   const textPath = `${destination}.txt`;
   fs.writeFileSync(textPath, text, "utf8");
   const resourceScript = resolveResource(app, "sapi.ps1");
   const script = fs.existsSync(resourceScript) ? resourceScript : path.join(__dirname, "sapi.ps1");
   const rate = Math.max(-10, Math.min(10, Math.round((Number(speed || 1) - 1) * 5)));
+  const configuredVoice = String(config?.tts?.system?.voice || "").trim();
+  const requestedVoice = String(speaker || "").trim();
+  const voiceName = requestedVoice && !requestedVoice.includes("_bigtts") ? requestedVoice : configuredVoice;
+  const volume = Math.max(0, Math.min(100, Number(config?.tts?.system?.volume ?? 100)));
   try {
-    await spawnAsync("powershell.exe", [
+    const args = [
       "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
-      "-File", script, "-TextPath", textPath, "-OutputPath", destination, "-Rate", String(rate)
-    ]);
+      "-File", script, "-TextPath", textPath, "-OutputPath", destination,
+      "-Rate", String(rate), "-Volume", String(volume)
+    ];
+    if (voiceName) args.push("-VoiceName", voiceName);
+    await spawnAsync("powershell.exe", args);
   } finally {
     if (fs.existsSync(textPath)) fs.unlinkSync(textPath);
   }
   return destination;
+}
+
+async function listSystemVoices(app) {
+  if (process.platform !== "win32") return [];
+  const resourceScript = resolveResource(app, "sapi-voices.ps1");
+  const script = fs.existsSync(resourceScript) ? resourceScript : path.join(__dirname, "sapi-voices.ps1");
+  const { stdout } = await spawnAsync("powershell.exe", [
+    "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script
+  ]);
+  const text = stdout.trim();
+  if (!text) return [];
+  const parsed = JSON.parse(text.replace(/^﻿/, ""));
+  return Array.isArray(parsed) ? parsed : [parsed];
 }
 
 function parseVolcengineAudio(responseText) {
@@ -462,5 +844,6 @@ async function mediaDuration(app, config, file) {
 
 module.exports = {
   spawnAsync, resolveResource, ffmpegPath, generateSceneImage,
-  synthesizeSpeech, mediaDuration, imageSize, downloadFile, testConnection
+  synthesizeSpeech, mediaDuration, imageSize, downloadFile, testConnection, generateRunningHubVideo,
+  listSystemVoices
 };

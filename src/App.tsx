@@ -7,6 +7,7 @@ import {
   Video, Volume2, WandSparkles, X
 } from "lucide-react";
 import systemPromptTemplatesData from "../shared/system-prompt-templates.json";
+import { DEFAULT_VOLC_VOICE_ID, VOLC_VOICES, type VolcVoiceOption } from "./volcVoices";
 
 type Page = "tasks" | "history" | "create" | "playground" | "voice" | "music" | "templates" | "styles" | "drafts" | "settings";
 type SettingsTab = "llm" | "image" | "tts" | "output" | "diagnostics";
@@ -69,14 +70,23 @@ export default function App() {
           <Settings size={18} /><span>设置</span>
         </button>
         <button><CircleHelp size={18} /><span>使用帮助</span></button>
-        <div className="version">Storybound Rebuild · v0.6.0</div>
+        <div className="version">Storybound Rebuild · v0.7.7</div>
       </div>
       </aside>
       <main className="main">
         {notice && <div className="toast" onClick={() => setNotice("")}>{notice}</div>}
       {page === "tasks" && <Tasks tasks={tasks.filter(task => task.status !== "completed")} onCreate={() => setPage("create")} onRefresh={refreshTasks} title="任务队列" desc="查看等待、运行中和失败的任务。" />}
       {page === "history" && <Tasks tasks={tasks} onCreate={() => setPage("create")} onRefresh={refreshTasks} title="历史任务" desc="按草稿、运行、完成、失败和取消状态查看全部任务。" history />}
-      {page === "create" && <CreateTask onCreated={async () => { await refreshTasks(); setPage("tasks"); }} onManageTemplates={() => setPage("drafts")} onManageStyles={() => setPage("styles")} />}
+      {page === "create" && <CreateTask
+        onCreated={async started => {
+          await refreshTasks();
+          setNotice(started ? "任务已创建并开始生成" : "草稿已保存到任务队列");
+          if (started) setPage("tasks");
+        }}
+        onNotice={setNotice}
+        onManageTemplates={() => setPage("drafts")}
+        onManageStyles={() => setPage("styles")}
+      />}
       {page === "settings" && config && <SettingsPage config={config} onSave={async next => {
         setConfig(await window.storybound.saveConfig(next));
         setNotice("设置已保存");
@@ -121,9 +131,10 @@ function Tasks({ tasks, onCreate, onRefresh, title = "任务队列", desc = "查
       <div className="toolbar-actions">
         <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
           <option value="all">全部状态</option><option value="pending">草稿</option><option value="review">待确认</option>
-          <option value="running">运行中</option><option value="completed">已完成</option><option value="failed">失败</option><option value="cancelled">已取消</option>
+          <option value="running">运行中</option><option value="interrupted">已中断</option><option value="completed">已完成</option><option value="failed">失败</option><option value="cancelled">已取消</option>
         </select>
         {!history && checked.length > 0 && <button className="primary" onClick={async () => { await window.storybound.runQueue(checked); setChecked([]); onRefresh(); }}><Play size={15} />串行执行 {checked.length} 项</button>}
+        {!history && tasks.some(task => Number(task.queue_order || 0) > 0 && !["completed", "cancelled"].includes(task.status)) && <button onClick={async () => { await window.storybound.resumeQueue(); onRefresh(); }}><RefreshCw size={15} />恢复上次队列</button>}
         <div className="stat"><span>{tasks.length}</span> 全部任务</div>
       </div>
     </div>
@@ -145,15 +156,17 @@ function Tasks({ tasks, onCreate, onRefresh, title = "任务队列", desc = "查
         <div className="task-actions">
           <button onClick={async e => {
             e.stopPropagation();
-            if (task.status === "review" || task.pipeline_data) {
+            if (task.status === "review" || task.status === "completed") {
               setSelected(task);
               return;
             }
-            if (task.pause_mode === "none") await window.storybound.runTask(task.id);
+            if (task.status === "interrupted" || task.status === "failed" || task.pipeline_data) {
+              await window.storybound.runTask(task.id);
+            } else if (task.pause_mode === "none") await window.storybound.runTask(task.id);
             else await window.storybound.prepareTask(task.id);
             onRefresh();
           }} disabled={task.status === "running"}>
-            <Play size={15} />{task.status === "review" ? "确认分镜" : task.status === "completed" ? "打开工作台" : task.pipeline_data ? "继续处理" : task.status === "failed" ? "从失败处继续" : "生成脚本"}
+            <Play size={15} />{task.status === "review" ? "确认分镜" : task.status === "completed" ? "打开工作台" : task.status === "interrupted" ? "从断点继续" : task.status === "failed" ? "从失败处继续" : task.pipeline_data ? "继续处理" : "生成脚本"}
           </button>
           {task.status === "running" && <button onClick={async e => { e.stopPropagation(); await window.storybound.cancelTask(task.id); onRefresh(); }}>取消</button>}
           <button title="复制任务" onClick={async e => { e.stopPropagation(); await window.storybound.duplicateTask(task.id); onRefresh(); }}><Copy size={15} /></button>
@@ -201,19 +214,58 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
     : Promise.resolve();
   const updateScene = (index: number, patch: Partial<PipelineScene>) => setPipeline(current => {
     if (!current) return current;
+    let invalidatesAudio = false;
+    let invalidatesImage = false;
+    let invalidatesVideo = false;
     const scenes = current.scenes.map(scene => {
       if (scene.index !== index) return scene;
       const next = { ...scene, ...patch };
-      if (patch.narration !== undefined && patch.narration !== scene.narration) {
+      invalidatesAudio = patch.narration !== undefined && patch.narration !== scene.narration;
+      invalidatesImage = (patch.image_prompt !== undefined && patch.image_prompt !== scene.image_prompt)
+        || (patch.use_reference !== undefined && patch.use_reference !== scene.use_reference);
+      invalidatesVideo = invalidatesImage || (patch.visual !== undefined && patch.visual !== scene.visual);
+      if (invalidatesAudio) {
         next.audio_path = undefined;
         next.duration = undefined;
+        next.audio_status = "pending";
+        next.audio_error = undefined;
       }
-      if (patch.image_prompt !== undefined && patch.image_prompt !== scene.image_prompt) {
+      if (invalidatesImage) {
         next.image_path = undefined;
+        next.image_status = "pending";
+        next.image_error = undefined;
+        next.image_remote_task_id = undefined;
+        next.image_remote_provider = undefined;
+      }
+      if (invalidatesVideo) {
+        next.video_path = undefined;
+        next.video_provider = undefined;
+        next.video_source_url = undefined;
+        next.video_error = undefined;
+        next.video_status = "pending";
+        next.video_remote_task_id = undefined;
+        next.video_remote_model = undefined;
       }
       return next;
     });
-    return { ...current, narration: scenes.map(scene => scene.narration).join(""), scenes };
+    const invalidatesRender = invalidatesAudio || invalidatesImage || invalidatesVideo;
+    return {
+      ...current,
+      narration: scenes.map(scene => scene.narration).join(""),
+      scenes,
+      runtime: invalidatesRender ? {
+        ...(current.runtime || {}),
+        current_stage: "review",
+        current_step: 3,
+        render_status: "pending",
+        cover_status: "pending",
+        draft_status: "pending",
+        final_video: "",
+        subtitle_path: "",
+        draft_dir: "",
+        cover_path: ""
+      } : current.runtime
+    };
   });
   const hasAssets = Boolean(pipeline?.scenes?.length && pipeline.scenes.every(scene => scene.image_path && scene.audio_path));
   const stages = ["分析文案", "改写脚本", "拆分分镜", "生成画面", "生成配音", "合成视频", "剪映草稿", "完成"];
@@ -225,6 +277,7 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
       <h2>{task.title}</h2>
       <p className="detail-source">{task.input_text}</p>
       {task.error_message && <div className="error-box">{task.error_message}</div>}
+      {task.current_stage && <div className="checkpoint-box">当前断点：{task.current_stage}{task.last_checkpoint_at ? ` · ${new Date(task.last_checkpoint_at).toLocaleString()}` : ""}</div>}
       <div className="stage-strip">{stages.map((stage, index) => <div className={task.current_step >= index + 1 ? "done" : task.status === "review" && index === 3 ? "next" : ""} key={stage}>
         <span>{task.current_step > index ? <CheckCircle2 size={13} /> : index + 1}</span><small>{stage}</small>
       </div>)}</div>
@@ -235,7 +288,7 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
         {pipeline && !hasAssets && <button className="primary" disabled={Boolean(busy)} onClick={async () => {
           await save();
           await run("生成全部素材与视频", () => window.storybound.continueTask(task.id));
-        }}><Play size={16} />确认并补齐素材生成视频</button>}
+        }}><Play size={16} />{task.status === "interrupted" ? "从断点继续" : "确认并补齐素材生成视频"}</button>}
         {hasAssets && <button className="primary" disabled={Boolean(busy)} onClick={async () => {
           await save();
           await run("重新合成视频", () => window.storybound.renderTask(task.id));
@@ -244,9 +297,20 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
       <div className="artifact-actions">
         {task.video_path && <button className="primary" onClick={() => window.storybound.openPath(task.video_path!)}><Video size={16} />播放视频</button>}
         {task.output_dir && <button onClick={() => window.storybound.openPath(task.output_dir!)}><FolderOpen size={16} />打开产物目录</button>}
+        {task.output_dir && pipeline && <button onClick={() => window.storybound.openPath(`${task.output_dir}/llm-debug`)}><FileText size={16} />查看模型请求日志</button>}
         {task.draft_dir && <button onClick={() => window.storybound.openPath(task.draft_dir!)}><ExternalLink size={16} />打开剪映草稿</button>}
         {task.cover_path && <button onClick={() => window.storybound.openPath(task.cover_path!)}><Image size={16} />查看封面海报</button>}
       </div>
+      {pipeline?.metadata && <div className="planner-metadata">
+        <div className="planner-metadata-head"><div><Sparkles size={16} /><b>大模型视觉规划结果</b></div><span>{pipeline.metadata.planner_mode === "staged-llm" ? "三阶段规划" : "本地规则"}</span></div>
+        <div className="planner-metadata-grid">
+          <div><small>提示词模板</small><b>{pipeline.metadata.template_name || pipeline.metadata.template_id || "跟随赛道"}</b></div>
+          <div><small>主角档案</small><b>{String((pipeline.metadata.character_card as any)?.stable_prompt || "未提取")}</b></div>
+          <div><small>产品/关键物件</small><b>{String((pipeline.metadata.product_card as any)?.stable_prompt || "未提取")}</b></div>
+          <div><small>参考图策略</small><b>{pipeline.metadata.reference_kind || "none"} · {pipeline.metadata.reference_available ? "已上传参考图" : "未上传参考图"}</b></div>
+        </div>
+        {pipeline.metadata.visual_continuity?.length ? <p><b>一致性规则：</b>{pipeline.metadata.visual_continuity.join("；")}</p> : null}
+      </div>}
       {pipeline?.scenes?.length ? <div className="scene-list">
         <h3>分镜工作台 · {pipeline.scenes.length} 镜</h3>
         {pipeline.scenes.map(scene => <div className="scene-editor" key={scene.index}>
@@ -262,12 +326,25 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
           {imageUrls[scene.index] && <div className="scene-preview"><img src={imageUrls[scene.index]} alt={`镜头 ${scene.index}`} /></div>}
           <label>旁白<textarea value={scene.narration} onChange={e => updateScene(scene.index, { narration: e.target.value })} /></label>
           <label>画面描述<textarea value={scene.visual} onChange={e => updateScene(scene.index, { visual: e.target.value })} /></label>
-          <label>图片提示词<textarea value={scene.image_prompt} onChange={e => updateScene(scene.index, { image_prompt: e.target.value })} /></label>
+          {scene.desc_prompt && <label>分镜基础提示词（desc_prompt）<textarea value={scene.desc_prompt} readOnly /></label>}
+          <label>最终图片提示词<textarea value={scene.image_prompt} onChange={e => updateScene(scene.index, { image_prompt: e.target.value })} /></label>
+          <div className="scene-reference-control">
+            <label><input type="checkbox" checked={Boolean(scene.use_reference)} onChange={e => updateScene(scene.index, { use_reference: e.target.checked })} />本镜使用主角/产品参考图</label>
+            <span>{scene.reference_reason || "大模型未提供判断说明"}</span>
+            {scene.subject_presence && <em>主体：{scene.subject_presence}</em>}
+          </div>
           <div className="scene-assets">
-            <span className={scene.image_path ? "ready" : ""}>画面 {scene.image_path ? "已生成" : "未生成"}</span>
-            <span className={scene.audio_path ? "ready" : ""}>配音 {scene.audio_path ? "已生成" : "未生成"}</span>
+            <span className={scene.image_path ? "ready" : ""}>画面 {scene.image_path ? "已生成" : "未生成"}{scene.image_status ? ` · ${assetStatusText(scene.image_status)}` : ""}</span>
+            <span className={scene.audio_path ? "ready" : ""}>配音 {scene.audio_path ? "已生成" : "未生成"}{scene.audio_status ? ` · ${assetStatusText(scene.audio_status)}` : ""}</span>
+            {scene.image_error && <span className="asset-warning" title={scene.image_error}>画面错误：{scene.image_error}</span>}
+            {scene.audio_error && <span className="asset-warning" title={scene.audio_error}>配音错误：{scene.audio_error}</span>}
             {scene.image_provider && <span className="ready">{scene.image_provider}</span>}
+            {scene.use_reference && <span className="ready">使用参考图</span>}
+            {scene.video_path && <span className="ready">动态画面已生成</span>}
+            {scene.video_provider && <span className="ready">{scene.video_provider}</span>}
+            {scene.video_error && <span className="asset-warning" title={scene.video_error}>动态兜底：{scene.video_error}</span>}
             {scene.source_url && <button onClick={() => window.open(scene.source_url, "_blank")}>素材来源</button>}
+            {scene.video_source_url && <button onClick={() => window.open(scene.video_source_url, "_blank")}>动态来源</button>}
           </div>
         </div>)}
       </div> : <div className="detail-empty">先生成脚本与分镜，在确认内容后再消耗时间生成图片、配音和视频。</div>}
@@ -275,7 +352,12 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
   </div>;
 }
 
-function CreateTask({ onCreated, onManageTemplates, onManageStyles }: { onCreated: () => void; onManageTemplates: () => void; onManageStyles: () => void }) {
+function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: {
+  onCreated: (started: boolean) => void | Promise<void>;
+  onNotice: (message: string) => void;
+  onManageTemplates: () => void;
+  onManageStyles: () => void;
+}) {
   const [track, setTrack] = useState("character-story");
   const [title, setTitle] = useState("");
   const [text, setText] = useState("");
@@ -292,18 +374,15 @@ function CreateTask({ onCreated, onManageTemplates, onManageStyles }: { onCreate
     ["pixar-3d", "皮克斯 3D", "动画质感"], ["ink-wash", "中国水墨", "文人意境"],
     ["folk-illustration", "民间故事工笔风", "工笔叙事"], ["ghibli", "吉卜力", "治愈日漫"]
   ];
-  const voices = [
-    ["zh_male_dongfanghaoran_uranus_bigtts", "东方浩然", "2.0"],
-    ["zh_male_xuanyijieshuo_uranus_bigtts", "悬疑解说", "2.0"],
-    ["zh_female_wenrouxiaoya_uranus_bigtts", "温柔小雅", "2.0"],
-    ["zh_female_wenroumama_uranus_bigtts", "温柔妈妈", "2.0"]
-  ];
+  const voices = VOLC_VOICES;
   const [style, setStyle] = useState(trackStyles["character-story"]);
   const [ratio, setRatio] = useState("9:16");
   const [targetScenes, setTargetScenes] = useState(0);
   const [targetLength, setTargetLength] = useState(0);
   const [ttsSpeed, setTtsSpeed] = useState(1);
-  const [speaker, setSpeaker] = useState(voices[0][0]);
+  const [speaker, setSpeaker] = useState(DEFAULT_VOLC_VOICE_ID);
+  const [ttsProvider, setTtsProvider] = useState("system");
+  const [systemVoices, setSystemVoices] = useState<SystemVoice[]>([]);
   const [taskType, setTaskType] = useState("story");
   const [podcastImageMode, setPodcastImageMode] = useState("multi");
   const [podcastSpeakers, setPodcastSpeakers] = useState("mizai-dayi");
@@ -313,6 +392,7 @@ function CreateTask({ onCreated, onManageTemplates, onManageStyles }: { onCreate
   const [materialSource, setMaterialSource] = useState("ai");
   const [videoIntro, setVideoIntro] = useState(0);
   const [customIntroCount, setCustomIntroCount] = useState(5);
+  const [videoIntroDuration, setVideoIntroDuration] = useState(0);
   const [templateId, setTemplateId] = useState("default-portrait-9-16");
   const [referenceImagePath, setReferenceImagePath] = useState("");
   const [coverImageMode, setCoverImageMode] = useState("off");
@@ -328,7 +408,7 @@ function CreateTask({ onCreated, onManageTemplates, onManageStyles }: { onCreate
   const [researchAi, setResearchAi] = useState(false);
   const [researchIma, setResearchIma] = useState(false);
   const [researching, setResearching] = useState(false);
-  const [promptTemplateId, setPromptTemplateId] = useState("");
+  const [promptTemplateId, setPromptTemplateId] = useState("character-story");
   const [customStyles, setCustomStyles] = useState<StyleRecord[]>([]);
   const [promptTemplates, setPromptTemplates] = useState<PromptTemplateRecord[]>([]);
   const [draftTemplates, setDraftTemplates] = useState<DraftTemplate[]>([]);
@@ -336,12 +416,20 @@ function CreateTask({ onCreated, onManageTemplates, onManageStyles }: { onCreate
   const [bgmItems, setBgmItems] = useState<BgmRecord[]>([]);
   const [bgmId, setBgmId] = useState("builtin");
   const [saving, setSaving] = useState(false);
+  const [draftJustSaved, setDraftJustSaved] = useState(false);
+
   useEffect(() => {
     window.storybound.listStyles().then(setCustomStyles);
     window.storybound.listPromptTemplates().then(setPromptTemplates);
     window.storybound.getTemplates().then(setDraftTemplates);
     window.storybound.listCoverTemplates().then(setCoverTemplates);
     window.storybound.listBgm().then(setBgmItems);
+    window.storybound.getConfig().then(config => {
+      const provider = config.tts?.provider || "system";
+      setTtsProvider(provider);
+      setSpeaker(provider === "system" ? (config.tts?.system?.voice || "") : (config.tts?.volcengine?.speaker || DEFAULT_VOLC_VOICE_ID));
+    });
+    window.storybound.listSystemVoices().then(setSystemVoices).catch(() => setSystemVoices([]));
   }, []);
 
   const chooseTrack = (id: string) => {
@@ -357,32 +445,84 @@ function CreateTask({ onCreated, onManageTemplates, onManageStyles }: { onCreate
     setRatio(config.image?.ratio || config.canvas?.ratio || "9:16");
     if (config.audio?.defaultBgmId) setBgmId(config.audio.defaultBgmId);
   };
+
+  const normalizedProcessingMode = processingMode === "semi" ? "semi_auto" : processingMode;
+  const disabledPauseSteps = normalizedProcessingMode === "direct" ? [0, 1, 2]
+    : normalizedProcessingMode === "semi_auto" ? [0, 1] : [];
+  const effectivePausePoints = pausePoints.filter(step => !disabledPauseSteps.includes(step));
+  const canSave = text.trim().length > 0;
+  const canStart = text.trim().length >= 50;
+  const wordsPerScene = targetLength > 0 && targetScenes > 0 ? Math.round(targetLength / targetScenes) : 0;
+
   const submit = async (start: boolean) => {
-    if (!text.trim()) return;
+    const cleanText = text.trim();
+    if (!cleanText) {
+      onNotice("请先填写文案内容");
+      return;
+    }
+    if (start && cleanText.length < 50) {
+      onNotice("文案至少需要 50 个字，当前内容过短");
+      return;
+    }
+    if (taskType === "podcast" && normalizedProcessingMode !== "auto") {
+      const podcastLines = cleanText.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+      const allTagged = podcastLines.length > 0 && podcastLines.every(line => /^[\[【]\s*[ABab]\s*[\]】]\s*.+/.test(line));
+      if (!allTagged) {
+        onNotice("双人播客使用半自动或直接出片时，每一行都必须以 [A] 或 [B] 开头");
+        return;
+      }
+    }
+
     setSaving(true);
-    const effectivePause = pauseMode === "custom"
-      ? (pausePoints.some(step => step <= 3) ? "script" : pausePoints.length ? "every" : "none")
-      : pauseMode === "critical" ? "script" : pauseMode;
-    const task = await window.storybound.createTask({
-      title: title.trim() || text.trim().slice(0, 18),
-      inputText: text.trim(), track, style, ratio, targetScenes: targetScenes || undefined, targetLength: targetLength || undefined,
-      ttsSpeed, promptTemplateId, rewriteIntensity, narrativePov, keepPromotion,
-      materialSource, templateId, referenceImagePath, coverImageMode, coverTemplateId,
-      pauseMode: effectivePause, sourceMode, sourceQuery, sourceRequirements, bgmId, speaker,
-      taskType, scriptFormat: taskType === "podcast" ? "dialogue" : "narration",
-      podcastImageMode, podcastSpeakers, processingMode, pausePoints,
-      videoIntro: videoIntro === -2 ? customIntroCount : videoIntro, videoIntroDuration: 5,
-      researchWeb, researchAi, researchIma
-    });
-    onCreated();
-    if (start) {
-      const action = effectivePause === "script" ? window.storybound.prepareTask(task.id) : window.storybound.runTask(task.id);
-      void action.catch(error => console.error(error));
+    setDraftJustSaved(false);
+    try {
+      const effectivePause = pauseMode === "custom"
+        ? (effectivePausePoints.some(step => step <= 3) ? "script" : effectivePausePoints.length ? "custom" : "none")
+        : pauseMode === "critical" ? "script" : pauseMode;
+      const effectiveVideoIntro = materialSource === "ai" && taskType !== "podcast"
+        ? (videoIntro === -2 ? Math.max(1, customIntroCount) : videoIntro) : 0;
+      const effectiveCoverMode = materialSource === "ai" ? coverImageMode : "off";
+      const task = await window.storybound.createTask({
+        title: title.trim() || cleanText.slice(0, 18),
+        inputText: cleanText,
+        track, style, ratio,
+        targetScenes: targetScenes || undefined,
+        targetLength: normalizedProcessingMode === "auto" ? (targetLength || undefined) : undefined,
+        ttsSpeed, promptTemplateId,
+        rewriteIntensity: normalizedProcessingMode === "auto" ? rewriteIntensity : "standard",
+        narrativePov: normalizedProcessingMode === "auto" ? narrativePov : "original",
+        keepPromotion: normalizedProcessingMode === "auto" ? keepPromotion : true,
+        materialSource, templateId,
+        referenceImagePath: materialSource === "ai" ? referenceImagePath : "",
+        coverImageMode: effectiveCoverMode, coverTemplateId,
+        pauseMode: effectivePause,
+        sourceMode, sourceQuery, sourceRequirements, bgmId, speaker,
+        taskType, scriptFormat: taskType === "podcast" ? "dialogue" : "narration",
+        podcastImageMode, podcastSpeakers,
+        processingMode: normalizedProcessingMode,
+        pausePoints: effectivePausePoints,
+        videoIntro: effectiveVideoIntro,
+        videoIntroDuration: effectiveVideoIntro === 0 ? 0 : videoIntroDuration,
+        researchWeb, researchAi, researchIma
+      });
+
+      await onCreated(start);
+      if (start) {
+        const action = effectivePause === "script" ? window.storybound.prepareTask(task.id) : window.storybound.runTask(task.id);
+        void action.catch(error => onNotice(error instanceof Error ? error.message : String(error)));
+      } else {
+        setDraftJustSaved(true);
+      }
+    } catch (error) {
+      onNotice(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSaving(false);
     }
   };
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.ctrlKey && event.key === "Enter" && text.trim() && !saving) {
+      if (event.ctrlKey && event.key === "Enter" && canStart && !saving) {
         event.preventDefault();
         void submit(true);
       }
@@ -391,8 +531,11 @@ function CreateTask({ onCreated, onManageTemplates, onManageStyles }: { onCreate
     return () => window.removeEventListener("keydown", onKeyDown);
   });
 
-  return <section>
-    <PageHeader eyebrow="NEW CREATION" title="创建视频任务" desc="粘贴一段人物故事，几分钟后在剪映里打开" />
+  return <section className="create-page-root">
+    <div className="create-page-heading">
+      <div className="create-page-heading-icon"><WandSparkles size={18} /></div>
+      <div><h1>创建视频任务</h1><p>粘贴一段人物故事，几分钟后在剪映里打开</p></div>
+    </div>
     <div className="home-create">
       <CreateSection title="文案" desc="改写 · 叙事视角 · 目标字数">
         <label className="field-title">标题 <span>可选</span><input value={title} onChange={e => setTitle(e.target.value)} placeholder="留空会从文案自动提取" /></label>
@@ -414,37 +557,56 @@ function CreateTask({ onCreated, onManageTemplates, onManageStyles }: { onCreate
               const result = await window.storybound.researchSource(sourceQuery, sourceRequirements, { web: researchWeb, ai: researchAi, ima: researchIma });
               setTitle(current => current || result.title);
               setText(result.text);
+            } catch (error) {
+              onNotice(error instanceof Error ? error.message : String(error));
             } finally { setResearching(false); }
           }}>{researching ? <LoaderCircle size={15} className="spin" /> : <Search size={15} />}搜索</button>
         </div> : <label className="script-field">文案内容<textarea value={text} onChange={e => setText(e.target.value)} placeholder="粘贴一段人物故事原始文案，AI 会自动改写为口播版、拆分分镜、配图配音。" /><small>{text.length.toLocaleString()} 字</small></label>}
-        {sourceMode === "research" && text && <label className="script-field">已生成原稿<textarea value={text} onChange={e => setText(e.target.value)} /></label>}
-        <OptionGroup title="视频形态"><Choice active={taskType === "story"} onClick={() => setTaskType("story")} title="旁白视频" desc="单人配音讲述（默认）" /><Choice active={taskType === "podcast"} onClick={() => setTaskType("podcast")} title="双人播客" desc="两位主播一问一答聊内容" /></OptionGroup>
+        {sourceMode === "research" && text && <label className="script-field">已生成原稿<textarea value={text} onChange={e => setText(e.target.value)} /><small>{text.length.toLocaleString()} 字</small></label>}
+        <OptionGroup title="视频形态"><Choice active={taskType === "story"} onClick={() => setTaskType("story")} title="旁白视频" desc="单人配音讲述（默认）" /><Choice active={taskType === "podcast"} onClick={() => { setTaskType("podcast"); setVideoIntro(0); }} title="双人播客" desc="两位主播一问一答聊内容" /></OptionGroup>
         {taskType === "podcast" && <div className="podcast-options">
           <OptionGroup title="配图方式"><Choice active={podcastImageMode === "multi"} onClick={() => setPodcastImageMode("multi")} title="按分镜配图" desc="每轮对话一张图" /><Choice active={podcastImageMode === "single"} onClick={() => setPodcastImageMode("single")} title="单图封面" desc="一张主题图铺满全程，最快出片" /></OptionGroup>
           <OptionGroup title="主播组合"><Choice active={podcastSpeakers === "mizai-dayi"} onClick={() => setPodcastSpeakers("mizai-dayi")} title="咪仔 × 大壹（默认）" /><Choice active={podcastSpeakers === "liufei-xiaolei"} onClick={() => setPodcastSpeakers("liufei-xiaolei")} title="刘飞 × 潇磊" /></OptionGroup>
           <p className="form-hint">播客使用专属双人音色，常规配音员与语速选项会自动隐藏。</p>
         </div>}
         <OptionGroup title="内容赛道"><div className="home-chip-grid">{tracks.map(({ id, name, desc }) => <Choice key={id} active={track === id} onClick={() => chooseTrack(id)} title={name} desc={desc} />)}</div></OptionGroup>
-        <OptionGroup title="改写强度" hint="强度越高原创度越高，但与对标结构差异越大"><Choice active={rewriteIntensity === "standard"} onClick={() => setRewriteIntensity("standard")} title="标准改写" badge="推荐" /><Choice active={rewriteIntensity === "deep"} onClick={() => setRewriteIntensity("deep")} title="深度改写" /><Choice active={rewriteIntensity === "original"} onClick={() => setRewriteIntensity("original")} title="高度原创" /></OptionGroup>
-        <OptionGroup title="叙事视角" hint="切换人称可大幅提升原创度"><Choice active={narrativePov === "original"} onClick={() => setNarrativePov("original")} title="保持原文" badge="默认" /><Choice active={narrativePov === "first"} onClick={() => setNarrativePov("first")} title="第一人称" /><Choice active={narrativePov === "third"} onClick={() => setNarrativePov("third")} title="第三人称" /></OptionGroup>
-        <label className="toggle-line"><span><b>带货模式</b><small>{keepPromotion ? "改写时保留带货段落" : "改写时删除带货段落"}</small></span><input type="checkbox" checked={keepPromotion} onChange={e => setKeepPromotion(e.target.checked)} /></label>
-        <div className="number-pair"><label>目标字数<input type="number" min={100} step={50} value={targetLength || ""} onChange={e => setTargetLength(Number(e.target.value))} placeholder="自动" /><small>字（±15%，留空跟随原文）</small></label><label>目标分镜数<input type="number" min={3} step={1} value={targetScenes || ""} onChange={e => setTargetScenes(Number(e.target.value))} placeholder="自动" /><small>个（±10%，建议每镜 25-45 字）</small></label></div>
+        {normalizedProcessingMode === "auto" ? <>
+          <OptionGroup title="改写强度" hint="强度越高原创度越高，但与对标结构差异越大"><Choice active={rewriteIntensity === "standard"} onClick={() => setRewriteIntensity("standard")} title="标准改写" badge="推荐" /><Choice active={rewriteIntensity === "deep"} onClick={() => setRewriteIntensity("deep")} title="深度改写" /><Choice active={rewriteIntensity === "original"} onClick={() => setRewriteIntensity("original")} title="高度原创" /></OptionGroup>
+          <OptionGroup title="叙事视角" hint="切换人称可大幅提升原创度"><Choice active={narrativePov === "original"} onClick={() => setNarrativePov("original")} title="保持原文" badge="默认" /><Choice active={narrativePov === "first"} onClick={() => setNarrativePov("first")} title="第一人称" /><Choice active={narrativePov === "third"} onClick={() => setNarrativePov("third")} title="第三人称" /></OptionGroup>
+          <label className="toggle-line"><span><b>带货模式</b><small>{keepPromotion ? "改写时保留带货段落" : "改写时删除带货段落"}</small></span><input type="checkbox" checked={keepPromotion} onChange={e => setKeepPromotion(e.target.checked)} /></label>
+          <div className="number-pair"><label>目标字数<input type="number" min={100} step={50} value={targetLength || ""} onChange={e => setTargetLength(Number(e.target.value))} placeholder="自动" /><small>字（±15%，留空跟随原文）</small></label><label>目标分镜数<input type="number" min={3} step={1} value={targetScenes || ""} onChange={e => setTargetScenes(Number(e.target.value))} placeholder="自动" /><small>个（±10%，建议每镜 25-45 字{wordsPerScene ? ` · 当前约 ${wordsPerScene} 字/镜` : ""}）</small></label></div>
+        </> : <div className="mode-note">{normalizedProcessingMode === "semi_auto" ? "半自动：保留输入原文，AI 只做智能分句。" : "直接出片：跳过 AI 改写，按空行和句号机械切分。"} 此模式下改写强度、叙事视角与带货设置已自动隐藏。</div>}
+        {taskType === "podcast" && normalizedProcessingMode !== "auto" && <div className="podcast-warning"><b>🎙️ 双人播客 + 半自动/直接出片：</b>文案需自带对话标签，每行以 <code>[A]</code>（主持人）或 <code>[B]</code>（主讲）开头；没有标签请切回“全自动”。</div>}
       </CreateSection>
 
       <CreateSection title="出图" desc="素材来源 · 画面风格 · 比例 · 参考图">
-        <OptionGroup title="素材来源"><Choice active={materialSource === "ai"} onClick={() => setMaterialSource("ai")} title="AI 绘图" desc="按画面风格生成插画/写实图" /><Choice active={materialSource === "network"} onClick={() => setMaterialSource("network")} title="网络素材" desc="真实视频画面，免版税可商用" /></OptionGroup>
-        {taskType !== "podcast" && <OptionGroup title="动态分镜"><Choice active={videoIntro === 0} onClick={() => setVideoIntro(0)} title="关闭" /><Choice active={videoIntro === 3} onClick={() => setVideoIntro(3)} title="前 3 张" /><Choice active={videoIntro === -1} onClick={() => setVideoIntro(-1)} title="全部" /><Choice active={videoIntro === -2} onClick={() => setVideoIntro(-2)} title="自定义" />{videoIntro === -2 && <input className="inline-number" type="number" min={1} value={customIntroCount} onChange={e => setCustomIntroCount(Number(e.target.value))} />}</OptionGroup>}
-        <OptionGroup title="画面风格"><div className="style-chip-grid">{visualStyles.map(([id, name, desc]) => <Choice key={id} active={style === id} onClick={() => setStyle(id)} title={name} desc={desc} />)}{customStyles.map(item => <Choice key={item.id} active={style === item.id} onClick={() => setStyle(item.id)} title={item.name} desc={item.tag} />)}<button className="choice-chip" onClick={onManageStyles}><Plus size={14} />自定义</button></div></OptionGroup>
+        <OptionGroup title="素材来源"><Choice active={materialSource === "ai"} onClick={() => setMaterialSource("ai")} title="AI 绘图" desc="按画面风格生成插画/写实图" /><Choice active={materialSource === "network"} onClick={() => { setMaterialSource("network"); setVideoIntro(0); }} title="网络素材" desc="从公开素材源检索真实画面" /></OptionGroup>
+        {materialSource === "ai" && taskType !== "podcast" && <>
+          <OptionGroup title="动态分镜" hint="把指定分镜的静态图通过 RunningHub 转成动态视频"><Choice active={videoIntro === 0} onClick={() => setVideoIntro(0)} title="关闭" /><Choice active={videoIntro === 3} onClick={() => setVideoIntro(3)} title="前 3 张" /><Choice active={videoIntro === -1} onClick={() => setVideoIntro(-1)} title="全部" /><Choice active={videoIntro === -2} onClick={() => setVideoIntro(-2)} title="自定义" />{videoIntro === -2 && <span className="dynamic-count">前 <input className="inline-number" type="number" min={1} value={customIntroCount} onChange={e => setCustomIntroCount(Math.max(1, Number(e.target.value)))} /> 张</span>}</OptionGroup>
+          {videoIntro !== 0 && <OptionGroup title="时长" hint="固定时长范围 6–30 秒；跟随配音时接口会自动限制到可用范围"><Choice active={videoIntroDuration === 0} onClick={() => setVideoIntroDuration(0)} title="跟配音一致" /><Choice active={videoIntroDuration > 0} onClick={() => setVideoIntroDuration(videoIntroDuration || 6)} title="固定秒数" />{videoIntroDuration > 0 && <span className="dynamic-count"><input className="inline-number" type="number" min={6} max={30} value={videoIntroDuration} onChange={e => setVideoIntroDuration(Math.min(30, Math.max(6, Number(e.target.value))))} /> 秒</span>}</OptionGroup>}
+          <p className="form-hint">动态视频失败时会自动保留原图片继续出片，不会让整条任务报废。</p>
+        </>}
+        {materialSource === "ai" && <OptionGroup title="画面风格"><div className="style-chip-grid">{visualStyles.map(([id, name, desc]) => <Choice key={id} active={style === id} onClick={() => setStyle(id)} title={name} desc={desc} />)}{customStyles.map(item => <Choice key={item.id} active={style === item.id} onClick={() => setStyle(item.id)} title={item.name} desc={item.tag} />)}<button className="choice-chip" onClick={onManageStyles}><Plus size={14} />自定义</button></div></OptionGroup>}
         <OptionGroup title="草稿模板"><div className="template-choice-grid">{draftTemplates.map(item => { const cfg = JSON.parse(item.config); return <Choice key={item.id} active={templateId === item.id} onClick={() => chooseTemplate(item.id)} title={`${item.is_default ? "★ " : ""}${item.name}`} desc={`出图 ${cfg.image?.ratio || cfg.canvas?.ratio}`} />; })}<button className="choice-chip" onClick={onManageTemplates}><Plus size={14} />管理模板</button></div></OptionGroup>
-        <OptionGroup title="AI 出图比例" hint="已跟随草稿模板"><Choice active={ratio === "9:16"} onClick={() => setRatio("9:16")} title="9:16" desc="竖屏" /><Choice active={ratio === "4:3"} onClick={() => setRatio("4:3")} title="4:3" desc="标准" /><Choice active={ratio === "1:1"} onClick={() => setRatio("1:1")} title="1:1" desc="方形" /><Choice active={ratio === "16:9"} onClick={() => setRatio("16:9")} title="16:9" desc="横屏" /></OptionGroup>
+        <OptionGroup title="AI 出图比例" hint={templateId ? "已跟随草稿模板" : "请选择画面比例"}><Choice active={ratio === "9:16"} onClick={() => setRatio("9:16")} title="9:16" desc="竖屏" /><Choice active={ratio === "4:3"} onClick={() => setRatio("4:3")} title="4:3" desc="标准" /><Choice active={ratio === "1:1"} onClick={() => setRatio("1:1")} title="1:1" desc="方形" /><Choice active={ratio === "16:9"} onClick={() => setRatio("16:9")} title="16:9" desc="横屏" /></OptionGroup>
         <p className="form-hint">选模板时自动同步图片比例。如需自定义，请去草稿模板编辑器调整图片区域比例。</p>
-        <div className="reference-row"><div><b>主角参考图</b><small>可选 · 出现主角的分镜会以参考图保持人物一致</small></div><button className="reference-upload-empty" onClick={async () => setReferenceImagePath(await window.storybound.selectImage())}><Upload size={15} />{referenceImagePath ? "已选择参考图" : "上传主角参考图"}</button></div>
-        <OptionGroup title="封面海报" hint="发布时上传的封面，独立于正片"><Choice active={coverImageMode === "off"} onClick={() => setCoverImageMode("off")} title="不生成" /><Choice active={coverImageMode === "title"} onClick={() => setCoverImageMode("title")} title="带标题文字" /><Choice active={coverImageMode === "blank"} onClick={() => setCoverImageMode("blank")} title="留白不带字" /></OptionGroup>
-        {coverImageMode !== "off" && <label>封面模板<select value={coverTemplateId} onChange={e => setCoverTemplateId(e.target.value)}>{coverTemplates.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>}
+        {materialSource === "ai" && <div className="reference-row"><div><b>主角参考图</b><small>可选 · 出现主角的分镜会以参考图保持人物一致{referenceImagePath ? ` · ${referenceImagePath.split(/[\\/]/).pop()}` : ""}</small></div><div className="reference-actions"><button className="reference-upload-empty" onClick={async () => { const selected = await window.storybound.selectImage(); if (selected) setReferenceImagePath(selected); }}><Upload size={15} />{referenceImagePath ? "更换参考图" : "上传主角参考图"}</button>{referenceImagePath && <button className="icon-btn" title="移除参考图" onClick={() => setReferenceImagePath("")}><X size={15} /></button>}</div></div>}
       </CreateSection>
 
+      {materialSource === "ai" && <CreateSection title="封面海报" desc="发布时上传的封面，独立于正片">
+        <OptionGroup title="封面海报" hint={coverImageMode === "off" ? "任务完成后仍可手动生成" : coverImageMode === "titled" ? "生成带主标题的封面" : "生成不带文字的留白封面"}><Choice active={coverImageMode === "off"} onClick={() => setCoverImageMode("off")} title="不生成" /><Choice active={coverImageMode === "titled"} onClick={() => setCoverImageMode("titled")} title="带标题文字" /><Choice active={coverImageMode === "plain"} onClick={() => setCoverImageMode("plain")} title="留白不带字" /></OptionGroup>
+        {coverImageMode !== "off" && <label className="field-title">封面模板<select value={coverTemplateId} onChange={e => setCoverTemplateId(e.target.value)}>{coverTemplates.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>}
+      </CreateSection>}
+
       <CreateSection title="配音" desc="音色 · 语速 · 背景音乐">
-        {taskType === "story" && <><OptionGroup title="配音员"><div className="voice-tabs"><button data-active>豆包</button><button disabled>MiniMax</button></div>{voices.map(([id, name, version]) => <Choice key={id} active={speaker === id} onClick={() => setSpeaker(id)} title={name} badge={version} />)}</OptionGroup>
+        {taskType === "story" && <><OptionGroup title="配音员">
+          <div className="voice-tabs"><button data-active>{ttsProvider === "system" ? "本机系统语音" : "火山引擎"}</button></div>
+          {ttsProvider === "system" ? <>
+            <Choice active={!speaker} onClick={() => setSpeaker("")} title="系统默认音色" desc="免费 · 无需 Key" />
+            {systemVoices.filter(item => item.enabled).slice(0, 8).map(item => <Choice key={item.id} active={speaker === item.id} onClick={() => setSpeaker(item.id)} title={item.name} desc={item.culture || "本机音色"} />)}
+            {!systemVoices.length && <p className="form-hint">没有读取到系统音色时会使用 Windows 默认声音；可在“设置 → TTS 配音”中测试。</p>}
+          </> : voices.map(item => <Choice key={item.id} active={speaker === item.id} onClick={() => setSpeaker(item.id)} title={item.name} desc={item.desc} badge={item.version} />)}
+        </OptionGroup>
           <OptionGroup title="配音语速"><Choice active={ttsSpeed === .85} onClick={() => setTtsSpeed(.85)} title="慢速" desc="0.85×" /><Choice active={ttsSpeed === 1} onClick={() => setTtsSpeed(1)} title="默认" desc="1.0×" /><Choice active={ttsSpeed === 1.15} onClick={() => setTtsSpeed(1.15)} title="快速" desc="1.15×" /><Choice active={ttsSpeed === 1.3} onClick={() => setTtsSpeed(1.3)} title="更快" desc="1.3×" /></OptionGroup></>}
         <OptionGroup title="背景音乐">{bgmItems.map(item => <Choice key={item.id} active={bgmId === item.id} onClick={() => setBgmId(item.id)} title={item.id === "builtin" ? "🎵 内置 BGM" : item.name} />)}<button className="choice-chip" onClick={async () => { const added = await window.storybound.addBgm(); if (added) { setBgmItems(await window.storybound.listBgm()); setBgmId(added.id); } }}><Plus size={14} />添加</button></OptionGroup>
       </CreateSection>
@@ -452,19 +614,26 @@ function CreateTask({ onCreated, onManageTemplates, onManageStyles }: { onCreate
       <div className="advanced-block">
         <button className="advanced-trigger" onClick={() => setAdvancedOpen(!advancedOpen)}>{advancedOpen ? "▼" : "▶"} <span><b>高级选项</b><small>处理模式 · 暂停确认（默认值通常已足够）</small></span></button>
         {advancedOpen && <div className="advanced-content">
-          <OptionGroup title="处理模式" hint="后续提示词、生图、配音和剪映草稿都会继续执行"><Choice active={processingMode === "auto"} onClick={() => setProcessingMode("auto")} title="全自动" badge="推荐" /><Choice active={processingMode === "semi"} onClick={() => setProcessingMode("semi")} title="半自动" /><Choice active={processingMode === "direct"} onClick={() => setProcessingMode("direct")} title="直接出片" /></OptionGroup>
-          <OptionGroup title="暂停确认" hint="选择流水线在哪些步骤后暂停，等你确认再继续"><Choice active={pauseMode === "none"} onClick={() => setPauseMode("none")} title="不暂停" /><Choice active={pauseMode === "critical"} onClick={() => setPauseMode("critical")} title="关键节点" badge="推荐" /><Choice active={pauseMode === "every"} onClick={() => setPauseMode("every")} title="每步确认" /><Choice active={pauseMode === "custom"} onClick={() => setPauseMode("custom")} title="自定义" /></OptionGroup>
-          {pauseMode === "custom" && <div className="pause-points"><b>勾选“哪些步骤后暂停让我确认”</b>{["文案预审", "智能改写", "分句分镜", "提示词生成", "批量生图", "TTS 配音"].map((name, index) => <label key={name}><input type="checkbox" checked={pausePoints.includes(index)} onChange={e => setPausePoints(current => e.target.checked ? [...current, index] : current.filter(item => item !== index))} />Step {index} · {name}</label>)}</div>}
-          <label>提示词模板<select value={promptTemplateId} onChange={e => setPromptTemplateId(e.target.value)}><option value="">跟随赛道默认</option><optgroup label="系统模板">{systemPromptTemplates.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</optgroup>{promptTemplates.length > 0 && <optgroup label="自定义模板">{promptTemplates.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</optgroup>}</select></label>
+          <div className="advanced-two-column">
+            <OptionGroup title="处理模式" hint="后续提示词、生图、配音和剪映草稿都会继续执行"><Choice active={normalizedProcessingMode === "auto"} onClick={() => setProcessingMode("auto")} title="全自动" badge="推荐" /><Choice active={normalizedProcessingMode === "semi_auto"} onClick={() => setProcessingMode("semi_auto")} title="半自动" /><Choice active={normalizedProcessingMode === "direct"} onClick={() => setProcessingMode("direct")} title="直接出片" /></OptionGroup>
+            <OptionGroup title="暂停确认" hint="选择流水线在哪些步骤后暂停，等你确认再继续"><Choice active={pauseMode === "none"} onClick={() => setPauseMode("none")} title="不暂停" /><Choice active={pauseMode === "critical"} onClick={() => setPauseMode("critical")} title="关键节点" badge="推荐" /><Choice active={pauseMode === "every"} onClick={() => setPauseMode("every")} title="每步确认" /><Choice active={pauseMode === "custom"} onClick={() => setPauseMode("custom")} title="自定义" /></OptionGroup>
+          </div>
+          {pauseMode === "custom" && <div className="pause-points"><b>勾选“哪些步骤后暂停让我确认”{disabledPauseSteps.length ? "（灰色项已被处理模式跳过）" : ""}</b>{["文案预审", "智能改写", "分句分镜", "提示词生成", "批量生图", "TTS 配音"].map((name, index) => { const disabled = disabledPauseSteps.includes(index); return <label className={disabled ? "disabled" : ""} key={name}><input type="checkbox" disabled={disabled} checked={!disabled && effectivePausePoints.includes(index)} onChange={e => setPausePoints(current => e.target.checked ? [...current.filter(item => item !== index), index] : current.filter(item => item !== index))} />Step {index} · {name}</label>; })}</div>}
+          {normalizedProcessingMode !== "auto" && <div className="mode-note">{normalizedProcessingMode === "semi_auto" ? "半自动：完整保留输入原文，AI 只提取主角/产品档案、拆分镜头并生成画面提示词。" : "直接出片：跳过预审、改写和智能分句，按空行或句号机械切分。"}</div>}
+          <label>提示词模板<select value={promptTemplateId} onChange={e => setPromptTemplateId(e.target.value)}><option value="">跟随赛道默认</option><optgroup label="系统模板">{systemPromptTemplates.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</optgroup>{promptTemplates.length > 0 && <optgroup label="自定义模板">{promptTemplates.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</optgroup>}</select><small>全自动与半自动会执行文案/元数据/分镜三阶段规划；直接出片不调用大模型。</small></label>
         </div>}
       </div>
-      <div className="create-submit-bar"><div><b>自定义 / 其他</b><small>当前语言模型 · 预计 3–6 分钟完成</small></div><button disabled={!text.trim() || saving} onClick={() => submit(false)}>保存为草稿</button><button className="primary" disabled={!text.trim() || saving} onClick={() => submit(true)}>{saving ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />}开始生成 <kbd>Ctrl+Enter</kbd></button></div>
+      <div className="create-submit-bar"><div><b>自定义 / 其他</b><small>{canStart ? "当前语言模型 · 可开始生成" : canSave ? `还需 ${Math.max(0, 50 - text.trim().length)} 字才能开始生成` : "请输入至少 50 字文案"}</small></div><button disabled={!canSave || saving} onClick={() => submit(false)}>{draftJustSaved ? <CheckCircle2 size={15} /> : <Save size={15} />}{draftJustSaved ? "已保存" : "保存为草稿"}</button><button className="primary" disabled={!canStart || saving} onClick={() => submit(true)}>{saving ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />}开始生成 <kbd>Ctrl+Enter</kbd></button></div>
     </div>
   </section>;
 }
 
 function CreateSection({ title, desc, children }: { title: string; desc: string; children: React.ReactNode }) {
-  return <section className="create-section"><header><h2>{title}</h2><span>{desc}</span></header><div className="create-section-body">{children}</div></section>;
+  const Icon = title === "文案" ? FileText : title === "出图" ? Image : title === "封面海报" ? Sparkles : Mic2;
+  return <div className="create-section">
+    <header><span className="create-section-icon"><Icon size={16} /></span><div><h2>{title}</h2><span>{desc}</span></div></header>
+    <div className="create-section-body">{children}</div>
+  </div>;
 }
 
 function OptionGroup({ title, hint, children }: { title: string; hint?: string; children: React.ReactNode }) {
@@ -482,7 +651,7 @@ function SettingsPage({ config, onSave }: { config: AppConfig; onSave: (config: 
     setDraft({ ...draft, [section]: value });
 
   return <section>
-    <PageHeader eyebrow="PREFERENCES" title="设置" desc="配置语言模型、外部生图、火山配音、剪映草稿与本地路径。"
+    <PageHeader eyebrow="PREFERENCES" title="设置" desc="配置语言模型、外部生图、本机/火山配音、剪映草稿与本地路径。"
       actions={<button className="primary" onClick={() => onSave(draft)}>保存设置</button>} />
     <div className="settings-grid">
       <div className="settings-nav">
@@ -572,7 +741,7 @@ function LlmSettings({ draft, setDraft }: { draft: AppConfig; setDraft: (next: A
         <div className="llm-field"><span>协议<small>必选</small></span><div className="protocol-grid">
           <button className={editing.protocol === "openai" ? "selected" : ""} onClick={() => setEditing({ ...editing, protocol: "openai" })}><strong>OpenAI 兼容</strong><small>/chat/completions</small></button>
           <button className={editing.protocol === "anthropic" ? "selected" : ""} onClick={() => setEditing({ ...editing, protocol: "anthropic" })}><strong>Claude 原生</strong><small>/messages</small></button>
-        </div><p className="field-help">走 OpenAI 兼容 /chat/completions 还是 Claude 原生 /messages。Claude 中转站通常选择 Claude 原生。</p></div>
+        </div><p className="field-help">必须按服务商文档选择：接口地址包含 /chat/completions 时选 OpenAI 兼容；明确提供 /v1/messages 时才选 Claude 原生。很多 Claude 中转站实际仍使用 OpenAI 兼容协议。</p></div>
         <label className="llm-field"><span>API Key<small>必填</small></span><div className="secret-input">
           <input type={showKey ? "text" : "password"} value={editing.api_key || ""} onChange={e => setEditing({ ...editing, api_key: e.target.value })} />
           <button title="显示或隐藏" onClick={() => setShowKey(value => !value)}><Eye size={16} /></button>
@@ -622,40 +791,59 @@ function ImageSettings({ draft, setDraft }: { draft: AppConfig; setDraft: (next:
   const provider = draft.image_provider;
   const [testMessage, setTestMessage] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
-  const ratios = ["9:16", "4:3", "1:1", "16:9"];
-  const setProvider = (next: string) => setDraft({ ...draft, image_provider: next });
+  const [showKey, setShowKey] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const ratios = ["9:16", "3:4", "1:1", "4:3", "16:9"];
+  const setProvider = (next: string) => {
+    setTestMessage("");
+    setDraft({ ...draft, image_provider: next });
+  };
   const updateCustom = (patch: Partial<AppConfig["custom_image"]>) => setDraft({ ...draft, custom_image: { ...draft.custom_image, ...patch } });
   const updateModelscope = (patch: Partial<AppConfig["modelscope"]>) => setDraft({ ...draft, modelscope: { ...draft.modelscope, ...patch } });
   const updateRunningHub = (patch: Partial<AppConfig["runninghub"]>) => setDraft({ ...draft, runninghub: { ...draft.runninghub, ...patch } });
   const common = provider === "modelscope" ? draft.modelscope : provider === "runninghub" ? draft.runninghub : draft.custom_image;
+  const testLabel = provider === "custom_image" ? "测试生图（会消耗额度）" : "测试连接";
+
   return <>
-    <PanelHeading icon={Image} title="AI 绘图" desc="分镜图片生成 · 支持自定义外部生图 API、魔搭与 RunningHub" />
+    <PanelHeading icon={Image} title="AI 绘图" desc="分镜图片生成 · 支持 OpenAI 兼容 Images API、魔搭与 RunningHub" />
     <div className="image-provider-tabs">
-      <button className={provider === "custom_image" ? "active" : ""} onClick={() => setProvider("custom_image")}>外部生图 API{provider === "custom_image" && <small>使用中</small>}</button>
+      <button className={provider === "custom_image" ? "active" : ""} onClick={() => setProvider("custom_image")}>OpenAI 兼容接口{provider === "custom_image" && <small>使用中</small>}</button>
       <button className={provider === "modelscope" ? "active" : ""} onClick={() => setProvider("modelscope")}>魔搭免费{provider === "modelscope" && <small>使用中</small>}</button>
       <button className={provider === "runninghub" ? "active" : ""} onClick={() => setProvider("runninghub")}>RunningHub{provider === "runninghub" && <small>使用中</small>}</button>
     </div>
     <div className="image-settings-card">
       {provider === "custom_image" && <>
-        <div className="info-box">接入你自己的生图工具。默认兼容 OpenAI Images API，也支持异步“提交任务 → 轮询结果”接口。</div>
-        <div className="form-grid">
-          <label>显示名称<input value={draft.custom_image.display_name} onChange={e => updateCustom({ display_name: e.target.value })} placeholder="例如：公司生图服务" /></label>
-          <label>模型<input value={draft.custom_image.model} onChange={e => updateCustom({ model: e.target.value })} /></label>
-          <label className="full">Base URL<input value={draft.custom_image.base_url} onChange={e => updateCustom({ base_url: e.target.value })} placeholder="https://api.example.com/v1" /></label>
-          <label className="full">API Key<input type="password" value={draft.custom_image.api_key} onChange={e => updateCustom({ api_key: e.target.value })} /></label>
-          <label className="full">提交路径<input value={draft.custom_image.submit_path} onChange={e => updateCustom({ submit_path: e.target.value })} placeholder="/images/generations" /></label>
-          <label className="check-label"><input type="checkbox" checked={draft.custom_image.async_mode} onChange={e => updateCustom({ async_mode: e.target.checked })} />异步任务模式</label>
-          <label className="full">代理地址（可选）<input value={draft.custom_image.proxy_url} onChange={e => updateCustom({ proxy_url: e.target.value })} /></label>
+        <div className="info-box">
+          已对接 OpenAI 官方接口格式：无参考图时调用 <code>/images/generations</code>，上传参考图后自动调用 <code>/images/edits</code>。API Key 只保存到本机配置文件，不会写入源码。
         </div>
-        <button className="text-action" onClick={() => setShowAdvanced(value => !value)}>{showAdvanced ? "收起高级映射" : "展开异步与字段映射"}</button>
+        <div className="form-grid">
+          <label>显示名称<input value={draft.custom_image.display_name} onChange={e => updateCustom({ display_name: e.target.value })} placeholder="例如：GPT Image 中转接口" /></label>
+          <label>模型<small>接口示例使用 gpt-image-2</small><input value={draft.custom_image.model} onChange={e => updateCustom({ model: e.target.value })} placeholder="gpt-image-2" /></label>
+          <label className="full">Base URL<small>填写到 /v1 即可，也兼容直接粘贴完整 generations 地址</small><input value={draft.custom_image.base_url} onChange={e => updateCustom({ base_url: e.target.value })} placeholder="https://dm-fox.rjj.cc/codex/v1" /></label>
+          <label className="full">API Key<small>在这里填写你自己的 Key</small><div className="secret-input">
+            <input type={showKey ? "text" : "password"} value={draft.custom_image.api_key} onChange={e => updateCustom({ api_key: e.target.value })} placeholder="sk-xxxx" />
+            <button title="显示或隐藏" onClick={() => setShowKey(value => !value)}><Eye size={16} /></button>
+            <button title="复制" onClick={() => window.storybound.writeClipboard(draft.custom_image.api_key)}><Copy size={16} /></button>
+          </div></label>
+          <label>文生图路径<input value={draft.custom_image.submit_path} onChange={e => updateCustom({ submit_path: e.target.value })} placeholder="/images/generations" /></label>
+          <label>参考图编辑路径<input value={draft.custom_image.edit_path} onChange={e => updateCustom({ edit_path: e.target.value })} placeholder="/images/edits" /></label>
+          <label>图片质量<select value={draft.custom_image.quality} onChange={e => updateCustom({ quality: e.target.value })}><option value="high">high</option><option value="medium">medium</option><option value="low">low</option><option value="auto">auto</option></select></label>
+          <label>文生图返回格式<select value={draft.custom_image.response_format} onChange={e => updateCustom({ response_format: e.target.value })}><option value="auto">不传（按接口默认）</option><option value="b64_json">b64_json</option><option value="url">url</option></select></label>
+          <label>参考图返回格式<select value={draft.custom_image.edit_response_format} onChange={e => updateCustom({ edit_response_format: e.target.value })}><option value="b64_json">b64_json（文档示例）</option><option value="url">url</option><option value="auto">不传此字段</option></select></label>
+          <label className="full">代理地址（可选）<input value={draft.custom_image.proxy_url} onChange={e => updateCustom({ proxy_url: e.target.value })} placeholder="http://127.0.0.1:7890" /></label>
+        </div>
+        <button className="text-action" onClick={() => setShowAdvanced(value => !value)}>{showAdvanced ? "收起高级设置" : "展开高级设置"}</button>
         {showAdvanced && <div className="form-grid advanced-image-fields">
-          <label className="full">状态查询路径<input value={draft.custom_image.status_path} onChange={e => updateCustom({ status_path: e.target.value })} placeholder="/tasks/{task_id}" /></label>
-          <label>任务 ID 字段<input value={draft.custom_image.task_id_field} onChange={e => updateCustom({ task_id_field: e.target.value })} /></label>
-          <label>状态字段<input value={draft.custom_image.status_field} onChange={e => updateCustom({ status_field: e.target.value })} /></label>
-          <label>图片字段<input value={draft.custom_image.image_field} onChange={e => updateCustom({ image_field: e.target.value })} /></label>
-          <label>成功状态<input value={draft.custom_image.success_values} onChange={e => updateCustom({ success_values: e.target.value })} /></label>
-          <label className="full">比例映射 JSON<textarea value={draft.custom_image.ratio_mapping_json} onChange={e => updateCustom({ ratio_mapping_json: e.target.value })} placeholder={'{"9:16":"1024x1792","16:9":"1792x1024"}'} /></label>
-          <label className="full">额外请求体 JSON<textarea value={draft.custom_image.extra_body_json} onChange={e => updateCustom({ extra_body_json: e.target.value })} placeholder='{"quality":"high"}' /></label>
+          <label className="check-label"><input type="checkbox" checked={draft.custom_image.async_mode} onChange={e => updateCustom({ async_mode: e.target.checked })} />异步任务模式</label>
+          {draft.custom_image.async_mode && <>
+            <label className="full">状态查询路径<input value={draft.custom_image.status_path} onChange={e => updateCustom({ status_path: e.target.value })} placeholder="/tasks/{task_id}" /></label>
+            <label>任务 ID 字段<input value={draft.custom_image.task_id_field} onChange={e => updateCustom({ task_id_field: e.target.value })} /></label>
+            <label>状态字段<input value={draft.custom_image.status_field} onChange={e => updateCustom({ status_field: e.target.value })} /></label>
+            <label>图片字段<input value={draft.custom_image.image_field} onChange={e => updateCustom({ image_field: e.target.value })} /></label>
+            <label>成功状态<input value={draft.custom_image.success_values} onChange={e => updateCustom({ success_values: e.target.value })} /></label>
+          </>}
+          <label className="full">比例映射 JSON<textarea value={draft.custom_image.ratio_mapping_json} onChange={e => updateCustom({ ratio_mapping_json: e.target.value })} placeholder={'{"9:16":"1024x1536","3:4":"1024x1536","1:1":"1024x1024","16:9":"1536x1024"}'} /><small>留空时会自动把横图映射为 1536×1024、竖图映射为 1024×1536。</small></label>
+          <label className="full">额外请求参数 JSON<textarea value={draft.custom_image.extra_body_json} onChange={e => updateCustom({ extra_body_json: e.target.value })} placeholder='{"background":"opaque"}' /><small>文生图时合并到 JSON 请求体；参考图编辑时转换为 multipart 表单字段。</small></label>
         </div>}
       </>}
       {provider === "modelscope" && <div className="form-grid">
@@ -667,108 +855,152 @@ function ImageSettings({ draft, setDraft }: { draft: AppConfig; setDraft: (next:
       </div>}
       {provider === "runninghub" && <div className="form-grid">
         <label className="full">API Key<input type="password" value={draft.runninghub.api_key} onChange={e => updateRunningHub({ api_key: e.target.value })} /></label>
-        <label>Workflow ID<input value={draft.runninghub.workflow_id} onChange={e => updateRunningHub({ workflow_id: e.target.value })} /></label>
-        <label>提示词节点 ID<input value={draft.runninghub.prompt_node_id} onChange={e => updateRunningHub({ prompt_node_id: e.target.value })} /></label>
-        <label>提示词字段名<input value={draft.runninghub.prompt_field_name} onChange={e => updateRunningHub({ prompt_field_name: e.target.value })} /></label>
+        <label>官方图片模型<select value={draft.runninghub.model || "rh-image-g2"} onChange={e => updateRunningHub({ model: e.target.value })}><option value="rh-image-g2">全能图片 G-2.0</option><option value="rh-image-x">全能图片 X</option><option value="rh-image-v2">全能图片 V2</option></select></label>
         <label>代理地址<input value={draft.runninghub.proxy_url} onChange={e => updateRunningHub({ proxy_url: e.target.value })} /></label>
-        <label className="full">固定节点参数 JSON<textarea value={draft.runninghub.node_info_json} onChange={e => updateRunningHub({ node_info_json: e.target.value })} placeholder='[{"nodeId":"5","fieldName":"width","fieldValue":"1024"}]' /><small>参考图节点的 fieldValue 可填写 {"{{reference_image}}"}，生成时会自动上传并替换。</small></label>
+        <label className="full">自定义 Workflow ID（可选）<input value={draft.runninghub.workflow_id} onChange={e => updateRunningHub({ workflow_id: e.target.value })} placeholder="留空则使用上方官方模型" /><small>填写后将改用旧版自定义工作流；动态分镜仍使用官方图生视频接口。</small></label>
+        {draft.runninghub.workflow_id && <><label>提示词节点 ID<input value={draft.runninghub.prompt_node_id} onChange={e => updateRunningHub({ prompt_node_id: e.target.value })} /></label><label>提示词字段名<input value={draft.runninghub.prompt_field_name} onChange={e => updateRunningHub({ prompt_field_name: e.target.value })} /></label><label className="full">固定节点参数 JSON<textarea value={draft.runninghub.node_info_json} onChange={e => updateRunningHub({ node_info_json: e.target.value })} placeholder='[{"nodeId":"5","fieldName":"width","fieldValue":"1024"}]' /><small>参考图节点的 fieldValue 可填写 {"{{reference_image}}"}，生成时会自动上传并替换。</small></label></>}
       </div>}
       <div className="image-common-settings">
         <strong>画面比例</strong><div>{ratios.map(ratio => <button className={common.ratio === ratio ? "selected" : ""} onClick={() => provider === "modelscope" ? updateModelscope({ ratio }) : provider === "runninghub" ? updateRunningHub({ ratio }) : updateCustom({ ratio })} key={ratio}>{ratio}</button>)}</div>
         <label>并发数<input type="number" min={1} max={6} value={common.concurrency} onChange={e => provider === "modelscope" ? updateModelscope({ concurrency: Number(e.target.value) }) : provider === "runninghub" ? updateRunningHub({ concurrency: Number(e.target.value) }) : updateCustom({ concurrency: Number(e.target.value) })} /></label>
       </div>
-      <div className="tts-test-row"><button onClick={async () => { try { const result = await window.storybound.testConfig("image", draft); setTestMessage(result.message); } catch (error) { setTestMessage(error instanceof Error ? error.message : String(error)); } }}><RefreshCw size={15} />测试连接</button>{testMessage && <span className={/成功|完整|可用/.test(testMessage) ? "success" : "failed"}>{testMessage}</span>}</div>
+      <div className="tts-test-row"><button disabled={testing} onClick={async () => {
+        setTesting(true); setTestMessage("");
+        try {
+          const result = await window.storybound.testConfig("image", draft);
+          setTestMessage(result.message);
+        } catch (error) {
+          setTestMessage(error instanceof Error ? error.message : String(error));
+        } finally { setTesting(false); }
+      }}>{testing ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}{testing ? "测试中…" : testLabel}</button>{testMessage && <span className={/成功|完整|可用/.test(testMessage) ? "success" : "failed"}>{testMessage}</span>}</div>
     </div>
   </>;
 }
 
 function TtsSettings({ draft, setDraft }: { draft: AppConfig; setDraft: (next: AppConfig) => void }) {
-  const voices = [
-    { id: "zh_female_xiaohe_uranus_bigtts", name: "小何", desc: "甜美活泼", version: "2.0" },
-    { id: "zh_male_yunzhou_jupiter_bigtts", name: "云舟", desc: "清爽沉稳", version: "2.0" },
-    { id: "zh_male_xiaotian_jupiter_bigtts", name: "小天", desc: "清爽磁性", version: "2.0" },
-    { id: "zh_male_dayixiansheng_v2_saturn_bigtts", name: "大壹先生", desc: "沉稳叙述", version: "2.0" },
-    { id: "zh_male_dongfanghaoran_moon_bigtts", name: "东方浩然", desc: "沉稳叙述", version: "1.0" },
-    { id: "zh_male_jieshuonansheng_moon_bigtts", name: "悬疑解说", desc: "纪录片感", version: "1.0" },
-    { id: "zh_female_wenrouxiaoya_moon_bigtts", name: "温柔小雅", desc: "治愈女声", version: "1.0" },
-    { id: "zh_female_wenrou_moon_bigtts", name: "温柔妈妈", desc: "温柔", version: "1.0" }
-  ];
+  const voices = VOLC_VOICES;
   const [presets, setPresets] = useState<VoicePreset[]>([]);
-  const [presetName, setPresetName] = useState("");
-  const [showKey, setShowKey] = useState(false);
+  const [systemVoices, setSystemVoices] = useState<SystemVoice[]>([]);
   const [showMore, setShowMore] = useState(false);
-  const [testMessage, setTestMessage] = useState("");
+  const [showKey, setShowKey] = useState(false);
+  const [presetName, setPresetName] = useState("");
   const [testing, setTesting] = useState(false);
-  useEffect(() => { window.storybound.listVoicePresets().then(setPresets); }, []);
+  const [testMessage, setTestMessage] = useState("");
+  const [testAudio, setTestAudio] = useState("");
+  const [testAudioKey, setTestAudioKey] = useState(0);
+  useEffect(() => {
+    window.storybound.listVoicePresets().then(setPresets);
+    window.storybound.listSystemVoices().then(setSystemVoices).catch(() => setSystemVoices([]));
+  }, []);
+  const provider = draft.tts.provider || "system";
+  const systemSection = draft.tts.system || { voice: "", volume: 100 };
   const section = draft.tts.volcengine;
-  const update = (patch: Partial<AppConfig["tts"]["volcengine"]>) =>
+  const updateProvider = (next: string) => {
+    setDraft({ ...draft, tts: { ...draft.tts, provider: next } });
+    setTestMessage(""); setTestAudio("");
+  };
+  const updateSystem = (patch: Partial<AppConfig["tts"]["system"]>) =>
+    setDraft({ ...draft, tts: { ...draft.tts, provider: "system", system: { ...systemSection, ...patch } } });
+  const updateVolc = (patch: Partial<AppConfig["tts"]["volcengine"]>) =>
     setDraft({ ...draft, tts: { ...draft.tts, provider: "volcengine", volcengine: { ...section, ...patch } } });
   const chooseVersion = (version: string) => {
     const firstVoice = voices.find(item => item.version === version);
-    update({
+    updateVolc({
       engine_version: version,
       resource_id: version === "1.0" ? "seed-tts-1.0" : "seed-tts-2.0",
       speaker: firstVoice?.id || section.speaker
     });
-    setTestMessage("");
+    setTestMessage(""); setTestAudio("");
   };
   const visibleVoices = voices.filter(item => item.version === section.engine_version);
+  const playOfficialPreview = (voice: VolcVoiceOption) => {
+    if (!voice.previewUrl) return;
+    setTesting(false);
+    setTestMessage(`${voice.name} · 官方公开样音（不需要 Key，不消耗合成额度）`);
+    setTestAudio(voice.previewUrl);
+    setTestAudioKey(value => value + 1);
+  };
+  const runTest = async () => {
+    setTesting(true); setTestMessage(""); setTestAudio("");
+    try {
+      const result = await window.storybound.testConfig("tts", draft);
+      setTestMessage(result.message);
+      setTestAudio(result.dataUrl || "");
+      setTestAudioKey(value => value + 1);
+    } catch (error) {
+      setTestMessage(error instanceof Error ? error.message : String(error));
+    } finally { setTesting(false); }
+  };
   return <>
-    <PanelHeading icon={Volume2} title="TTS 配音" desc="每镜语音生成 · 仅支持火山引擎" />
+    <PanelHeading icon={Volume2} title="TTS 配音" desc="本机免费语音或火山引擎 · 可直接生成试听" />
     <div className="tts-card">
-      <div className="tts-field"><span>引擎</span><div className="tts-engine-grid">
-        <button className="selected" disabled><strong>火山引擎</strong><small>音色丰富 · 情感自然</small></button>
-      </div><p>火山引擎按字符付费，支持语音合成模型 2.0 与 1.0。</p></div>
-      <label className="tts-field"><span>App ID <small>必填</small></span>
-        <input value={section.app_id} onChange={e => update({ app_id: e.target.value })} />
-        <p>请填写火山引擎控制台中的 App ID。</p>
-      </label>
-      <label className="tts-field"><span>Access Token <small>必填</small></span><div className="secret-input">
-        <input type={showKey ? "text" : "password"} value={section.access_key} onChange={e => update({ access_key: e.target.value })} />
-        <button title="显示或隐藏" onClick={() => setShowKey(value => !value)}><Eye size={16} /></button>
-        <button title="复制" onClick={() => window.storybound.writeClipboard(section.access_key)}><Copy size={16} /></button>
-      </div></label>
-      <div className="tts-field"><span>默认配音员</span>
-        <div className="tts-version-row">
-          <button className={section.engine_version === "2.0" ? "selected" : ""} onClick={() => chooseVersion("2.0")}><strong>语音合成 2.0</strong><small>情感更自然</small></button>
-          <button className={section.engine_version === "1.0" ? "selected" : ""} onClick={() => chooseVersion("1.0")}><strong>语音合成 1.0</strong><small>经典音色</small></button>
-          <button className="more-voices" onClick={() => setShowMore(value => !value)}>更多音色…</button>
+      <div className="tts-field"><span>配音引擎</span><div className="tts-engine-grid">
+        <button className={provider === "system" ? "selected" : ""} onClick={() => updateProvider("system")}><strong>本机系统语音</strong><small>免费 · 离线 · 无需 Key</small></button>
+        <button className={provider === "volcengine" ? "selected" : ""} onClick={() => updateProvider("volcengine")}><strong>火山引擎</strong><small>自然度更高 · 按量付费</small></button>
+      </div><p>{provider === "system" ? "调用 Windows 自带 SAPI 语音，适合先测试完整流程。" : "火山引擎支持语音合成模型 2.0 与 1.0。"}</p></div>
+
+      {provider === "system" ? <>
+        <label className="tts-field"><span>本机音色</span>
+          <select value={systemSection.voice || ""} onChange={e => updateSystem({ voice: e.target.value })}>
+            <option value="">系统默认音色</option>
+            {systemVoices.filter(item => item.enabled).map(item => <option key={item.id} value={item.id}>{item.name} · {item.culture || "未知语言"}</option>)}
+          </select>
+          <p>{systemVoices.length ? `已读取 ${systemVoices.length} 个 Windows 音色。` : "未读取到音色列表时仍会尝试使用 Windows 默认声音。"}</p>
+        </label>
+        <label className="tts-field"><span>音量 <small>{systemSection.volume ?? 100}%</small></span>
+          <input type="range" min={0} max={100} value={systemSection.volume ?? 100} onChange={e => updateSystem({ volume: Number(e.target.value) })} />
+          <p>系统语音会生成 WAV 文件，不消耗任何接口额度。</p>
+        </label>
+      </> : <>
+        <label className="tts-field"><span>App ID <small>必填</small></span>
+          <input value={section.app_id} onChange={e => updateVolc({ app_id: e.target.value })} />
+          <p>请填写火山引擎控制台中的 App ID。</p>
+        </label>
+        <label className="tts-field"><span>Access Token <small>必填</small></span><div className="secret-input">
+          <input type={showKey ? "text" : "password"} value={section.access_key} onChange={e => updateVolc({ access_key: e.target.value })} />
+          <button title="显示或隐藏" onClick={() => setShowKey(value => !value)}><Eye size={16} /></button>
+          <button title="复制" onClick={() => window.storybound.writeClipboard(section.access_key)}><Copy size={16} /></button>
+        </div></label>
+        <div className="tts-field"><span>默认配音员</span>
+          <div className="tts-version-row">
+            <button className={section.engine_version === "2.0" ? "selected" : ""} onClick={() => chooseVersion("2.0")}><strong>语音合成 2.0</strong><small>情感更自然</small></button>
+            <button className={section.engine_version === "1.0" ? "selected" : ""} onClick={() => chooseVersion("1.0")}><strong>语音合成 1.0</strong><small>经典音色</small></button>
+            <button className="more-voices" onClick={() => setShowMore(value => !value)}>更多音色…</button>
+          </div>
+          <div className="tts-voice-grid">{visibleVoices.map(item =>
+            <article key={item.id} className={`tts-voice-card ${section.speaker === item.id ? "selected" : ""}`}>
+              <button className="tts-voice-select" onClick={() => updateVolc({ speaker: item.id })}>
+                <strong>{item.name}</strong><small>{item.desc}</small><em>{item.version}</em>
+              </button>
+              {item.previewUrl
+                ? <button className="tts-official-preview" title={`播放${item.name}官方公开样音`} onClick={() => playOfficialPreview(item)}><Play size={13} />{item.previewLabel || "官方样音"}</button>
+                : <span className="tts-preview-unavailable">暂无公开样音</span>}
+            </article>)}
+          </div>
+          <p>“官方样音”直接播放火山引擎官网公开试听文件，不需要 App ID 或 Token；正式合成仍使用你自己的接口配置。</p>
         </div>
-        <div className="tts-voice-grid">{visibleVoices.slice(0, 4).map(item =>
-          <button key={item.id} className={section.speaker === item.id ? "selected" : ""} onClick={() => update({ speaker: item.id })}>
-            <strong>{item.name}</strong><small>{item.desc}</small>
-          </button>)}
-        </div>
-        <p>创建任务时以此为默认音色；收藏或自定义音色也可以直接使用。</p>
-      </div>
-      {showMore && <div className="tts-more-panel">
-        <label>自定义音色 ID<input value={section.speaker} onChange={e => update({ speaker: e.target.value })} placeholder="从火山引擎控制台复制 Speaker ID" /></label>
-        <div className="tts-preset-row">
-          <select onChange={e => {
-            const item = presets.find(preset => preset.id === e.target.value);
-            if (item) update({ speaker: item.voice_id });
-          }}><option value="">选择已收藏音色</option>{presets.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
-          <input value={presetName} onChange={e => setPresetName(e.target.value)} placeholder="收藏名称" />
-          <button onClick={async () => {
-            if (!presetName.trim() || !section.speaker.trim()) return;
-            await window.storybound.saveVoicePreset({ name: presetName, provider: "volcengine", voice_id: section.speaker });
-            setPresets(await window.storybound.listVoicePresets()); setPresetName("");
-          }}><Save size={14} />收藏当前音色</button>
-        </div>
-      </div>}
+        {showMore && <div className="tts-more-panel">
+          <label>自定义音色 ID<input value={section.speaker} onChange={e => updateVolc({ speaker: e.target.value })} placeholder="从火山引擎控制台复制 Speaker ID" /></label>
+          <div className="tts-preset-row">
+            <select onChange={e => {
+              const item = presets.find(preset => preset.id === e.target.value);
+              if (item) updateVolc({ speaker: item.voice_id });
+            }}><option value="">选择已收藏音色</option>{presets.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select>
+            <input value={presetName} onChange={e => setPresetName(e.target.value)} placeholder="收藏名称" />
+            <button onClick={async () => {
+              if (!presetName.trim() || !section.speaker.trim()) return;
+              await window.storybound.saveVoicePreset({ name: presetName, provider: "volcengine", voice_id: section.speaker });
+              setPresets(await window.storybound.listVoicePresets()); setPresetName("");
+            }}><Save size={14} />收藏当前音色</button>
+          </div>
+        </div>}
+      </>}
+
       <div className="tts-test-row">
-        <button disabled={testing} onClick={async () => {
-          setTesting(true); setTestMessage("");
-          try {
-            const candidate = { ...draft, tts: { ...draft.tts, provider: "volcengine" } };
-            const result = await window.storybound.testConfig("tts", candidate);
-            setTestMessage(result.message);
-          } catch (error) {
-            setTestMessage(error instanceof Error ? error.message : String(error));
-          } finally { setTesting(false); }
-        }}>{testing ? <LoaderCircle size={15} className="spin" /> : <RefreshCw size={15} />}{testing ? "测试中…" : "测试连接"}</button>
-        {testMessage && <span className={testMessage.startsWith("连接成功") ? "success" : "failed"}>{testMessage}</span>}
+        <button disabled={testing} onClick={runTest}>{testing ? <LoaderCircle size={15} className="spin" /> : <Play size={15} />}{testing ? "生成中…" : "生成试听"}</button>
+        {testMessage && <span className={/可用|官方公开样音|成功/.test(testMessage) ? "success" : "failed"}>{testMessage}</span>}
       </div>
+      {testAudio && <div className="tts-preview-audio"><audio key={testAudioKey} controls autoPlay src={testAudio} /></div>}
     </div>
   </>;
 }
@@ -981,6 +1213,22 @@ function PromptTemplates() {
   const [viewing, setViewing] = useState<PromptTemplateRecord | null>(null);
   const refresh = () => window.storybound.listPromptTemplates().then(setItems);
   useEffect(() => { refresh(); }, []);
+  const moduleOptions = [
+    ["cross-era", "跨年代", "按剧情阶段调整人物年龄、服装、建筑和道具"],
+    ["anti-text", "防台词文字", "禁止字幕、标语、商标、乱码和水印"],
+    ["character-consistency", "人物一致性", "重复注入主角外貌、发型和服装特征"],
+    ["product-consistency", "产品一致性", "保持商品、菜品或关键物件外观一致"]
+  ];
+  const readModules = (value?: string) => {
+    try { const parsed = JSON.parse(value || "[]"); return Array.isArray(parsed) ? parsed as string[] : []; }
+    catch { return []; }
+  };
+  const toggleModule = (id: string, checked: boolean) => setEditing(current => {
+    if (!current) return current;
+    const modules = readModules(current.step3_skeleton_modules_json);
+    const next = checked ? [...new Set([...modules, id])] : modules.filter(item => item !== id);
+    return { ...current, step3_skeleton_modules_json: JSON.stringify(next) };
+  });
   const save = async () => {
     if (!editing?.name) return;
     await window.storybound.savePromptTemplate(editing as Partial<PromptTemplateRecord> & { name: string });
@@ -992,47 +1240,59 @@ function PromptTemplates() {
     });
     refresh();
   };
+  const cardModeText = (item: PromptTemplateRecord) => ({ follow: "跟随赛道", force: "强制提取", skip: "强制跳过" }[item.character_card_mode || "follow"] || "跟随赛道");
   return <section>
-    <PageHeader eyebrow="PROMPT SYSTEM" title="提示词模板" desc="模板决定 AI 如何改写文案、生成元数据和编写画面提示词。"
-      actions={<><button className="secondary" onClick={async () => { await window.storybound.importPromptTemplates(); refresh(); }}><Upload size={16} />导入 JSON</button><button className="primary" onClick={() => setEditing({ name: "", base_track: "character-story", description: "", step1_rewrite_system_prompt: "", step1_metadata_system_prompt: "", step3_system_prompt: "", style_id: "cinematic", image_seed_pools_json: "[]", step3_skeleton_modules_json: "[]", reference_kind: "" })}><Plus size={16} />新建自定义模板</button></>} />
+    <PageHeader eyebrow="PROMPT SYSTEM" title="提示词模板" desc="模板控制文案改写、主角档案、分镜提示词以及每一镜是否使用参考图。"
+      actions={<><button className="secondary" onClick={async () => { await window.storybound.importPromptTemplates(); refresh(); }}><Upload size={16} />导入 JSON</button><button className="primary" onClick={() => setEditing({ name: "", base_track: "character-story", description: "", step1_rewrite_system_prompt: "", step1_metadata_system_prompt: "", step3_system_prompt: "", style_id: "cinematic", image_seed_pools_json: "[]", step3_skeleton_modules_json: "[]", character_card_mode: "follow", needs_character_card: true, reference_kind: "character", reference_decision_prompt: "只有主角在画面中清晰出现时使用参考图；环境、空镜和器物镜头不使用。", image_prompt_template: "{character_card}，{era_and_location}，{visual_action}，{ratio}构图，无文字无水印" })}><Plus size={16} />新建自定义模板</button></>} />
+    <div className="prompt-flow-note"><b>实际执行流程</b><span>Step 1 文案改写 → Step 2 主角/产品档案 → Step 3 分镜与 desc_prompt → use_reference 判断 → 图片接口</span></div>
     <h2 className="group-heading">⭐ 系统模板（{systemPromptTemplates.length}）</h2>
     <div className="system-template-list">{systemPromptTemplates.map(item =>
       <article className="system-template-card" key={item.id}>
-        <div><h3>{item.name}</h3><p>{item.description}</p><small>默认画风：{item.style_id} · id: {item.id}</small></div>
+        <div><h3>{item.name}</h3><p>{item.description}</p><small>默认画风：{item.style_id} · 主角档案：{cardModeText(item)} · 参考图：{item.reference_kind || "none"}</small></div>
         <div className="template-row-actions"><button onClick={() => setViewing(item)}><Eye size={15} />查看</button><button onClick={() => clone(item)}><Copy size={15} />克隆</button></div>
       </article>)}</div>
     <h2 className="group-heading">自定义模板（{items.length}）</h2>
     {items.length ? <div className="system-template-list">{items.map(item =>
       <article className="system-template-card" key={item.id}>
-        <div><h3>{item.name}</h3><p>{item.description || "暂无描述"}</p><small>{trackName(item.base_track)} · {item.style_id}</small></div>
+        <div><h3>{item.name}</h3><p>{item.description || "暂无描述"}</p><small>{trackName(item.base_track)} · {item.style_id} · {cardModeText(item)}</small></div>
         <div className="template-row-actions"><button onClick={() => setViewing(item)}><Eye size={15} />查看</button><button onClick={() => setEditing(item)}>编辑</button><button onClick={async () => { await window.storybound.deletePromptTemplate(item.id); refresh(); }}>删除</button></div>
       </article>)}</div> : <div className="inline-empty">还没有自定义模板，可克隆系统模板后修改。</div>}
     {editing && <EditorModal title="编辑提示词模板" onClose={() => setEditing(null)} onSave={save}>
       <label>名称<input value={editing.name || ""} onChange={e => setEditing({ ...editing, name: e.target.value })} /></label>
       <label>内容类型<select value={editing.base_track || "character-story"} onChange={e => setEditing({ ...editing, base_track: e.target.value })}>{tracks.map(track => <option key={track.id} value={track.id}>{track.name}</option>)}</select></label>
+      <label>默认画风<input value={editing.style_id || "cinematic"} onChange={e => setEditing({ ...editing, style_id: e.target.value })} placeholder="例如 black-white / cinematic" /></label>
       <label>描述<input value={editing.description || ""} onChange={e => setEditing({ ...editing, description: e.target.value })} /></label>
-      <label>文案重写要求<textarea value={editing.step1_rewrite_system_prompt || ""} onChange={e => setEditing({ ...editing, step1_rewrite_system_prompt: e.target.value })} /></label>
-      <label>元数据提取要求<textarea value={editing.step1_metadata_system_prompt || ""} onChange={e => setEditing({ ...editing, step1_metadata_system_prompt: e.target.value })} /></label>
-      <label>分镜生成要求<textarea value={editing.step3_system_prompt || ""} onChange={e => setEditing({ ...editing, step3_system_prompt: e.target.value })} /></label>
-      <label>最终图片提示词模板<textarea value={editing.image_prompt_template || ""} onChange={e => setEditing({ ...editing, image_prompt_template: e.target.value })} /></label>
+      <div className="template-editor-section"><h3>主角档案</h3><p>控制 Step 2 是否提取并向后续人物镜头注入稳定外貌信息。</p>
+        <label>提取模式<select value={editing.character_card_mode || "follow"} onChange={e => setEditing({ ...editing, character_card_mode: e.target.value as "follow" | "force" | "skip" })}><option value="follow">跟随赛道</option><option value="force">强制提取</option><option value="skip">强制跳过</option></select></label>
+        {editing.character_card_mode !== "skip" && <label className="check-label"><input type="checkbox" checked={Boolean(editing.needs_character_card)} onChange={e => setEditing({ ...editing, needs_character_card: e.target.checked })} />该赛道默认需要稳定主角档案</label>}
+      </div>
+      <div className="template-editor-section"><h3>Step 3 骨架模块</h3><p>这些规则会同时写入分镜请求，并在最终图片提示词中再次兜底。</p>
+        <div className="template-module-grid">{moduleOptions.map(([id, name, desc]) => <label key={id} className="template-module-item"><input type="checkbox" checked={readModules(editing.step3_skeleton_modules_json).includes(id)} onChange={e => toggleModule(id, e.target.checked)} /><span><b>{name}</b><small>{desc}</small></span></label>)}</div>
+      </div>
+      <div className="template-editor-section"><h3>参考图判断</h3>
+        <label>参考图类型<select value={editing.reference_kind || "none"} onChange={e => setEditing({ ...editing, reference_kind: e.target.value as PromptTemplateRecord["reference_kind"] })}><option value="none">不使用参考图</option><option value="auto">自动判断人物或产品</option><option value="character">人物参考图</option><option value="product">产品/菜品参考图</option></select></label>
+        <label>use_reference 判断标准<textarea value={editing.reference_decision_prompt || ""} onChange={e => setEditing({ ...editing, reference_decision_prompt: e.target.value })} placeholder="例如：只有主角清晰露脸时为 true；环境空镜和器物特写为 false。" /></label>
+      </div>
+      <label>Step 1 · 文案重写要求<textarea value={editing.step1_rewrite_system_prompt || ""} onChange={e => setEditing({ ...editing, step1_rewrite_system_prompt: e.target.value })} /></label>
+      <label>Step 2 · 元数据提取要求<textarea value={editing.step1_metadata_system_prompt || ""} onChange={e => setEditing({ ...editing, step1_metadata_system_prompt: e.target.value })} /></label>
+      <label>Step 3 · 分镜生成要求<textarea value={editing.step3_system_prompt || ""} onChange={e => setEditing({ ...editing, step3_system_prompt: e.target.value })} /></label>
+      <label>最终图片提示词模板<textarea value={editing.image_prompt_template || ""} onChange={e => setEditing({ ...editing, image_prompt_template: e.target.value })} /><small>可用变量：{"{character_card}"}、{"{product_card}"}、{"{era_and_location}"}、{"{visual_action}"}、{"{ratio}"}</small></label>
       <label>图片种子池 JSON<textarea value={editing.image_seed_pools_json || "[]"} onChange={e => setEditing({ ...editing, image_seed_pools_json: e.target.value })} /></label>
-      <label>分镜骨架模块 JSON<textarea value={editing.step3_skeleton_modules_json || "[]"} onChange={e => setEditing({ ...editing, step3_skeleton_modules_json: e.target.value })} /></label>
-      <label>参考图类型<select value={editing.reference_kind || ""} onChange={e => setEditing({ ...editing, reference_kind: e.target.value })}><option value="">自动</option><option value="character">人物</option><option value="product">产品</option></select></label>
-      <label className="check-label"><input type="checkbox" checked={Boolean(editing.needs_character_card)} onChange={e => setEditing({ ...editing, needs_character_card: e.target.checked })} />提取主角档案</label>
     </EditorModal>}
     {viewing && <div className="modal-backdrop" onClick={() => setViewing(null)}><div className="template-view" onClick={e => e.stopPropagation()}>
       <button className="modal-close" onClick={() => setViewing(null)}><X size={18} /></button>
       <span>{trackName(viewing.base_track)}</span><h2>{viewing.name}</h2><p>{viewing.description}</p>
       <div className="template-config-summary">
         <div><b>默认画风</b><span>{viewing.style_id}</span></div>
-        <div><b>主角档案</b><span>{viewing.needs_character_card ? "跟随赛道 / 强制提取" : "不强制"}</span></div>
-        <div><b>Step 3 骨架模块</b><span>{viewing.step3_skeleton_modules_json || "[]"}</span></div>
-        <div><b>参考图类型</b><span>{viewing.reference_kind || "自动"}</span></div>
+        <div><b>主角档案</b><span>{cardModeText(viewing)}{viewing.character_card_mode === "follow" ? ` · 赛道默认${viewing.needs_character_card ? "提取" : "跳过"}` : ""}</span></div>
+        <div><b>Step 3 骨架模块</b><span>{readModules(viewing.step3_skeleton_modules_json).map(id => moduleOptions.find(item => item[0] === id)?.[1] || id).join("、") || "无"}</span></div>
+        <div><b>参考图类型</b><span>{viewing.reference_kind || "none"}</span></div>
         <div><b>图片种子池</b><span>{viewing.image_seed_pools_json || "[]"}</span></div>
       </div>
-      <h3>文案重写要求</h3><pre>{viewing.step1_rewrite_system_prompt || "使用系统默认规则"}</pre>
-      <h3>元数据提取要求</h3><pre>{viewing.step1_metadata_system_prompt || "使用系统默认规则"}</pre>
-      <h3>分镜生成要求</h3><pre>{viewing.step3_system_prompt || "使用系统默认规则"}</pre>
+      <h3>use_reference 判断标准</h3><pre>{viewing.reference_decision_prompt || "仅主体需要保持一致时使用参考图"}</pre>
+      <h3>Step 1 · 文案重写要求</h3><pre>{viewing.step1_rewrite_system_prompt || "使用系统默认规则"}</pre>
+      <h3>Step 2 · 元数据提取要求</h3><pre>{viewing.step1_metadata_system_prompt || "使用系统默认规则"}</pre>
+      <h3>Step 3 · 分镜生成要求</h3><pre>{viewing.step3_system_prompt || "使用系统默认规则"}</pre>
       <h3>最终图片提示词模板</h3><pre>{viewing.image_prompt_template || "由分镜提示词直接生成"}</pre>
       <button className="primary" onClick={async () => { await clone(viewing); setViewing(null); }}>克隆为自定义模板</button>
     </div></div>}
@@ -1047,151 +1307,407 @@ function EditorModal({ title, children, onClose, onSave }: { title: string; chil
   </div></div>;
 }
 
+const DRAFT_CANVAS_SIZES: Record<string, { width: number; height: number }> = {
+  "9:16": { width: 1080, height: 1920 },
+  "3:4": { width: 1080, height: 1440 },
+  "1:1": { width: 1080, height: 1080 },
+  "4:3": { width: 1440, height: 1080 },
+  "16:9": { width: 1920, height: 1080 }
+};
+
+const IMAGE_ANIMATION_OPTIONS = [
+  "无动画", "缩放", "缩放 II", "左拉镜", "右拉镜",
+  "向左缩小", "向右缩小", "形变左缩", "形变右缩", "上下分割",
+  "左右分割", "向左下降", "向右下降", "旋转缩小", "旋转上升",
+  "翻转", "形变缩小", "回弹伸缩", "滑滑梯"
+];
+
+const createDraftLayer = (overrides: Record<string, unknown> = {}) => ({
+  visible: true,
+  x: 0,
+  y: 0,
+  fontSize: 20,
+  color: "#FFFFFF",
+  alpha: 1,
+  bold: false,
+  underline: false,
+  align: 1,
+  letterSpacing: 0,
+  lineSpacing: 0,
+  border: { color: "#000000", width: 0, alpha: 0 },
+  ...overrides
+});
+
+function createDraftTemplateConfig() {
+  return {
+    canvas: { width: 1080, height: 1920, ratio: "9:16", backgroundColor: "#000000", backgroundImage: "" },
+    image: { ratio: "9:16", fit: "cover", top: 0, height: 1, animation: "缩放", motionStrength: 1 },
+    title: createDraftLayer({ y: .0473958333, fontSize: 25, color: "#FFDE00", bold: true, underline: true, border: { color: "#000000", width: 40, alpha: 1 } }),
+    subtitle: createDraftLayer({ y: -.2166666667, fontSize: 12, letterSpacing: 2, lineSpacing: 4, border: { color: "#000000", width: 40, alpha: 1 } }),
+    caption: { ...createDraftLayer({ y: -.2151041667, fontSize: 12, color: "#FFDE00" }), maxCharsPerLine: 12, background: { color: "#000000", alpha: .5, roundRadius: .3 } },
+    disclaimer: { ...createDraftLayer({ y: -.903125, fontSize: 8, alpha: .26, lineSpacing: 5, border: { color: "#000000", width: 40, alpha: 1 } }), text: "图片由AI生成与网络下载\n科普视频，无不良引导" },
+    audio: { narrationVolume: 10, bgmVolume: 3, bgmFadeOutMs: 2000, defaultBgmId: "" }
+  };
+}
+
+function mergeDraftLayer(base: any, value: any) {
+  return {
+    ...base,
+    ...(value || {}),
+    border: { ...(base.border || {}), ...(value?.border || {}) },
+    ...(base.background || value?.background ? { background: { ...(base.background || {}), ...(value?.background || {}) } } : {})
+  };
+}
+
+function normalizeDraftConfig(value: any) {
+  const base = createDraftTemplateConfig();
+  const raw = value && typeof value === "object" ? value : {};
+  return {
+    ...base,
+    ...raw,
+    canvas: { ...base.canvas, ...(raw.canvas || {}) },
+    image: { ...base.image, ...(raw.image || {}) },
+    title: mergeDraftLayer(base.title, raw.title),
+    subtitle: mergeDraftLayer(base.subtitle, raw.subtitle),
+    caption: mergeDraftLayer(base.caption, raw.caption),
+    disclaimer: mergeDraftLayer(base.disclaimer, raw.disclaimer),
+    audio: { ...base.audio, ...(raw.audio || {}) }
+  };
+}
+
+function readDraftConfig(serialized: string) {
+  try { return normalizeDraftConfig(JSON.parse(serialized)); }
+  catch { return createDraftTemplateConfig(); }
+}
+
 function DraftTemplates() {
   const [templates, setTemplates] = useState<DraftTemplate[]>([]);
   const [editing, setEditing] = useState<{ id?: string; name: string; config: any } | null>(null);
   const [openSections, setOpenSections] = useState<string[]>(["canvas"]);
+  const [activeSection, setActiveSection] = useState("canvas");
   const [bgmItems, setBgmItems] = useState<BgmRecord[]>([]);
   const refresh = () => window.storybound.getTemplates().then(setTemplates);
-  useEffect(() => { refresh(); window.storybound.listBgm().then(setBgmItems); }, []);
-  const defaultLayer = (overrides: Record<string, unknown> = {}) => ({
-    visible: true, x: 0, y: 0, fontSize: 20, color: "#FFFFFF", alpha: 1,
-    bold: false, underline: false, align: 1, letterSpacing: 0, lineSpacing: 0,
-    border: { color: "#000000", width: 0, alpha: 0 }, ...overrides
-  });
-  const newConfig = () => ({
-    canvas: { width: 1080, height: 1920, ratio: "9:16", backgroundColor: "#000000", backgroundImage: "" },
-    image: { ratio: "9:16", fit: "cover", top: 0, height: 1, animation: "缩放", motionStrength: 1 },
-    title: defaultLayer({ y: .047, fontSize: 25, color: "#FFDE00", bold: true, underline: true, border: { color: "#000000", width: 40, alpha: 1 } }),
-    subtitle: defaultLayer({ y: -.216, fontSize: 12, letterSpacing: 2, lineSpacing: 4, border: { color: "#000000", width: 40, alpha: 1 } }),
-    caption: { ...defaultLayer({ y: -.215, fontSize: 12, color: "#FFDE00" }), maxCharsPerLine: 12, background: { color: "#000000", alpha: .5, roundRadius: .3 } },
-    disclaimer: { ...defaultLayer({ y: -.903, fontSize: 8, alpha: .26, lineSpacing: 5, border: { color: "#000000", width: 40, alpha: 1 } }), text: "图片由AI生成与网络下载\n科普视频，无不良引导" },
-    audio: { narrationVolume: 10, bgmVolume: 3, bgmFadeOutMs: 2000, defaultBgmId: "" }
-  });
+
+  useEffect(() => {
+    refresh();
+    window.storybound.listBgm().then(setBgmItems);
+  }, []);
+
   const editTemplate = (template?: DraftTemplate) => {
     setOpenSections(["canvas"]);
-    if (!template) return setEditing({ name: "", config: newConfig() });
-    const config = { ...newConfig(), ...JSON.parse(template.config) };
-    setEditing({ id: template.id, name: template.name, config });
+    setActiveSection("canvas");
+    if (!template) {
+      setEditing({ name: "新建模板", config: createDraftTemplateConfig() });
+      return;
+    }
+    setEditing({ id: template.id, name: template.name, config: readDraftConfig(template.config) });
   };
+
+  const duplicateTemplate = (template: DraftTemplate) => {
+    setOpenSections(["canvas"]);
+    setActiveSection("canvas");
+    setEditing({ name: `${template.name} (副本)`, config: readDraftConfig(template.config) });
+  };
+
   const save = async () => {
-    if (!editing?.name) return;
+    if (!editing?.name.trim()) return;
     await window.storybound.saveDraftTemplate({
-      id: editing.id, name: editing.name,
-      config: JSON.stringify(editing.config)
+      id: editing.id,
+      name: editing.name.trim(),
+      config: JSON.stringify(normalizeDraftConfig(editing.config))
     });
-    setEditing(null); refresh();
+    setEditing(null);
+    refresh();
   };
+
   const setConfig = (section: string, patch: Record<string, unknown>) => setEditing(current => current ? ({
-    ...current, config: { ...current.config, [section]: { ...current.config[section], ...patch } }
+    ...current,
+    config: { ...current.config, [section]: { ...current.config[section], ...patch } }
   }) : current);
-  const toggleSection = (id: string) => setOpenSections(current => current.includes(id) ? current.filter(item => item !== id) : [...current, id]);
-  return <section>
-    <PageHeader eyebrow="DRAFT SYSTEM" title="草稿模板" desc="控制画布比例、标题、字幕、背景和音量。"
-      actions={<button className="primary" onClick={() => editTemplate()}><Plus size={16} />新建草稿模板</button>} />
-    <div className="template-grid">{templates.map(template => {
-      const config = JSON.parse(template.config);
-      return <article className="template-card" key={template.id}>
-        <div className={`template-preview ${["16:9", "4:3"].includes(config.canvas.ratio) ? "landscape" : ""}`} style={{ backgroundColor: config.canvas.backgroundColor }}>
-          {config.title?.visible !== false && <span className="mock-title" style={{ color: config.title?.color }}>标题</span>}
-          {config.caption?.visible !== false && <span className="mock-caption" style={{ color: config.caption?.color }}>字幕</span>}
-          {config.subtitle?.visible !== false && <span className="mock-subtitle">副标题</span>}
-          {config.disclaimer?.visible !== false && <span className="mock-disclaimer">免责</span>}
+
+  const toggleSection = (id: string) => {
+    setActiveSection(id);
+    setOpenSections(current => current.includes(id) ? current.filter(item => item !== id) : [...current, id]);
+  };
+
+  const focusSection = (id: string) => {
+    setActiveSection(id);
+    setOpenSections(current => current.includes(id) ? current : [...current, id]);
+  };
+
+  if (editing) {
+    const canvasSize = DRAFT_CANVAS_SIZES[editing.config.canvas.ratio] || { width: editing.config.canvas.width, height: editing.config.canvas.height };
+    return <section className="draft-editor-page">
+      <header className="draft-editor-topbar">
+        <div className="draft-editor-heading">
+          <span><LayoutTemplate size={20} /></span>
+          <input value={editing.name} onChange={event => setEditing({ ...editing, name: event.target.value })} aria-label="模板名称" />
         </div>
-        <div><h3>{template.name}</h3><p>{config.canvas.width} × {config.canvas.height} · {config.canvas.ratio}</p></div>
-        <div className="library-actions"><button onClick={() => editTemplate(template)}>编辑</button><button onClick={() => { editTemplate(template); setTimeout(() => setEditing(current => current ? { ...current, id: undefined, name: `${template.name} (副本)` } : current), 0); }}>复制</button>{!template.is_default && <button onClick={async () => { await window.storybound.deleteDraftTemplate(template.id); refresh(); }}>删除</button>}</div>
-      </article>;
-    })}</div>
-    {editing && <div className="modal-backdrop"><div className="draft-editor-modal">
-      <header><input value={editing.name} onChange={e => setEditing({ ...editing, name: e.target.value })} placeholder="模板名称" /><div><button onClick={() => setEditing(null)}>取消</button><button className="primary" onClick={save}>保存</button></div></header>
-      <div className="draft-editor-layout">
-        <DraftCanvasPreview config={editing.config} />
+        <div className="draft-editor-actions">
+          <button className="draft-cancel" onClick={() => setEditing(null)}>取消</button>
+          <button className="draft-save" disabled={!editing.name.trim()} onClick={save}>保存</button>
+        </div>
+      </header>
+
+      <div className="draft-editor-workspace">
+        <DraftCanvasPreview config={editing.config} activeSection={activeSection} onSelectSection={focusSection} />
         <div className="draft-controls">
-          <DraftAccordion title="画布设置" open={openSections.includes("canvas")} onToggle={() => toggleSection("canvas")}>
-            <span className="control-label">比例</span><div className="ratio-buttons">{["9:16", "3:4", "1:1", "4:3", "16:9"].map(ratio => <button data-active={editing.config.canvas.ratio === ratio || undefined} onClick={() => {
-              const [rw, rh] = ratio.split(":").map(Number); const landscape = rw > rh;
-              setConfig("canvas", { ratio, width: landscape ? 1920 : 1080, height: landscape ? 1080 : ratio === "1:1" ? 1080 : 1920 });
-            }} key={ratio}>{ratio}</button>)}</div>
-            <div className="dimension-line"><input type="number" value={editing.config.canvas.width} onChange={e => setConfig("canvas", { width: Number(e.target.value) })} /><span>×</span><input type="number" value={editing.config.canvas.height} onChange={e => setConfig("canvas", { height: Number(e.target.value) })} /></div>
+          <DraftAccordion title="画布设置" open={openSections.includes("canvas")} active={activeSection === "canvas"} onToggle={() => toggleSection("canvas")}>
+            <ControlRow label="比例">
+              <div className="ratio-buttons">{Object.keys(DRAFT_CANVAS_SIZES).map(ratio => <button
+                type="button"
+                data-active={editing.config.canvas.ratio === ratio || undefined}
+                onClick={() => {
+                  const size = DRAFT_CANVAS_SIZES[ratio];
+                  setConfig("canvas", { ratio, width: size.width, height: size.height });
+                }}
+                key={ratio}
+              >{ratio}</button>)}</div>
+            </ControlRow>
+            <div className="dimension-readout">{canvasSize.width}×{canvasSize.height}</div>
             <ColorControl label="底色" value={editing.config.canvas.backgroundColor} onChange={value => setConfig("canvas", { backgroundColor: value })} />
-            <label>背景图<div className="inline-picker"><input value={editing.config.canvas.backgroundImage || ""} onChange={e => setConfig("canvas", { backgroundImage: e.target.value })} placeholder="留空 = 无背景图" /><button onClick={async () => setConfig("canvas", { backgroundImage: await window.storybound.selectImage() })}>浏览</button></div></label>
+            <ControlRow label="背景图">
+              <div className="draft-file-picker">
+                <input value={editing.config.canvas.backgroundImage || ""} onChange={event => setConfig("canvas", { backgroundImage: event.target.value })} placeholder="留空 = 无背景图" />
+                <button type="button" onClick={async () => {
+                  const target = await window.storybound.selectImage();
+                  if (target) setConfig("canvas", { backgroundImage: target });
+                }}><FolderOpen size={14} />浏览</button>
+              </div>
+            </ControlRow>
           </DraftAccordion>
-          <DraftAccordion title="图片区域" open={openSections.includes("image")} onToggle={() => toggleSection("image")}>
-            <label>出图比例<select value={editing.config.image.ratio} onChange={e => setConfig("image", { ratio: e.target.value })}><option>9:16</option><option>3:4</option><option>1:1</option><option>4:3</option><option>16:9</option></select></label>
-            <label>填充方式<select value={editing.config.image.fit || "cover"} onChange={e => setConfig("image", { fit: e.target.value })}><option value="cover">裁切铺满</option><option value="contain">完整显示</option></select></label>
-            <RangeControl label="垂直位置" value={editing.config.image.top} min={0} max={1} step={.01} onChange={value => setConfig("image", { top: value })} />
-            <RangeControl label="高度占比" value={editing.config.image.height} min={.1} max={1} step={.01} onChange={value => setConfig("image", { height: value })} />
-            <label>图片动画<select value={editing.config.image.animation || "缩放"} onChange={e => setConfig("image", { animation: e.target.value })}><option>缩放</option><option>向左缩小</option><option>向右缩小</option><option>无</option></select></label>
+
+          <DraftAccordion title="图片区域" open={openSections.includes("image")} active={activeSection === "image"} onToggle={() => toggleSection("image")}>
+            <ControlRow label="图片比例">
+              <div className="ratio-buttons">{Object.keys(DRAFT_CANVAS_SIZES).map(ratio => <button type="button" data-active={editing.config.image.ratio === ratio || undefined} onClick={() => setConfig("image", { ratio })} key={ratio}>{ratio}</button>)}</div>
+            </ControlRow>
+            <ControlRow label="适配">
+              <div className="fit-buttons">
+                <button type="button" data-active={(editing.config.image.fit || "cover") === "cover" || undefined} onClick={() => setConfig("image", { fit: "cover" })}>cover</button>
+                <button type="button" data-active={editing.config.image.fit === "contain" || undefined} onClick={() => setConfig("image", { fit: "contain" })}>contain</button>
+              </div>
+            </ControlRow>
+            <RangeControl label="垂直位置" value={Number(editing.config.image.top || 0)} min={0} max={1} step={.01} onChange={value => setConfig("image", { top: value })} />
+            <RangeControl label="高度占比" value={Number(editing.config.image.height || 1)} min={.1} max={1} step={.01} onChange={value => setConfig("image", { height: value })} />
+            <div className="animation-control-row">
+              <span className="control-row-label">动画效果</span>
+              <div className="animation-picker">
+                <div className="animation-grid">{IMAGE_ANIMATION_OPTIONS.map(animation => <button
+                  type="button"
+                  data-active={(editing.config.image.animation || "缩放") === animation || undefined}
+                  onClick={() => setConfig("image", { animation })}
+                  key={animation}
+                >{animation}</button>)}</div>
+                <AnimationThumbnail animation={editing.config.image.animation || "缩放"} />
+              </div>
+            </div>
           </DraftAccordion>
-          <TextLayerEditor title="主标题" section="title" canvasHeight={editing.config.canvas.height} config={editing.config.title} open={openSections.includes("title")} onToggle={() => toggleSection("title")} onChange={patch => setConfig("title", patch)} />
-          <TextLayerEditor title="副标题" section="subtitle" canvasHeight={editing.config.canvas.height} config={editing.config.subtitle} open={openSections.includes("subtitle")} onToggle={() => toggleSection("subtitle")} onChange={patch => setConfig("subtitle", patch)} />
-          <TextLayerEditor title="字幕" section="caption" canvasHeight={editing.config.canvas.height} config={editing.config.caption} open={openSections.includes("caption")} onToggle={() => toggleSection("caption")} onChange={patch => setConfig("caption", patch)} caption />
-          <TextLayerEditor title="免责声明" section="disclaimer" canvasHeight={editing.config.canvas.height} config={editing.config.disclaimer} open={openSections.includes("disclaimer")} onToggle={() => toggleSection("disclaimer")} onChange={patch => setConfig("disclaimer", patch)} disclaimer />
-          <DraftAccordion title="音频设置" open={openSections.includes("audio")} onToggle={() => toggleSection("audio")}>
+
+          <TextLayerEditor title="主标题" canvasHeight={editing.config.canvas.height} config={editing.config.title} open={openSections.includes("title")} active={activeSection === "title"} onToggle={() => toggleSection("title")} onChange={patch => setConfig("title", patch)} />
+          <TextLayerEditor title="副标题" canvasHeight={editing.config.canvas.height} config={editing.config.subtitle} open={openSections.includes("subtitle")} active={activeSection === "subtitle"} onToggle={() => toggleSection("subtitle")} onChange={patch => setConfig("subtitle", patch)} />
+          <TextLayerEditor title="字幕" canvasHeight={editing.config.canvas.height} config={editing.config.caption} open={openSections.includes("caption")} active={activeSection === "caption"} onToggle={() => toggleSection("caption")} onChange={patch => setConfig("caption", patch)} caption />
+          <TextLayerEditor title="免责声明" canvasHeight={editing.config.canvas.height} config={editing.config.disclaimer} open={openSections.includes("disclaimer")} active={activeSection === "disclaimer"} onToggle={() => toggleSection("disclaimer")} onChange={patch => setConfig("disclaimer", patch)} disclaimer />
+
+          <DraftAccordion title="音频设置" open={openSections.includes("audio")} active={activeSection === "audio"} onToggle={() => toggleSection("audio")}>
             <RangeControl label="配音音量" suffix="dB" value={20 * Math.log10(Math.max(.316, editing.config.audio.narrationVolume || 1))} min={-10} max={20} step={.5} onChange={value => setConfig("audio", { narrationVolume: Math.pow(10, value / 20) })} />
             <RangeControl label="BGM 音量" suffix="dB" value={20 * Math.log10(Math.max(.316, editing.config.audio.bgmVolume || 1))} min={-10} max={20} step={.5} onChange={value => setConfig("audio", { bgmVolume: Math.pow(10, value / 20) })} />
-            <label>BGM 淡出(ms)<input type="number" min={0} max={10000} step={100} value={editing.config.audio.bgmFadeOutMs} onChange={e => setConfig("audio", { bgmFadeOutMs: Number(e.target.value) })} /></label>
-            <label>默认 BGM<select value={editing.config.audio.defaultBgmId || ""} onChange={e => setConfig("audio", { defaultBgmId: e.target.value })}><option value="">不指定 · 用新建任务当前选择</option>{bgmItems.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></label>
+            <ControlRow label="BGM 淡出"><input type="number" min={0} max={10000} step={100} value={editing.config.audio.bgmFadeOutMs} onChange={event => setConfig("audio", { bgmFadeOutMs: Number(event.target.value) })} /><em>ms</em></ControlRow>
+            <ControlRow label="默认 BGM"><select value={editing.config.audio.defaultBgmId || ""} onChange={event => setConfig("audio", { defaultBgmId: event.target.value })}><option value="">不指定 · 使用任务选择</option>{bgmItems.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</select></ControlRow>
           </DraftAccordion>
         </div>
       </div>
-    </div></div>}
+    </section>;
+  }
+
+  return <section className="draft-library-page">
+    <div className="draft-library-header">
+      <span><LayoutTemplate size={22} /></span>
+      <div><h1>草稿模板</h1><p>管理剪映草稿的排版布局和音量配置</p></div>
+    </div>
+    <div className="draft-template-grid">
+      {templates.map(template => {
+        const config = readDraftConfig(template.config);
+        const isPrimaryDefault = template.id === "default-portrait-9-16";
+        return <article className={`draft-template-card ${template.is_default ? "builtin" : ""} ${isPrimaryDefault ? "primary-default" : ""}`} key={template.id}>
+          {isPrimaryDefault ? <i className="draft-default-badge">默认</i> : null}
+          <div className="draft-template-preview-wrap"><DraftMiniPreview config={config} /></div>
+          <div className="draft-template-card-body">
+            <h3>{template.name}</h3>
+            <p>{config.canvas.ratio} · {config.canvas.width}×{config.canvas.height}</p>
+            <div className="draft-template-actions">
+              <button className="edit" onClick={() => editTemplate(template)}>编辑</button>
+              <button onClick={() => duplicateTemplate(template)}>复制</button>
+              {!template.is_default && <button className="delete" onClick={async () => { await window.storybound.deleteDraftTemplate(template.id); refresh(); }}>删除</button>}
+            </div>
+          </div>
+        </article>;
+      })}
+      <button className="draft-new-template" onClick={() => editTemplate()}><Plus size={28} /><span>新建模板</span></button>
+    </div>
   </section>;
 }
 
-function DraftCanvasPreview({ config }: { config: any }) {
+function DraftMiniPreview({ config }: { config: any }) {
   const landscape = Number(config.canvas.width) > Number(config.canvas.height);
-  const layerStyle = (layer: any): React.CSSProperties => ({
-    display: layer?.visible === false ? "none" : undefined,
-    top: `${50 - Number(layer?.y || 0) * 48}%`, color: layer?.color,
-    opacity: layer?.alpha ?? 1, fontSize: `${Math.max(7, Number(layer?.fontSize || 12) * .42)}px`,
-    fontWeight: layer?.bold ? 800 : 400, textDecoration: layer?.underline ? "underline" : "none",
-    WebkitTextStroke: `${Math.max(0, Number(layer?.border?.width || 0) / 20)}px ${layer?.border?.color || "transparent"}`
-  });
-  return <div className="draft-preview-pane"><div className={`draft-live-canvas ${landscape ? "landscape" : ""}`} style={{ backgroundColor: config.canvas.backgroundColor, backgroundImage: config.canvas.backgroundImage ? `url("${config.canvas.backgroundImage}")` : undefined }}>
-    <div className="draft-image-area" style={{ top: `${Number(config.image.top || 0) * 100}%`, height: `${Number(config.image.height || 1) * 100}%` }}>图片区域</div>
-    <span className="preview-layer" style={layerStyle(config.title)}>主标题示例</span>
-    <span className="preview-layer" style={layerStyle(config.subtitle)}>副标题示例文字</span>
-    <span className="preview-layer caption" style={{ ...layerStyle(config.caption), background: config.caption?.background ? `${config.caption.background.color}${Math.round((config.caption.background.alpha || 0) * 255).toString(16).padStart(2, "0")}` : undefined }}>字幕示例文字</span>
-    <span className="preview-layer disclaimer" style={layerStyle(config.disclaimer)}>{config.disclaimer?.text || "免责声明"}</span>
-  </div><p>{config.canvas.ratio} · {config.canvas.width}×{config.canvas.height}</p></div>;
+  return <div
+    className={`draft-mini-canvas ${landscape ? "landscape" : ""}`}
+    style={{
+      aspectRatio: `${config.canvas.width}/${config.canvas.height}`,
+      backgroundColor: config.canvas.backgroundColor,
+      backgroundImage: config.canvas.backgroundImage ? `url("${config.canvas.backgroundImage}")` : undefined
+    }}
+  >
+    <div className="draft-mini-image" style={{ top: `${Number(config.image.top || 0) * 100}%`, height: `${Number(config.image.height || 1) * 100}%` }}><ScenicPlaceholder /></div>
+    {config.title?.visible !== false && <span className="draft-mini-title" style={{ color: config.title.color }}>标题</span>}
+    {config.caption?.visible !== false && <span className="draft-mini-caption" style={{ color: config.caption.color }}>字幕</span>}
+    {config.subtitle?.visible !== false && <span className="draft-mini-subtitle">副标题</span>}
+    {config.disclaimer?.visible !== false && <span className="draft-mini-disclaimer">免责</span>}
+  </div>;
 }
 
-function DraftAccordion({ title, open, onToggle, children }: { title: string; open: boolean; onToggle: () => void; children: React.ReactNode }) {
-  return <div className="draft-accordion"><button className="draft-accordion-head" onClick={onToggle}><ChevronRight className={open ? "open" : ""} size={15} />{title}</button>{open && <div className="draft-accordion-body">{children}</div>}</div>;
+function DraftCanvasPreview({ config, activeSection, onSelectSection }: { config: any; activeSection: string; onSelectSection: (id: string) => void }) {
+  const animationClass = draftAnimationClass(config.image?.animation || "缩放");
+  const rgba = (hex: string, alpha: number) => {
+    const safe = String(hex || "#000000").replace("#", "").padEnd(6, "0").slice(0, 6);
+    const red = parseInt(safe.slice(0, 2), 16) || 0;
+    const green = parseInt(safe.slice(2, 4), 16) || 0;
+    const blue = parseInt(safe.slice(4, 6), 16) || 0;
+    return `rgba(${red},${green},${blue},${Math.max(0, Math.min(1, Number(alpha ?? 1)))})`;
+  };
+  const layerStyle = (layer: any): React.CSSProperties => ({
+    display: layer?.visible === false ? "none" : undefined,
+    top: `${50 - Number(layer?.y || 0) * 50}%`,
+    color: layer?.color || "#FFFFFF",
+    opacity: layer?.alpha ?? 1,
+    fontSize: `${Math.max(7, Number(layer?.fontSize || 12) * 1.08)}px`,
+    fontWeight: layer?.bold ? 800 : 400,
+    textDecoration: layer?.underline ? "underline" : "none",
+    textAlign: Number(layer?.align || 1) === 0 ? "left" : Number(layer?.align || 1) === 2 ? "right" : "center",
+    letterSpacing: `${Number(layer?.letterSpacing || 0)}px`,
+    lineHeight: `${1.2 + Number(layer?.lineSpacing || 0) / 10}`,
+    WebkitTextStroke: `${Math.max(0, Number(layer?.border?.width || 0) / 20)}px ${rgba(layer?.border?.color || "#000000", layer?.border?.alpha ?? 0)}`
+  });
+  const canvasWidth = Number(config.canvas.width || 1080);
+  const canvasHeight = Number(config.canvas.height || 1920);
+
+  return <div className="draft-preview-pane">
+    <div className="draft-preview-stage">
+      <div className="draft-live-canvas" style={{
+        aspectRatio: `${canvasWidth}/${canvasHeight}`,
+        backgroundColor: config.canvas.backgroundColor,
+        backgroundImage: config.canvas.backgroundImage ? `url("${config.canvas.backgroundImage}")` : undefined
+      }}>
+        <button type="button" className={`draft-image-area ${activeSection === "image" ? "selected" : ""}`} style={{ top: `${Number(config.image.top || 0) * 100}%`, height: `${Number(config.image.height || 1) * 100}%` }} onClick={() => onSelectSection("image")}>
+          <div className={`draft-sample-motion ${animationClass}`} style={{ backgroundSize: config.image.fit === "contain" ? "contain" : "cover" }}><ScenicPlaceholder /></div>
+        </button>
+        <button type="button" className={`preview-layer ${activeSection === "title" ? "selected" : ""}`} style={layerStyle(config.title)} onClick={() => onSelectSection("title")}>主标题示例</button>
+        <button type="button" className={`preview-layer ${activeSection === "subtitle" ? "selected" : ""}`} style={layerStyle(config.subtitle)} onClick={() => onSelectSection("subtitle")}>副标题示例文字</button>
+        <button type="button" className={`preview-layer caption ${activeSection === "caption" ? "selected" : ""}`} style={{ ...layerStyle(config.caption), background: config.caption?.background ? rgba(config.caption.background.color, config.caption.background.alpha) : undefined, borderRadius: `${Math.round(Number(config.caption?.background?.roundRadius || 0) * 12)}px` }} onClick={() => onSelectSection("caption")}>字幕示例文字</button>
+        <button type="button" className={`preview-layer disclaimer ${activeSection === "disclaimer" ? "selected" : ""}`} style={layerStyle(config.disclaimer)} onClick={() => onSelectSection("disclaimer")}>{config.disclaimer?.text || "免责声明"}</button>
+      </div>
+      <span className="draft-zoom-label">120%</span>
+    </div>
+  </div>;
+}
+
+function ScenicPlaceholder() {
+  return <div className="scenic-placeholder" aria-hidden="true"><i className="scenic-sun" /><i className="scenic-hill hill-one" /><i className="scenic-hill hill-two" /></div>;
+}
+
+function draftAnimationClass(animation: string) {
+  const map: Record<string, string> = {
+    "无动画": "motion-none",
+    "缩放": "motion-zoom",
+    "缩放 II": "motion-zoom-two",
+    "左拉镜": "motion-pan-left",
+    "右拉镜": "motion-pan-right",
+    "向左缩小": "motion-shrink-left",
+    "向右缩小": "motion-shrink-right",
+    "形变左缩": "motion-warp-left",
+    "形变右缩": "motion-warp-right",
+    "上下分割": "motion-split-vertical",
+    "左右分割": "motion-split-horizontal",
+    "向左下降": "motion-drop-left",
+    "向右下降": "motion-drop-right",
+    "旋转缩小": "motion-rotate-shrink",
+    "旋转上升": "motion-rotate-rise",
+    "翻转": "motion-flip",
+    "形变缩小": "motion-warp-shrink",
+    "回弹伸缩": "motion-bounce",
+    "滑滑梯": "motion-slide"
+  };
+  return map[animation] || "motion-zoom";
+}
+
+function AnimationThumbnail({ animation }: { animation: string }) {
+  return <div className="animation-thumbnail" title={animation}><div className={draftAnimationClass(animation)}><ScenicPlaceholder /></div></div>;
+}
+
+function DraftAccordion({ title, open, active, onToggle, children }: { title: string; open: boolean; active?: boolean; onToggle: () => void; children: React.ReactNode }) {
+  return <div className={`draft-accordion ${open ? "open" : ""} ${active ? "active" : ""}`}>
+    <button type="button" className="draft-accordion-head" onClick={onToggle}><ChevronRight className={open ? "open" : ""} size={16} /><span>{title}</span></button>
+    {open && <div className="draft-accordion-body">{children}</div>}
+  </div>;
+}
+
+function ControlRow({ label, children }: { label: string; children: React.ReactNode }) {
+  return <div className="control-row"><span className="control-row-label">{label}</span><div className="control-row-value">{children}</div></div>;
+}
+
+function formatRangeValue(value: number, step: number) {
+  const decimals = step >= 1 ? 0 : step >= .1 ? 1 : 2;
+  return Number(value).toFixed(decimals).replace(/\.0+$/, "").replace(/(\.\d*?)0+$/, "$1");
 }
 
 function RangeControl({ label, value, min, max, step, suffix = "", onChange }: { label: string; value: number; min: number; max: number; step: number; suffix?: string; onChange: (value: number) => void }) {
-  return <label className="range-control"><span>{label}<b>{Number(value).toFixed(step < 1 ? 2 : 0)}{suffix}</b></span><input type="range" value={value} min={min} max={max} step={step} onChange={e => onChange(Number(e.target.value))} /></label>;
+  return <div className="range-control"><span className="control-row-label">{label}</span><input type="range" value={value} min={min} max={max} step={step} onChange={event => onChange(Number(event.target.value))} /><b>{formatRangeValue(value, step)}{suffix}</b></div>;
 }
 
 function ColorControl({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
-  return <label>{label}<div className="color-control"><input type="color" value={value} onChange={e => onChange(e.target.value.toUpperCase())} /><input value={value} onChange={e => onChange(e.target.value)} /></div></label>;
+  return <ControlRow label={label}><div className="color-control"><input type="color" value={value || "#000000"} onChange={event => onChange(event.target.value.toUpperCase())} /><input value={value || "#000000"} onChange={event => onChange(event.target.value.toUpperCase())} /></div></ControlRow>;
 }
 
-function TextLayerEditor({ title, config, canvasHeight, open, onToggle, onChange, caption = false, disclaimer = false }: {
-  title: string; section: string; config: any; canvasHeight: number; open: boolean; onToggle: () => void;
-  onChange: (patch: Record<string, unknown>) => void; caption?: boolean; disclaimer?: boolean;
+function TextLayerEditor({ title, config, canvasHeight, open, active, onToggle, onChange, caption = false, disclaimer = false }: {
+  title: string;
+  config: any;
+  canvasHeight: number;
+  open: boolean;
+  active?: boolean;
+  onToggle: () => void;
+  onChange: (patch: Record<string, unknown>) => void;
+  caption?: boolean;
+  disclaimer?: boolean;
 }) {
   const setBorder = (patch: Record<string, unknown>) => onChange({ border: { ...(config.border || {}), ...patch } });
   const setBackground = (patch: Record<string, unknown>) => onChange({ background: { ...(config.background || {}), ...patch } });
-  return <DraftAccordion title={title} open={open} onToggle={onToggle}>
-    <label className="toggle-line"><span>显示</span><input type="checkbox" checked={config.visible !== false} onChange={e => onChange({ visible: e.target.checked })} /></label>
-    <label>垂直位置<input type="number" step={1} value={Math.round(Number(config.y || 0) * canvasHeight)} onChange={e => onChange({ y: Number(e.target.value) / canvasHeight })} /></label>
-    <label>字号<input type="number" min={4} max={100} value={config.fontSize} onChange={e => onChange({ fontSize: Number(e.target.value) })} /></label>
-    <ColorControl label="颜色" value={config.color} onChange={color => onChange({ color })} />
+  return <DraftAccordion title={title} open={open} active={active} onToggle={onToggle}>
+    <label className="draft-checkbox-row"><input type="checkbox" checked={config.visible !== false} onChange={event => onChange({ visible: event.target.checked })} /><span>显示</span></label>
+    <ControlRow label="垂直位置"><input type="number" step={1} value={Math.round(Number(config.y || 0) * canvasHeight)} onChange={event => onChange({ y: Number(event.target.value) / canvasHeight })} /></ControlRow>
+    <ControlRow label="字号"><input type="number" min={4} max={100} value={config.fontSize} onChange={event => onChange({ fontSize: Number(event.target.value) })} /></ControlRow>
+    <ColorControl label="颜色" value={config.color || "#FFFFFF"} onChange={color => onChange({ color })} />
     <RangeControl label="透明度" suffix="%" value={Math.round((config.alpha ?? 1) * 100)} min={0} max={100} step={1} onChange={value => onChange({ alpha: value / 100 })} />
-    {!caption && !disclaimer && <div className="check-row"><label><input type="checkbox" checked={Boolean(config.bold)} onChange={e => onChange({ bold: e.target.checked })} />粗体</label><label><input type="checkbox" checked={Boolean(config.underline)} onChange={e => onChange({ underline: e.target.checked })} />下划线</label></div>}
-    {(title === "副标题") && <div className="number-pair"><label>字间距<input type="number" min={0} max={20} value={config.letterSpacing || 0} onChange={e => onChange({ letterSpacing: Number(e.target.value) })} /></label><label>行间距<input type="number" min={0} max={20} value={config.lineSpacing || 0} onChange={e => onChange({ lineSpacing: Number(e.target.value) })} /></label></div>}
+    <ControlRow label="对齐"><div className="alignment-buttons"><button type="button" data-active={Number(config.align || 1) === 0 || undefined} onClick={() => onChange({ align: 0 })}>左</button><button type="button" data-active={Number(config.align || 1) === 1 || undefined} onClick={() => onChange({ align: 1 })}>中</button><button type="button" data-active={Number(config.align || 1) === 2 || undefined} onClick={() => onChange({ align: 2 })}>右</button></div></ControlRow>
+    <label className="draft-checkbox-row"><input type="checkbox" checked={Boolean(config.bold)} onChange={event => onChange({ bold: event.target.checked })} /><span>粗体</span></label>
+    <label className="draft-checkbox-row"><input type="checkbox" checked={Boolean(config.underline)} onChange={event => onChange({ underline: event.target.checked })} /><span>下划线</span></label>
+    {(title === "副标题" || caption || disclaimer) && <>
+      <ControlRow label="字间距"><input type="number" min={0} max={50} value={config.letterSpacing || 0} onChange={event => onChange({ letterSpacing: Number(event.target.value) })} /></ControlRow>
+      <ControlRow label="行间距"><input type="number" min={0} max={50} value={config.lineSpacing || 0} onChange={event => onChange({ lineSpacing: Number(event.target.value) })} /></ControlRow>
+    </>}
     <ColorControl label="描边色" value={config.border?.color || "#000000"} onChange={color => setBorder({ color })} />
     <RangeControl label="描边宽度" value={config.border?.width || 0} min={0} max={100} step={1} onChange={value => setBorder({ width: value })} />
     <RangeControl label="描边透明" suffix="%" value={Math.round((config.border?.alpha || 0) * 100)} min={0} max={100} step={1} onChange={value => setBorder({ alpha: value / 100 })} />
-    {caption && <><label>每行字数<input type="number" min={4} max={30} value={config.maxCharsPerLine || 12} onChange={e => onChange({ maxCharsPerLine: Number(e.target.value) })} /></label><ColorControl label="背景色" value={config.background?.color || "#000000"} onChange={color => setBackground({ color })} /><RangeControl label="背景透明" suffix="%" value={Math.round((config.background?.alpha || 0) * 100)} min={0} max={100} step={1} onChange={value => setBackground({ alpha: value / 100 })} /><RangeControl label="圆角" value={config.background?.roundRadius || 0} min={0} max={1} step={.01} onChange={value => setBackground({ roundRadius: value })} /></>}
-    {disclaimer && <label>文案内容<textarea value={config.text || ""} onChange={e => onChange({ text: e.target.value })} /></label>}
+    {caption && <>
+      <ControlRow label="每行字数"><input type="number" min={4} max={30} value={config.maxCharsPerLine || 12} onChange={event => onChange({ maxCharsPerLine: Number(event.target.value) })} /></ControlRow>
+      <ColorControl label="背景色" value={config.background?.color || "#000000"} onChange={color => setBackground({ color })} />
+      <RangeControl label="背景透明" suffix="%" value={Math.round((config.background?.alpha || 0) * 100)} min={0} max={100} step={1} onChange={value => setBackground({ alpha: value / 100 })} />
+      <RangeControl label="圆角" value={config.background?.roundRadius || 0} min={0} max={1} step={.01} onChange={value => setBackground({ roundRadius: value })} />
+    </>}
+    {disclaimer && <ControlRow label="文案内容"><textarea value={config.text || ""} onChange={event => onChange({ text: event.target.value })} /></ControlRow>}
   </DraftAccordion>;
 }
 
-const statusText = (status: TaskStatus) => ({ pending: "待处理", running: "进行中", review: "待确认脚本", completed: "已完成", failed: "失败", cancelled: "已取消" }[status]);
+const statusText = (status: TaskStatus) => ({ pending: "待处理", running: "进行中", interrupted: "已中断", review: "待确认脚本", completed: "已完成", failed: "失败", cancelled: "已取消" }[status]);
+const assetStatusText = (status: string) => ({ pending: "待处理", running: "处理中", remote_running: "远程处理中", interrupted: "待恢复", completed: "完成", failed: "失败", failed_fallback: "失败已兜底", skipped: "已跳过" }[status] || status);
 const trackName = (track: string) => tracks.find(item => item.id === track)?.name || track;
 const styleGradient = (id: string) => {
   const hue = [...id].reduce((sum, char) => sum + char.charCodeAt(0), 0) % 360;

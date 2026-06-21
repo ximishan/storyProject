@@ -7,7 +7,9 @@ function assEscape(text) {
 }
 
 async function generateCover({ app, config, task, outputDir, script, sourceImage, template }) {
-  if (task.cover_image_mode === "off") return "";
+  const coverMode = task.cover_image_mode === "title" ? "titled"
+    : task.cover_image_mode === "blank" ? "plain" : (task.cover_image_mode || "off");
+  if (coverMode === "off") return "";
   const coverDir = path.join(outputDir, "cover");
   fs.mkdirSync(coverDir, { recursive: true });
   const baseImage = path.join(coverDir, "base.png");
@@ -17,13 +19,13 @@ async function generateCover({ app, config, task, outputDir, script, sourceImage
     await generateSceneImage({
       app, config,
       prompt: `${template?.prompt || "电影海报构图"}，${script.summary || script.title}`,
-      destination: baseImage, ratio: task.ratio, index: 0,
+      destination: baseImage, ratio: "3:4", index: 0,
       referenceImagePath: task.reference_image_path || ""
     });
   }
   const output = path.join(coverDir, "cover.jpg");
-  const { width, height } = imageSize(task.ratio);
-  if (task.cover_image_mode === "blank") {
+  const { width, height } = imageSize("3:4");
+  if (coverMode === "plain") {
     await spawnAsync(ffmpegPath(app, config), [
       "-y", "-i", baseImage,
       "-vf", `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}`,

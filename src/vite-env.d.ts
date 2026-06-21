@@ -6,7 +6,8 @@ interface StoryboundApi {
   deleteTask(id: string): Promise<void>;
   cancelTask(id: string): Promise<TaskRecord>;
   duplicateTask(id: string): Promise<TaskRecord>;
-  runQueue(ids: string[]): Promise<{ running: boolean }>;
+  runQueue(ids: string[]): Promise<{ running: boolean; count?: number; empty?: boolean }>;
+  resumeQueue(): Promise<{ running: boolean; count?: number; empty?: boolean }>;
   prepareTask(id: string): Promise<TaskRecord>;
   continueTask(id: string): Promise<TaskRecord>;
   updatePipeline(id: string, pipeline: PipelineData): Promise<TaskRecord>;
@@ -15,7 +16,7 @@ interface StoryboundApi {
   renderTask(id: string): Promise<TaskRecord>;
   getConfig(): Promise<AppConfig>;
   saveConfig(config: AppConfig): Promise<AppConfig>;
-  testConfig(kind: string, config: AppConfig): Promise<{ ok: boolean; message: string }>;
+  testConfig(kind: string, config: AppConfig): Promise<{ ok: boolean; message: string; provider?: string; dataUrl?: string }>;
   runDiagnostics(): Promise<{ checks: Array<{ name: string; ok: boolean }>; logPath: string; dataPath: string }>;
   getTemplates(): Promise<DraftTemplate[]>;
   saveDraftTemplate(input: Partial<DraftTemplate> & { name: string; config: string }): Promise<DraftTemplate>;
@@ -27,6 +28,7 @@ interface StoryboundApi {
   saveLlmProfile(input: Partial<LlmProfile> & { name: string; provider: string; protocol: string }): Promise<LlmProfile>;
   activateLlmProfile(id: string): Promise<LlmProfile>;
   deleteLlmProfile(id: string): Promise<LlmProfile | null>;
+  listSystemVoices(): Promise<SystemVoice[]>;
   listVoicePresets(): Promise<VoicePreset[]>;
   saveVoicePreset(input: Partial<VoicePreset> & { name: string; provider: string; voice_id: string }): Promise<VoicePreset>;
   openPath(target: string): Promise<void>;
@@ -58,7 +60,7 @@ interface Window {
   storybound: StoryboundApi;
 }
 
-type TaskStatus = "pending" | "running" | "review" | "completed" | "failed" | "cancelled";
+type TaskStatus = "pending" | "running" | "interrupted" | "review" | "completed" | "failed" | "cancelled";
 
 interface TaskRecord {
   id: string;
@@ -89,6 +91,9 @@ interface TaskRecord {
   cover_template_id?: string;
   cover_path?: string;
   pause_mode?: string;
+  source_mode?: string;
+  source_query?: string;
+  source_requirements?: string;
   bgm_id?: string;
   speaker?: string;
   task_type?: string;
@@ -102,6 +107,13 @@ interface TaskRecord {
   research_web?: number;
   research_ai?: number;
   research_ima?: number;
+  current_stage?: string;
+  last_checkpoint_at?: number;
+  last_heartbeat_at?: number;
+  interrupted_at?: number;
+  resume_count?: number;
+  queue_order?: number;
+  queue_batch_id?: string;
 }
 
 interface CreateTaskInput {
@@ -159,19 +171,67 @@ interface PipelineScene {
   index: number;
   narration: string;
   visual: string;
+  desc_prompt?: string;
   image_prompt: string;
+  use_reference?: boolean;
+  reference_reason?: string;
+  subject_presence?: "character" | "product" | "both" | "none";
+  era_and_location?: string;
   duration_hint?: number;
   duration?: number;
   image_path?: string;
   audio_path?: string;
   image_provider?: string;
   source_url?: string;
+  video_path?: string;
+  video_provider?: string;
+  video_source_url?: string;
+  video_error?: string;
+  image_status?: string;
+  image_attempts?: number;
+  image_error?: string;
+  image_remote_task_id?: string;
+  image_remote_provider?: string;
+  audio_status?: string;
+  audio_attempts?: number;
+  audio_error?: string;
+  video_status?: string;
+  video_attempts?: number;
+  video_remote_task_id?: string;
+  video_remote_model?: string;
+  render_clip_status?: string;
+}
+
+interface PipelineMetadata {
+  character_card?: Record<string, unknown>;
+  product_card?: Record<string, unknown>;
+  era_and_location?: Array<Record<string, unknown> | string>;
+  key_objects?: string[];
+  facts?: string[];
+  visual_continuity?: string[];
+  planner_mode?: string;
+  template_id?: string;
+  template_name?: string;
+  character_card_mode?: string;
+  reference_kind?: string;
+  reference_available?: boolean;
+  step3_skeleton_modules?: string[];
+  image_seed_pools?: string[];
+  reference_decision_prompt?: string;
 }
 
 interface PipelineData {
+  checkpoint_version?: number;
+  runtime?: {
+    current_stage?: string; current_step?: number; detail?: string; updated_at?: string;
+    render_status?: string; cover_status?: string; draft_status?: string;
+    final_video?: string; subtitle_path?: string; draft_dir?: string; cover_path?: string;
+    completed_at?: string;
+  };
   title: string;
   summary: string;
   narration: string;
+  metadata?: PipelineMetadata;
   scenes: PipelineScene[];
 }
 
@@ -198,8 +258,10 @@ interface PromptTemplateRecord {
   style_id: string;
   image_seed_pools_json?: string;
   needs_character_card?: number | boolean;
+  character_card_mode?: "follow" | "force" | "skip";
   step3_skeleton_modules_json?: string;
-  reference_kind?: string;
+  reference_kind?: "" | "auto" | "character" | "product" | "none";
+  reference_decision_prompt?: string;
   image_prompt_template?: string;
   created_at?: number;
   updated_at?: number;
@@ -215,6 +277,8 @@ interface CoverTemplate {
 }
 interface BgmRecord { id: string; name: string; path: string; is_default: number; }
 interface LlmProfile { id: string; name: string; provider: string; protocol: string; base_url: string; api_key: string; model: string; proxy_url: string; is_default: number; created_at?: string; }
+interface SystemVoice { id: string; name: string; culture: string; gender: string; age: string; enabled: boolean; }
+
 interface VoicePreset { id: string; name: string; provider: string; voice_id: string; source_audio_path: string; created_at?: string; last_used_at?: string; }
 
 interface PlaygroundJob {
@@ -260,6 +324,10 @@ interface AppConfig {
     model: string;
     async_mode: boolean;
     submit_path: string;
+    edit_path: string;
+    quality: string;
+    response_format: string;
+    edit_response_format: string;
     status_path: string;
     task_id_field: string;
     status_field: string;
@@ -275,6 +343,7 @@ interface AppConfig {
   runninghub: {
     api_key: string;
     base_url: string;
+    model: string;
     workflow_id: string;
     prompt_node_id: string;
     prompt_field_name: string;
@@ -286,6 +355,10 @@ interface AppConfig {
   };
   tts: {
     provider: string;
+    system: {
+      voice: string;
+      volume: number;
+    };
     volcengine: {
       app_id: string;
       access_key: string;

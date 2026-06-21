@@ -1,6 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
-const { spawnAsync, ffmpegPath, imageSize } = require("./services.cjs");
+const { spawnAsync, ffmpegPath, imageSize, mediaDuration } = require("./services.cjs");
+const { atomicWriteFile, fileLooksUsable } = require("./checkpoint.cjs");
 
 function srtTime(seconds) {
   const ms = Math.max(0, Math.round(seconds * 1000));
@@ -26,12 +27,69 @@ function writeSrt(scenes, destination, maxChars = 0) {
     const caption = `${scene.speaker_name ? `${scene.speaker_name}：` : ""}${scene.narration.trim()}`;
     return `${index + 1}\n${srtTime(start)} --> ${srtTime(cursor)}\n${wrapCaption(caption, maxChars)}\n`;
   });
-  fs.writeFileSync(destination, blocks.join("\n"), "utf8");
+  atomicWriteFile(destination, blocks.join("\n"), "utf8");
   return destination;
 }
 
 function escapeFilterPath(file) {
   return file.replace(/\\/g, "/").replace(/:/g, "\\:").replace(/'/g, "\\'");
+}
+
+
+function buildImageMotionFilter({ fitted, width, height, frames, animation, motionStrength = 1, dynamicScene = false }) {
+  const safeFrames = Math.max(1, Number(frames) || 1);
+  const strength = Math.max(0.25, Math.min(3, Number(motionStrength) || 1));
+  const selected = dynamicScene && animation === "无动画" ? "缩放" : String(animation || "缩放");
+  const progress = `on/${safeFrames}`;
+  const centerX = "(iw-iw/zoom)/2";
+  const centerY = "(ih-ih/zoom)/2";
+  const zoomInStep = (dynamicScene ? 0.0012 : 0.00045) * strength;
+  const zoomOutStep = (dynamicScene ? 0.0010 : 0.00038) * strength;
+  const zoomLimit = dynamicScene ? 1.16 : 1.10;
+  const zoompan = ({ z, x = centerX, y = centerY, prefix = "" }) =>
+    `${fitted},${prefix}zoompan=z='${z}':x='${x}':y='${y}':d=${safeFrames}:s=${width}x${height}:fps=30`;
+
+  switch (selected) {
+    case "无动画":
+      return `${fitted},fps=30`;
+    case "缩放 II":
+      return zoompan({ z: `if(eq(on,0),${zoomLimit},max(1.0,zoom-${zoomOutStep.toFixed(6)}))` });
+    case "左拉镜":
+      return zoompan({ z: "1.15", x: `(iw-iw/zoom)*(1-${progress})` });
+    case "右拉镜":
+      return zoompan({ z: "1.15", x: `(iw-iw/zoom)*${progress}` });
+    case "向左缩小":
+      return zoompan({ z: `if(eq(on,0),1.16,max(1.0,zoom-${zoomOutStep.toFixed(6)}))`, x: "0" });
+    case "向右缩小":
+      return zoompan({ z: `if(eq(on,0),1.16,max(1.0,zoom-${zoomOutStep.toFixed(6)}))`, x: "iw-iw/zoom" });
+    case "形变左缩":
+      return zoompan({ z: `if(eq(on,0),1.14,max(1.0,zoom-${zoomOutStep.toFixed(6)}))`, x: `(iw-iw/zoom)*(1-${progress})`, y: `(ih-ih/zoom)*(0.35+0.15*${progress})` });
+    case "形变右缩":
+      return zoompan({ z: `if(eq(on,0),1.14,max(1.0,zoom-${zoomOutStep.toFixed(6)}))`, x: `(iw-iw/zoom)*${progress}`, y: `(ih-ih/zoom)*(0.35+0.15*${progress})` });
+    case "上下分割":
+      return zoompan({ z: "1.10", y: `(ih-ih/zoom)*${progress}` });
+    case "左右分割":
+      return zoompan({ z: "1.10", x: `(iw-iw/zoom)*${progress}` });
+    case "向左下降":
+      return zoompan({ z: "1.10", x: `(iw-iw/zoom)*(1-${progress})`, y: `(ih-ih/zoom)*${progress}` });
+    case "向右下降":
+      return zoompan({ z: "1.10", x: `(iw-iw/zoom)*${progress}`, y: `(ih-ih/zoom)*${progress}` });
+    case "旋转缩小":
+      return `${zoompan({ z: `if(eq(on,0),1.15,max(1.0,zoom-${zoomOutStep.toFixed(6)}))` })},rotate='-0.025*n/${safeFrames}':ow=iw:oh=ih:c=black@0`;
+    case "旋转上升":
+      return `${zoompan({ z: `min(zoom+${zoomInStep.toFixed(6)},1.12)`, y: `(ih-ih/zoom)*(1-${progress})` })},rotate='0.025*n/${safeFrames}':ow=iw:oh=ih:c=black@0`;
+    case "翻转":
+      return zoompan({ z: `min(zoom+${(zoomInStep * .6).toFixed(6)},1.08)`, prefix: "hflip," });
+    case "形变缩小":
+      return zoompan({ z: `if(eq(on,0),1.17,max(1.0,zoom-${zoomOutStep.toFixed(6)}))`, x: `(iw-iw/zoom)*(0.25+0.5*${progress})` });
+    case "回弹伸缩":
+      return zoompan({ z: `1+0.09*sin(PI*${progress})` });
+    case "滑滑梯":
+      return zoompan({ z: "1.12", x: `(iw-iw/zoom)*${progress}`, y: `(ih-ih/zoom)*${progress}` });
+    case "缩放":
+    default:
+      return zoompan({ z: `min(zoom+${zoomInStep.toFixed(6)},${zoomLimit})` });
+  }
 }
 
 async function renderVideo({ app, config, scenes, outputDir, ratio, bgmPath, template = {}, videoIntro = 0 }) {
@@ -51,22 +109,49 @@ async function renderVideo({ app, config, scenes, outputDir, ratio, bgmPath, tem
 
   for (const scene of scenes) {
     const clip = path.join(renderDir, `${String(scene.index).padStart(3, "0")}.mp4`);
+    if (fileLooksUsable(clip, 1024)) {
+      try {
+        const existingDuration = await mediaDuration(app, config, clip);
+        if (existingDuration > 0.05 && Math.abs(existingDuration - Number(scene.duration || 0)) < 1.25) {
+          clips.push(clip);
+          scene.render_clip_status = "completed";
+          continue;
+        }
+      } catch {}
+      try { fs.rmSync(clip, { force: true }); } catch {}
+    }
+    scene.render_clip_status = "running";
     const frames = Math.max(1, Math.ceil(scene.duration * 30));
     const fitMode = imageConfig.fit === "contain" ? "decrease" : "increase";
     const fitted = imageConfig.fit === "contain"
       ? `scale=${width}:${regionHeight}:force_original_aspect_ratio=${fitMode},pad=${width}:${regionHeight}:(ow-iw)/2:(oh-ih)/2:color=${ffBackgroundColor}`
       : `scale=${width}:${regionHeight}:force_original_aspect_ratio=${fitMode},crop=${width}:${regionHeight}`;
     const dynamicScene = Number(videoIntro) === -1 || (Number(videoIntro) > 0 && Number(scene.index) <= Number(videoIntro));
-    const zoomStep = dynamicScene ? 0.0012 : 0.00045 * Number(imageConfig.motionStrength || 1);
-    const motion = imageConfig.animation === "无" && !dynamicScene
-      ? `${fitted},fps=30`
-      : `${fitted},zoompan=z='min(zoom+${zoomStep},${dynamicScene ? 1.16 : 1.08})':d=${frames}:s=${width}x${regionHeight}:fps=30`;
+    const hasGeneratedVideo = Boolean(scene.video_path && fs.existsSync(scene.video_path));
+    let visualFilter;
+    if (hasGeneratedVideo) {
+      const sourceDuration = Math.max(.1, await mediaDuration(app, config, scene.video_path));
+      const stretch = Math.max(.01, Number(scene.duration || sourceDuration) / sourceDuration);
+      visualFilter = `${fitted},setpts=${stretch.toFixed(8)}*PTS,fps=30`;
+    } else {
+      visualFilter = buildImageMotionFilter({
+        fitted,
+        width,
+        height: regionHeight,
+        frames,
+        animation: imageConfig.animation === "无" ? "无动画" : imageConfig.animation,
+        motionStrength: imageConfig.motionStrength,
+        dynamicScene
+      });
+    }
     const useBackgroundImage = backgroundImage && fs.existsSync(backgroundImage);
     const backgroundFilter = useBackgroundImage
       ? `[2:v]scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}[bg];`
       : "";
-    const filter = `[0:v]${motion}[img];${backgroundFilter}[2:v][img]overlay=0:${regionTop}:shortest=1,format=yuv420p[v]`;
-    const clipArgs = ["-y", "-loop", "1", "-i", scene.image_path, "-i", scene.audio_path];
+    const filter = `[0:v]${visualFilter}[img];${backgroundFilter}[2:v][img]overlay=0:${regionTop}:shortest=1,format=yuv420p[v]`;
+    const clipArgs = hasGeneratedVideo
+      ? ["-y", "-i", scene.video_path, "-i", scene.audio_path]
+      : ["-y", "-loop", "1", "-i", scene.image_path, "-i", scene.audio_path];
     if (useBackgroundImage) clipArgs.push("-loop", "1", "-i", backgroundImage);
     else clipArgs.push("-f", "lavfi", "-i", `color=c=${ffBackgroundColor}:s=${width}x${height}:r=30`);
     clipArgs.push(
@@ -75,11 +160,12 @@ async function renderVideo({ app, config, scenes, outputDir, ratio, bgmPath, tem
       "-c:a", "aac", "-b:a", "160k", "-shortest", clip
     );
     await spawnAsync(ffmpeg, clipArgs);
+    scene.render_clip_status = "completed";
     clips.push(clip);
   }
 
   const concatFile = path.join(renderDir, "concat.txt");
-  fs.writeFileSync(concatFile, clips.map(file => `file '${file.replace(/'/g, "'\\''")}'`).join("\n"), "utf8");
+  atomicWriteFile(concatFile, clips.map(file => `file '${file.replace(/'/g, "'\\''")}'`).join("\n"), "utf8");
   const joined = path.join(renderDir, "joined.mp4");
   await spawnAsync(ffmpeg, ["-y", "-f", "concat", "-safe", "0", "-i", concatFile, "-c", "copy", joined]);
 
@@ -138,7 +224,7 @@ async function renderMusicVideo({ app, config, audioPath, images, lyrics, output
     clips.push(clip);
   }
   const concatFile = path.join(renderDir, "concat.txt");
-  fs.writeFileSync(concatFile, clips.map(file => `file '${file.replace(/'/g, "'\\''")}'`).join("\n"), "utf8");
+  atomicWriteFile(concatFile, clips.map(file => `file '${file.replace(/'/g, "'\\''")}'`).join("\n"), "utf8");
   const silentVideo = path.join(renderDir, "silent.mp4");
   await spawnAsync(ffmpeg, ["-y", "-f", "concat", "-safe", "0", "-i", concatFile, "-c", "copy", silentVideo]);
 

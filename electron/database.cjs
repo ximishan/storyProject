@@ -55,8 +55,10 @@ CREATE TABLE IF NOT EXISTS user_prompt_templates (
   style_id TEXT DEFAULT 'cinematic',
   image_seed_pools_json TEXT DEFAULT '[]',
   needs_character_card INTEGER,
+  character_card_mode TEXT DEFAULT 'follow',
   step3_skeleton_modules_json TEXT DEFAULT '[]',
   reference_kind TEXT DEFAULT '',
+  reference_decision_prompt TEXT DEFAULT '',
   image_prompt_template TEXT DEFAULT '',
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
@@ -121,6 +123,7 @@ function openDatabase(path) {
   db.pragma("journal_mode = WAL");
   db.exec(schema);
   migrateTasks(db);
+  normalizeLegacyTaskValues(db);
   migratePromptTemplates(db);
   seedTemplates(db);
   refreshBuiltinTemplates(db);
@@ -167,10 +170,23 @@ function migrateTasks(db) {
     ,["research_web", "INTEGER DEFAULT 1"]
     ,["research_ai", "INTEGER DEFAULT 0"]
     ,["research_ima", "INTEGER DEFAULT 0"]
+    ,["current_stage", "TEXT DEFAULT 'pending'"]
+    ,["last_checkpoint_at", "INTEGER DEFAULT 0"]
+    ,["last_heartbeat_at", "INTEGER DEFAULT 0"]
+    ,["interrupted_at", "INTEGER DEFAULT 0"]
+    ,["resume_count", "INTEGER DEFAULT 0"]
+    ,["queue_batch_id", "TEXT DEFAULT ''"]
   ];
   for (const [name, sql] of additions) {
     if (!columns.has(name)) db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${sql}`);
   }
+}
+
+
+function normalizeLegacyTaskValues(db) {
+  db.prepare("UPDATE tasks SET processing_mode='semi_auto' WHERE processing_mode='semi'").run();
+  db.prepare("UPDATE tasks SET cover_image_mode='titled' WHERE cover_image_mode='title'").run();
+  db.prepare("UPDATE tasks SET cover_image_mode='plain' WHERE cover_image_mode='blank'").run();
 }
 
 function migratePromptTemplates(db) {
@@ -179,9 +195,11 @@ function migratePromptTemplates(db) {
     ["step1_metadata_system_prompt", "TEXT DEFAULT ''"],
     ["image_seed_pools_json", "TEXT DEFAULT '[]'"],
     ["needs_character_card", "INTEGER"],
+    ["character_card_mode", "TEXT DEFAULT 'follow'"],
     ["step3_skeleton_modules_json", "TEXT DEFAULT '[]'"],
-    ["reference_kind", "TEXT DEFAULT ''"]
-    ,["image_prompt_template", "TEXT DEFAULT ''"]
+    ["reference_kind", "TEXT DEFAULT ''"],
+    ["reference_decision_prompt", "TEXT DEFAULT ''"],
+    ["image_prompt_template", "TEXT DEFAULT ''"]
   ];
   for (const [name, sql] of additions) {
     if (!columns.has(name)) db.exec(`ALTER TABLE user_prompt_templates ADD COLUMN ${name} ${sql}`);
@@ -271,6 +289,9 @@ function seedCoverTemplates(db) {
 
 function createTask(db, input) {
   const id = crypto.randomUUID();
+  const processingMode = input.processingMode === "semi" ? "semi_auto" : (input.processingMode || "auto");
+  const coverImageMode = input.coverImageMode === "title" ? "titled"
+    : input.coverImageMode === "blank" ? "plain" : (input.coverImageMode || "off");
   db.prepare(`
     INSERT INTO tasks (
       id,title,input_text,track,style,ratio,target_scenes,tts_speed,prompt_template_id,
@@ -286,11 +307,11 @@ function createTask(db, input) {
     input.rewriteIntensity || "standard", input.narrativePov || "original", input.keepPromotion ? 1 : 0,
     input.materialSource || "ai", input.targetLength ? Number(input.targetLength) : null,
     input.templateId || "default-portrait-9-16", input.referenceImagePath || "",
-    input.coverImageMode || "off", input.coverTemplateId || "cinematic-poster",
+    coverImageMode, input.coverTemplateId || "cinematic-poster",
     input.pauseMode || "none", input.sourceMode || "paste", input.sourceQuery || "", input.sourceRequirements || "",
-    input.bgmId || "builtin", input.speaker || "zh_male_dongfanghaoran_uranus_bigtts",
+    input.bgmId || "builtin", input.speaker || "",
     input.taskType || "story", input.scriptFormat || (input.taskType === "podcast" ? "dialogue" : "narration"),
-    input.podcastImageMode || "multi", input.podcastSpeakers || "mizai-dayi", input.processingMode || "auto",
+    input.podcastImageMode || "multi", input.podcastSpeakers || "mizai-dayi", processingMode,
     JSON.stringify(input.pausePoints || []), Number(input.videoIntro || 0), Number(input.videoIntroDuration || 0),
     input.researchWeb === false ? 0 : 1, input.researchAi ? 1 : 0, input.researchIma ? 1 : 0
   );

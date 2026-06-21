@@ -3,10 +3,17 @@ const path = require("node:path");
 const { spawnAsync, resolveResource } = require("./services.cjs");
 
 function templateForRatio(ratio) {
-  const landscape = ratio === "16:9";
+  const sizes = {
+    "9:16": { width: 1080, height: 1920 },
+    "3:4": { width: 1080, height: 1440 },
+    "1:1": { width: 1080, height: 1080 },
+    "4:3": { width: 1440, height: 1080 },
+    "16:9": { width: 1920, height: 1080 }
+  };
+  const size = sizes[ratio] || sizes["9:16"];
   return {
-    canvas: { width: landscape ? 1920 : 1080, height: landscape ? 1080 : 1920, ratio, backgroundColor: "#000000" },
-    image: { ratio, fit: "cover", top: 0, height: 1, animation: ["缩放", "向左缩小", "向右缩小"], motionStrength: 1 },
+    canvas: { width: size.width, height: size.height, ratio, backgroundColor: "#000000", backgroundImage: "" },
+    image: { ratio, fit: "cover", top: 0, height: 1, animation: "缩放", motionStrength: 1 },
     title: { visible: true, x: 0, y: .05, fontSize: 25, color: "#FFDE00", alpha: 1, bold: true, align: 1, border: { color: "#000000", width: 40, alpha: 1 } },
     caption: { visible: true, x: 0, y: -.22, fontSize: 12, color: "#FFFFFF", alpha: 1, align: 1, maxCharsPerLine: 14, background: { color: "#000000", alpha: .5, roundRadius: .3 }, border: { color: "#000000", width: 0, alpha: 0 } },
     audio: { narrationVolume: 10, bgmVolume: 3, bgmFadeOutMs: 2000 }
@@ -17,12 +24,16 @@ async function generateJianyingDraft({ app, config, task, outputDir, scenes, bgm
   const sentences = scenes.map(scene => ({
     id: scene.index,
     cap: scene.narration,
-    desc_prompt: scene.image_prompt
+    desc_prompt: scene.image_prompt,
+    image_path: scene.image_path || "",
+    video_path: scene.video_path || ""
   }));
   const segments = scenes.map(scene => ({
     index: scene.index,
     duration: scene.duration,
-    path: scene.audio_path
+    path: scene.audio_path,
+    image_path: scene.image_path || "",
+    video_path: scene.video_path || ""
   }));
   fs.writeFileSync(path.join(outputDir, "02-sentences.json"), JSON.stringify(sentences, null, 2), "utf8");
   fs.writeFileSync(path.join(outputDir, "03-segments.json"), JSON.stringify(segments, null, 2), "utf8");
@@ -40,7 +51,12 @@ async function generateJianyingDraft({ app, config, task, outputDir, scenes, bgm
     bgm_path: bgmPath || "",
     jianying_draft_path: config.jianying?.draft_path || "",
     template: task.draft_template || templateForRatio(task.ratio),
-    task_title: task.title
+    task_title: task.title,
+    dynamic_videos: scenes.filter(scene => scene.video_path).map(scene => ({
+      index: scene.index,
+      video_path: scene.video_path,
+      duration: scene.duration
+    }))
   };
   const { stdout } = await spawnAsync(exe, ["--input", JSON.stringify(input)]);
   const line = stdout.trim().split(/\r?\n/).filter(Boolean).pop();

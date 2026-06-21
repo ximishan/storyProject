@@ -1,5 +1,5 @@
 const defaultConfig: AppConfig = {
-  config_version: 2,
+  config_version: 4,
   llm: {
     provider: "local",
     protocol: "local",
@@ -19,19 +19,36 @@ const defaultConfig: AppConfig = {
     proxy_url: "", custom_models: []
   },
   custom_image: {
-    display_name: "", base_url: "", api_key: "", model: "gpt-image-1",
-    async_mode: false, submit_path: "/images/generations", status_path: "",
-    task_id_field: "task_id", status_field: "status", image_field: "data.0.url",
-    success_values: "succeeded,completed,success", extra_body_json: "",
-    ratio_mapping_json: "", ratio: "9:16", resolution: "1k", concurrency: 3, proxy_url: ""
+    display_name: "OpenAI 兼容图片接口",
+    base_url: "https://dm-fox.rjj.cc/codex/v1",
+    api_key: "",
+    model: "gpt-image-2",
+    async_mode: false,
+    submit_path: "/images/generations",
+    edit_path: "/images/edits",
+    quality: "high",
+    response_format: "auto",
+    edit_response_format: "b64_json",
+    status_path: "",
+    task_id_field: "task_id",
+    status_field: "status",
+    image_field: "data.0.url",
+    success_values: "succeeded,completed,success",
+    extra_body_json: "",
+    ratio_mapping_json: "",
+    ratio: "9:16",
+    resolution: "1k",
+    concurrency: 3,
+    proxy_url: ""
   },
   runninghub: {
-    api_key: "", base_url: "https://www.runninghub.cn", workflow_id: "",
+    api_key: "", base_url: "https://www.runninghub.cn", model: "rh-image-g2", workflow_id: "",
     prompt_node_id: "", prompt_field_name: "text", node_info_json: "[]",
     ratio: "9:16", resolution: "1k", concurrency: 1, proxy_url: ""
   },
   tts: {
-    provider: "volcengine",
+    provider: "system",
+    system: { voice: "", volume: 100 },
     volcengine: {
       app_id: "", access_key: "", engine_version: "2.0", resource_id: "seed-tts-2.0",
       base_url: "https://openspeech.bytedance.com/api/v3/tts/unidirectional",
@@ -142,6 +159,9 @@ export function installBrowserMock() {
         cover_image_mode: input.coverImageMode,
         cover_template_id: input.coverTemplateId,
         pause_mode: input.pauseMode,
+        source_mode: input.sourceMode,
+        source_query: input.sourceQuery,
+        source_requirements: input.sourceRequirements,
         bgm_id: input.bgmId,
         speaker: input.speaker,
         task_type: input.taskType,
@@ -173,6 +193,10 @@ export function installBrowserMock() {
     },
     runQueue: async ids => {
       tasks = tasks.map(task => ids.includes(task.id) ? { ...task, status: "completed", current_step: 8 } : task);
+      return { running: true };
+    },
+    resumeQueue: async () => {
+      tasks = tasks.map(task => Number(task.queue_order || 0) > 0 ? { ...task, status: "running" } : task);
       return { running: true };
     },
     prepareTask: async id => {
@@ -264,6 +288,7 @@ export function installBrowserMock() {
       if (llmProfiles.length && !llmProfiles.some(profile => profile.is_default)) llmProfiles[0].is_default = 1;
       return llmProfiles.find(profile => profile.is_default) || null;
     },
+    listSystemVoices: async () => [{ id: "Microsoft Huihui Desktop", name: "Microsoft Huihui Desktop", culture: "zh-CN", gender: "Female", age: "Adult", enabled: true }],
     listVoicePresets: async () => [],
     saveVoicePreset: async input => ({ id: input.id || crypto.randomUUID(), source_audio_path: "", ...input } as VoicePreset),
     openPath: async () => undefined,

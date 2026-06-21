@@ -1,6 +1,6 @@
 {
   "name": "storybound-rebuild",
-  "version": "0.6.0",
+  "version": "0.7.7",
   "private": true,
   "description": "A maintainable Storybound-compatible AI video creation desktop app",
   "main": "electron/main.cjs",
@@ -10,7 +10,16 @@
     "start": "electron .",
     "dist": "npm run build && electron-builder",
     "test:workflow": "node scripts/workflow-smoke-test.cjs",
-    "test:advanced": "node scripts/advanced-workflow-test.cjs"
+    "test:advanced": "node scripts/advanced-workflow-test.cjs",
+    "test:dynamic": "node scripts/dynamic-scene-test.cjs",
+    "test:script-modes": "node scripts/script-mode-test.cjs",
+    "test:openai-image": "node scripts/openai-image-api-test.cjs",
+    "test:llm-planner": "node scripts/llm-planner-test.cjs",
+    "test:reference-routing": "node scripts/reference-routing-test.cjs",
+    "test:checkpoint": "node scripts/checkpoint-recovery-test.cjs",
+    "test:voice-previews": "node scripts/official-voice-preview-test.cjs",
+    "test:llm-protocol": "node scripts/llm-protocol-test.cjs",
+    "test:llm-json-repair": "node scripts/llm-json-repair-test.cjs"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.4.1",
@@ -44,24 +53,22 @@
     ],
     "extraResources": [
       {
-        "from": "resources/draft-generator.exe",
-        "to": "draft-generator.exe"
-      },
-      {
-        "from": "resources/default-bgm.mp3",
-        "to": "default-bgm.mp3"
-      },
-      {
-        "from": "resources/bin/ffmpeg.exe",
-        "to": "bin/ffmpeg.exe"
+        "from": "resources",
+        "to": ".",
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "electron/sapi.ps1",
         "to": "sapi.ps1"
+      },
+      {
+        "from": "electron/sapi-voices.ps1",
+        "to": "sapi-voices.ps1"
       }
     ],
     "win": {
-      "icon": "build/icon.ico",
       "target": "nsis"
     }
   }

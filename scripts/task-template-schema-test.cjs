@@ -52,13 +52,14 @@ const expected = {
   script_format: "dialogue",
   podcast_image_mode: "multi",
   podcast_speakers: "mizai-dayi",
-  processing_mode: "semi",
+  processing_mode: "semi_auto",
   pause_points: "[0,3,5]",
   video_intro: 3,
   video_intro_duration: 5,
   research_web: 1,
   research_ai: 1,
-  research_ima: 0
+  research_ima: 0,
+  cover_image_mode: "titled"
 };
 for (const [key, value] of Object.entries(expected)) {
   if (task[key] !== value) throw new Error(`${key}: expected ${value}, got ${task[key]}`);

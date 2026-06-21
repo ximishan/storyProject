@@ -3,19 +3,20 @@ const path = require("node:path");
 const fs = require("node:fs");
 const { openDatabase, createTask } = require("./database.cjs");
 const {
-  runPipeline, preparePipeline, completePipeline, regenerateScene, renderPrepared
+  runPipeline, preparePipeline, completePipeline, regenerateScene, renderPrepared, taskOutputDir
 } = require("./pipeline.cjs");
-const { generateSceneImage, synthesizeSpeech, testConnection, spawnAsync } = require("./services.cjs");
+const { generateSceneImage, synthesizeSpeech, testConnection, spawnAsync, listSystemVoices } = require("./services.cjs");
 const { renderMusicVideo } = require("./media.cjs");
 const { generateMusicDraft } = require("./draft.cjs");
 const crypto = require("node:crypto");
+const { atomicWriteJson } = require("./checkpoint.cjs");
 
 let mainWindow;
 let db;
 let queueRunning = false;
 
 const defaultConfig = {
-  config_version: 2,
+  config_version: 4,
   llm: {
     provider: "local",
     protocol: "local",
@@ -35,19 +36,39 @@ const defaultConfig = {
     proxy_url: "", custom_models: []
   },
   custom_image: {
-    display_name: "", base_url: "", api_key: "", model: "gpt-image-1",
-    async_mode: false, submit_path: "/images/generations", status_path: "",
-    task_id_field: "task_id", status_field: "status", image_field: "data.0.url",
-    success_values: "succeeded,completed,success", extra_body_json: "",
-    ratio_mapping_json: "", ratio: "9:16", resolution: "1k", concurrency: 3, proxy_url: ""
+    display_name: "OpenAI 兼容图片接口",
+    base_url: "https://dm-fox.rjj.cc/codex/v1",
+    api_key: "",
+    model: "gpt-image-2",
+    async_mode: false,
+    submit_path: "/images/generations",
+    edit_path: "/images/edits",
+    quality: "high",
+    response_format: "auto",
+    edit_response_format: "b64_json",
+    status_path: "",
+    task_id_field: "task_id",
+    status_field: "status",
+    image_field: "data.0.url",
+    success_values: "succeeded,completed,success",
+    extra_body_json: "",
+    ratio_mapping_json: "",
+    ratio: "9:16",
+    resolution: "1k",
+    concurrency: 3,
+    proxy_url: ""
   },
   runninghub: {
-    api_key: "", base_url: "https://www.runninghub.cn", workflow_id: "",
+    api_key: "", base_url: "https://www.runninghub.cn", model: "rh-image-g2", workflow_id: "",
     prompt_node_id: "", prompt_field_name: "text", node_info_json: "[]",
     ratio: "9:16", resolution: "1k", concurrency: 1, proxy_url: ""
   },
   tts: {
-    provider: "volcengine",
+    provider: "system",
+    system: {
+      voice: "",
+      volume: 100
+    },
     volcengine: {
       app_id: "", access_key: "", engine_version: "2.0", resource_id: "seed-tts-2.0",
       base_url: "https://openspeech.bytedance.com/api/v3/tts/unidirectional",
@@ -75,26 +96,23 @@ function readConfig() {
       custom_image: { ...defaultConfig.custom_image, ...saved.custom_image },
       runninghub: { ...defaultConfig.runninghub, ...saved.runninghub },
       tts: {
-        provider: "volcengine",
+        provider: saved.tts?.provider || (saved.tts?.volcengine?.app_id && saved.tts?.volcengine?.access_key ? "volcengine" : "system"),
+        system: { ...defaultConfig.tts.system, ...saved.tts?.system },
         volcengine: { ...defaultConfig.tts.volcengine, ...saved.tts?.volcengine }
       },
       jianying: { ...defaultConfig.jianying, ...saved.jianying },
       media: { ...defaultConfig.media, ...saved.media },
       ui: { ...defaultConfig.ui, ...saved.ui }
     };
-    if (!saved.config_version || saved.config_version < 2) {
+    if (!saved.config_version || saved.config_version < 4) {
       if (!merged.llm.api_key && merged.llm.provider !== "local") {
         merged.llm.provider = "local";
         merged.llm.protocol = "local";
       }
-      const imageSection = merged.image_provider === "modelscope"
-        ? merged.modelscope : merged.image_provider === "custom_image"
-          ? merged.custom_image : merged.gpt_image;
-      if (merged.image_provider !== "placeholder" && !imageSection?.api_key) {
-        merged.image_provider = "placeholder";
+      if (!saved.tts?.provider) {
+        merged.tts.provider = merged.tts.volcengine.app_id && merged.tts.volcengine.access_key ? "volcengine" : "system";
       }
-      merged.tts.provider = "volcengine";
-      merged.config_version = 2;
+      merged.config_version = 4;
       fs.writeFileSync(configPath(), JSON.stringify(merged, null, 2), "utf8");
     }
     if (merged.image_provider === "gpt_image") {
@@ -109,7 +127,7 @@ function readConfig() {
     if (!["custom_image", "modelscope", "runninghub", "placeholder"].includes(merged.image_provider)) {
       merged.image_provider = "custom_image";
     }
-    merged.tts.provider = "volcengine";
+    if (!["system", "volcengine"].includes(merged.tts.provider)) merged.tts.provider = "system";
     return merged;
   } catch {
     fs.writeFileSync(configPath(), JSON.stringify(defaultConfig, null, 2), "utf8");
@@ -133,8 +151,9 @@ function createWindow() {
       nodeIntegration: false
     }
   });
-  mainWindow.webContents.on("console-message", (_event, level, message, line, sourceId) => {
-    log(`console level=${level} ${message} (${sourceId}:${line})`);
+  mainWindow.webContents.on("console-message", details => {
+    const { level = "info", message = "", lineNumber = 0, sourceId = "renderer" } = details || {};
+    log(`console level=${level} ${message} (${sourceId}:${lineNumber})`);
   });
   mainWindow.webContents.on("did-fail-load", (_event, code, description, url) => {
     log(`load failed code=${code} description=${description} url=${url}`);
@@ -154,6 +173,13 @@ function createWindow() {
 app.whenReady().then(() => {
   fs.mkdirSync(app.getPath("userData"), { recursive: true });
   db = openDatabase(path.join(app.getPath("userData"), "data.db"));
+  const interruptedAt = Date.now();
+  const interruptedRows = db.prepare("SELECT id,current_step FROM tasks WHERE status='running'").all();
+  db.prepare(`UPDATE tasks SET status='interrupted',current_stage='interrupted',interrupted_at=?,last_heartbeat_at=?,
+    error_message=CASE WHEN error_message='' THEN '检测到上次运行异常中断，可从断点继续' ELSE error_message END
+    WHERE status='running'`).run(interruptedAt, interruptedAt);
+  const interruptedEvent = db.prepare("INSERT INTO task_events(task_id,type,step,detail,data_json,ts) VALUES(?,?,?,?,?,?)");
+  for (const row of interruptedRows) interruptedEvent.run(row.id, "interrupted", row.current_step || 0, "程序上次未正常结束，任务已标记为可恢复", "{}", interruptedAt);
   const config = readConfig();
   const smokeOutput = process.env.STORYBOUND_SMOKE_OUTPUT;
   if (smokeOutput) {
@@ -227,20 +253,23 @@ ipcMain.handle("tasks:duplicate", (_event, id) => {
     narrativePov: task.narrative_pov, keepPromotion: task.keep_promotion,
     materialSource: task.material_source, targetLength: task.target_length,
     templateId: task.template_id, referenceImagePath: task.reference_image_path,
-    coverImageMode: task.cover_image_mode, coverTemplateId: task.cover_template_id, pauseMode: task.pause_mode, bgmId: task.bgm_id,
+    coverImageMode: task.cover_image_mode, coverTemplateId: task.cover_template_id, pauseMode: task.pause_mode,
+    sourceMode: task.source_mode, sourceQuery: task.source_query, sourceRequirements: task.source_requirements, bgmId: task.bgm_id,
     speaker: task.speaker, taskType: task.task_type, scriptFormat: task.script_format,
     podcastImageMode: task.podcast_image_mode, podcastSpeakers: task.podcast_speakers,
     processingMode: task.processing_mode, pausePoints: JSON.parse(task.pause_points || "[]"),
     videoIntro: task.video_intro, videoIntroDuration: task.video_intro_duration,
-    researchWeb: task.research_web, researchAi: task.research_ai, researchIma: task.research_ima
+    researchWeb: Boolean(task.research_web), researchAi: Boolean(task.research_ai), researchIma: Boolean(task.research_ima)
   });
 });
 ipcMain.handle("tasks:updatePipeline", (_event, id, pipeline) => {
-  db.prepare("UPDATE tasks SET pipeline_data=? WHERE id=?").run(JSON.stringify(pipeline), id);
+  const runtime = pipeline?.runtime || {};
+  db.prepare("UPDATE tasks SET pipeline_data=?,current_stage=?,current_step=?,last_checkpoint_at=? WHERE id=?")
+    .run(JSON.stringify(pipeline), runtime.current_stage || "review", Number(runtime.current_step || 3), Date.now(), id);
   const task = db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
   if (task.output_dir) {
-    fs.writeFileSync(path.join(task.output_dir, "script.json"), JSON.stringify(pipeline, null, 2), "utf8");
-    fs.writeFileSync(path.join(task.output_dir, "pipeline.json"), JSON.stringify(pipeline, null, 2), "utf8");
+    atomicWriteJson(path.join(task.output_dir, "script.json"), pipeline);
+    atomicWriteJson(path.join(task.output_dir, "pipeline.json"), pipeline);
   }
   return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
 });
@@ -364,6 +393,7 @@ ipcMain.handle("profiles:delete", (_event, id) => {
   }
   return next || null;
 });
+ipcMain.handle("voices:system-list", async () => listSystemVoices(app));
 ipcMain.handle("voices:list", () => db.prepare("SELECT * FROM voice_presets ORDER BY last_used_at DESC,created_at DESC").all());
 ipcMain.handle("voices:save", (_event, input) => {
   const id = input.id || crypto.randomUUID();
@@ -376,18 +406,28 @@ ipcMain.handle("voices:save", (_event, input) => {
 });
 ipcMain.handle("config:get", () => readConfig());
 ipcMain.handle("config:save", (_event, config) => {
-  fs.writeFileSync(configPath(), JSON.stringify(config, null, 2), "utf8");
-  return config;
+  const normalized = {
+    ...defaultConfig,
+    ...config,
+    config_version: 4,
+    tts: {
+      provider: ["system", "volcengine"].includes(config?.tts?.provider) ? config.tts.provider : "system",
+      system: { ...defaultConfig.tts.system, ...config?.tts?.system },
+      volcengine: { ...defaultConfig.tts.volcengine, ...config?.tts?.volcengine }
+    }
+  };
+  fs.writeFileSync(configPath(), JSON.stringify(normalized, null, 2), "utf8");
+  return normalized;
 });
-ipcMain.handle("config:test", async (_event, kind, candidate) => testConnection(candidate || readConfig(), kind));
+ipcMain.handle("config:test", async (_event, kind, candidate) => testConnection(candidate || readConfig(), kind, app));
 ipcMain.handle("diagnostics:run", async () => {
   const config = readConfig();
   const imageSection = config[config.image_provider] || {};
   return {
     checks: [
       { name: `LLM 配置完整性 · ${config.llm?.protocol || "未配置"} · ${config.llm?.model || "未填写模型"}`, ok: Boolean(config.llm?.api_key && config.llm?.model && config.llm?.base_url) },
-      { name: `AI 绘图 · ${config.image_provider}`, ok: config.image_provider === "runninghub" ? Boolean(config.runninghub?.api_key && config.runninghub?.workflow_id) : Boolean(imageSection.api_key && imageSection.base_url) },
-      { name: `TTS · ${config.tts?.volcengine?.speaker || "未选择音色"}`, ok: Boolean(config.tts?.volcengine?.app_id && config.tts?.volcengine?.access_key) },
+      { name: `AI 绘图 · ${config.image_provider}`, ok: config.image_provider === "runninghub" ? Boolean(config.runninghub?.api_key) : Boolean(imageSection.api_key && imageSection.base_url && imageSection.model) },
+      { name: config.tts?.provider === "system" ? `TTS · 本机系统语音 · ${config.tts?.system?.voice || "系统默认"}` : `TTS · 火山引擎 · ${config.tts?.volcengine?.speaker || "未选择音色"}`, ok: config.tts?.provider === "system" ? process.platform === "win32" : Boolean(config.tts?.volcengine?.app_id && config.tts?.volcengine?.access_key) },
       { name: `剪映草稿目录 · ${config.jianying?.draft_path || "未配置"}`, ok: Boolean(config.jianying?.draft_path && fs.existsSync(config.jianying.draft_path)) },
       { name: "BGM 配置", ok: fs.existsSync(app.isPackaged ? path.join(process.resourcesPath, "default-bgm.mp3") : path.join(__dirname, "..", "resources", "default-bgm.mp3")) },
       { name: `数据目录可写 · ${app.getPath("userData")}`, ok: fs.existsSync(app.getPath("userData")) },
@@ -465,19 +505,21 @@ ipcMain.handle("prompts:list", () =>
 ipcMain.handle("prompts:save", (_event, input) => {
   const id = input.id || crypto.randomUUID();
   const now = Date.now();
-  db.prepare(`INSERT INTO user_prompt_templates(id,name,description,base_track,step1_rewrite_system_prompt,step1_metadata_system_prompt,step3_system_prompt,style_id,image_seed_pools_json,needs_character_card,step3_skeleton_modules_json,reference_kind,image_prompt_template,created_at,updated_at)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  db.prepare(`INSERT INTO user_prompt_templates(id,name,description,base_track,step1_rewrite_system_prompt,step1_metadata_system_prompt,step3_system_prompt,style_id,image_seed_pools_json,needs_character_card,character_card_mode,step3_skeleton_modules_json,reference_kind,reference_decision_prompt,image_prompt_template,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
     ON CONFLICT(id) DO UPDATE SET name=excluded.name,description=excluded.description,
     base_track=excluded.base_track,step1_rewrite_system_prompt=excluded.step1_rewrite_system_prompt,
     step1_metadata_system_prompt=excluded.step1_metadata_system_prompt,step3_system_prompt=excluded.step3_system_prompt,
     style_id=excluded.style_id,image_seed_pools_json=excluded.image_seed_pools_json,
-    needs_character_card=excluded.needs_character_card,step3_skeleton_modules_json=excluded.step3_skeleton_modules_json,
-    reference_kind=excluded.reference_kind,image_prompt_template=excluded.image_prompt_template,updated_at=excluded.updated_at`).run(
+    needs_character_card=excluded.needs_character_card,character_card_mode=excluded.character_card_mode,
+    step3_skeleton_modules_json=excluded.step3_skeleton_modules_json,reference_kind=excluded.reference_kind,
+    reference_decision_prompt=excluded.reference_decision_prompt,image_prompt_template=excluded.image_prompt_template,updated_at=excluded.updated_at`).run(
       id, input.name, input.description || "", input.base_track || "character-story",
       input.step1_rewrite_system_prompt || "", input.step1_metadata_system_prompt || "", input.step3_system_prompt || "",
       input.style_id || "cinematic", input.image_seed_pools_json || "[]",
       input.needs_character_card == null ? null : Number(Boolean(input.needs_character_card)),
-      input.step3_skeleton_modules_json || "[]", input.reference_kind || "", input.image_prompt_template || "", input.created_at || now, now
+      input.character_card_mode || "follow", input.step3_skeleton_modules_json || "[]", input.reference_kind || "",
+      input.reference_decision_prompt || "", input.image_prompt_template || "", input.created_at || now, now
     );
   return db.prepare("SELECT * FROM user_prompt_templates WHERE id=?").get(id);
 });
@@ -498,15 +540,16 @@ ipcMain.handle("prompts:importJson", async () => {
     if (!item.name) continue;
     const id = crypto.randomUUID();
     const now = Date.now();
-    db.prepare(`INSERT INTO user_prompt_templates(id,name,description,base_track,step1_rewrite_system_prompt,step1_metadata_system_prompt,step3_system_prompt,style_id,image_seed_pools_json,needs_character_card,step3_skeleton_modules_json,reference_kind,image_prompt_template,created_at,updated_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+    db.prepare(`INSERT INTO user_prompt_templates(id,name,description,base_track,step1_rewrite_system_prompt,step1_metadata_system_prompt,step3_system_prompt,style_id,image_seed_pools_json,needs_character_card,character_card_mode,step3_skeleton_modules_json,reference_kind,reference_decision_prompt,image_prompt_template,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
         id, item.name, item.description || "", item.base_track || "character-story",
         item.step1_rewrite_system_prompt || item.rewrite_prompt || "",
         item.step1_metadata_system_prompt || "",
         item.step3_system_prompt || item.scene_prompt || "",
         item.style_id || "cinematic", item.image_seed_pools_json || "[]",
         item.needs_character_card == null ? null : Number(Boolean(item.needs_character_card)),
-        item.step3_skeleton_modules_json || "[]", item.reference_kind || "", item.image_prompt_template || "", now, now
+        item.character_card_mode || "follow", item.step3_skeleton_modules_json || "[]", item.reference_kind || "",
+        item.reference_decision_prompt || "", item.image_prompt_template || "", now, now
       );
     saved.push(db.prepare("SELECT * FROM user_prompt_templates WHERE id=?").get(id));
   }
@@ -681,50 +724,110 @@ ipcMain.handle("tasks:replaceSceneImage", async (_event, id, sceneIndex) => {
   const destination = path.join(imagesDir, `${scene.index}-custom${path.extname(selected.filePaths[0]) || ".png"}`);
   fs.copyFileSync(selected.filePaths[0], destination);
   scene.image_path = destination;
-  fs.writeFileSync(path.join(task.output_dir, "pipeline.json"), JSON.stringify(script, null, 2), "utf8");
-  db.prepare("UPDATE tasks SET pipeline_data=?,status='review' WHERE id=?").run(JSON.stringify(script), id);
+  scene.image_provider = "custom-local";
+  scene.image_status = "completed";
+  scene.image_error = "";
+  scene.image_remote_task_id = "";
+  scene.image_remote_provider = "";
+  scene.video_path = "";
+  scene.video_provider = "";
+  scene.video_source_url = "";
+  scene.video_remote_task_id = "";
+  scene.video_remote_model = "";
+  scene.video_status = "pending";
+  scene.video_error = "图片已替换，动态画面将在继续任务时重新生成";
+  script.runtime = {
+    ...(script.runtime || {}),
+    current_stage: "review",
+    current_step: 4,
+    render_status: "pending",
+    cover_status: "pending",
+    draft_status: "pending",
+    final_video: "",
+    subtitle_path: "",
+    draft_dir: "",
+    cover_path: ""
+  };
+  atomicWriteJson(path.join(task.output_dir, "pipeline.json"), script);
+  db.prepare("UPDATE tasks SET pipeline_data=?,status='review',current_stage='review',current_step=4,last_checkpoint_at=? WHERE id=?")
+    .run(JSON.stringify(script), Date.now(), id);
   return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
 });
 
+function taskCheckpoint(id) {
+  return ({ outputDir = "", pipeline = null, currentStage = "", currentStep = 0, detail = "" } = {}) => {
+    const now = Date.now();
+    const task = db.prepare("SELECT output_dir,pipeline_data,current_step,current_stage FROM tasks WHERE id=?").get(id);
+    if (!task) return;
+    const nextOutputDir = outputDir || task.output_dir || "";
+    const nextPipeline = pipeline ? JSON.stringify(pipeline) : task.pipeline_data;
+    const nextStep = Number(currentStep || task.current_step || 0);
+    const nextStage = currentStage || task.current_stage || "running";
+    db.prepare(`UPDATE tasks SET output_dir=?,pipeline_data=?,current_step=?,current_stage=?,last_checkpoint_at=?,last_heartbeat_at=? WHERE id=?`)
+      .run(nextOutputDir, nextPipeline, nextStep, nextStage, now, now, id);
+    if (detail) {
+      db.prepare("INSERT INTO task_events(task_id,type,step,detail,data_json,ts) VALUES(?,?,?,?,?,?)")
+        .run(id, "checkpoint", nextStep, detail, JSON.stringify({ stage: nextStage }), now);
+    }
+  };
+}
+
 function taskEmitter(id) {
   return (step, message) => {
-    db.prepare("UPDATE tasks SET current_step=? WHERE id=?").run(step, id);
+    const now = Date.now();
+    db.prepare("UPDATE tasks SET current_step=?,last_heartbeat_at=? WHERE id=?").run(step, now, id);
     db.prepare("INSERT INTO task_events(task_id,type,step,detail,data_json,ts) VALUES(?,?,?,?,?,?)")
-      .run(id, "progress", step, message, "{}", Date.now());
+      .run(id, "progress", step, message, "{}", now);
     mainWindow?.webContents.send("task:event", { taskId: id, status: "running", step, message });
   };
+}
+
+function beginTaskRun(id, { keepStep = false } = {}) {
+  const before = db.prepare("SELECT status,current_step FROM tasks WHERE id=?").get(id);
+  const task = loadTask(id);
+  const config = readConfig();
+  const outputDir = taskOutputDir(task, config, path.join(app.getPath("documents"), "Storybound"));
+  fs.mkdirSync(outputDir, { recursive: true });
+  const resume = ["interrupted", "failed", "review"].includes(before?.status) || Boolean(task.pipeline_data) || fs.existsSync(path.join(outputDir, "pipeline.json"));
+  db.prepare(`UPDATE tasks SET status='running',output_dir=?,current_stage=?,current_step=?,cancel_requested=0,error_message='',
+    resume_count=resume_count+?,last_heartbeat_at=? WHERE id=?`)
+    .run(outputDir, resume ? "resuming" : "planning", keepStep ? Number(before?.current_step || 0) : (resume ? Number(before?.current_step || 0) : 0), resume ? 1 : 0, Date.now(), id);
+  task.output_dir = outputDir;
+  task.status = "running";
+  return { task, config, outputDir, resume };
 }
 
 function taskFailure(id, error) {
   const message = error instanceof Error ? error.message : String(error);
   const cancelRequested = Boolean(db.prepare("SELECT cancel_requested FROM tasks WHERE id=?").get(id)?.cancel_requested);
   if (cancelRequested || message.includes("取消")) {
-    db.prepare("UPDATE tasks SET status='cancelled',error_message='任务已取消' WHERE id=?").run(id);
+    db.prepare("UPDATE tasks SET status='cancelled',current_stage='cancelled',error_message='任务已取消',last_heartbeat_at=? WHERE id=?").run(Date.now(), id);
     mainWindow?.webContents.send("task:event", { taskId: id, status: "cancelled", step: 0, message: "任务已取消" });
     return;
   }
   const task = db.prepare("SELECT output_dir FROM tasks WHERE id=?").get(id);
   const pipelinePath = task?.output_dir ? path.join(task.output_dir, "pipeline.json") : "";
   if (pipelinePath && fs.existsSync(pipelinePath)) {
-    db.prepare("UPDATE tasks SET status='failed',error_message=?,pipeline_data=? WHERE id=?")
-      .run(message, fs.readFileSync(pipelinePath, "utf8"), id);
+    db.prepare("UPDATE tasks SET status='failed',current_stage='failed',error_message=?,pipeline_data=?,last_heartbeat_at=? WHERE id=?")
+      .run(message, fs.readFileSync(pipelinePath, "utf8"), Date.now(), id);
   } else {
-    db.prepare("UPDATE tasks SET status='failed',error_message=? WHERE id=?").run(message, id);
+    db.prepare("UPDATE tasks SET status='failed',current_stage='failed',error_message=?,last_heartbeat_at=? WHERE id=?").run(message, Date.now(), id);
   }
   mainWindow?.webContents.send("task:event", { taskId: id, status: "failed", step: 0, message });
 }
 
 ipcMain.handle("tasks:prepare", async (_event, id) => {
-  db.prepare("UPDATE tasks SET status='running',current_step=0,error_message='' WHERE id=?").run(id);
-  const task = loadTask(id);
+  const { task, config } = beginTaskRun(id);
   try {
     const result = await preparePipeline({
-      task, config: readConfig(),
+      task,
+      config,
       baseOutputDir: path.join(app.getPath("documents"), "Storybound"),
-      emit: taskEmitter(id)
+      emit: taskEmitter(id),
+      checkpoint: taskCheckpoint(id)
     });
-    db.prepare("UPDATE tasks SET status='review',current_step=3,output_dir=?,pipeline_data=? WHERE id=?")
-      .run(result.outputDir, JSON.stringify(result.script), id);
+    db.prepare("UPDATE tasks SET status='review',current_stage='review_script',current_step=3,output_dir=?,pipeline_data=?,last_checkpoint_at=? WHERE id=?")
+      .run(result.outputDir, JSON.stringify(result.script), Date.now(), id);
     mainWindow?.webContents.send("task:event", { taskId: id, status: "review", step: 3, message: "脚本和分镜已生成，请确认后继续" });
     return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
   } catch (error) {
@@ -734,21 +837,27 @@ ipcMain.handle("tasks:prepare", async (_event, id) => {
 });
 
 ipcMain.handle("tasks:continue", async (_event, id) => {
-  const task = loadTask(id);
-  const script = JSON.parse(task.pipeline_data || "{}");
-  if (!Array.isArray(script.scenes)) throw new Error("请先生成并确认脚本");
-  db.prepare("UPDATE tasks SET status='running',error_message='' WHERE id=?").run(id);
+  const { task, config, outputDir } = beginTaskRun(id, { keepStep: true });
+  let script = null;
+  try { script = task.pipeline_data ? JSON.parse(task.pipeline_data) : null; } catch {}
+  if (!script?.scenes?.length && fs.existsSync(path.join(outputDir, "pipeline.json"))) {
+    try { script = JSON.parse(fs.readFileSync(path.join(outputDir, "pipeline.json"), "utf8")); } catch {}
+  }
+  if (!Array.isArray(script?.scenes)) throw new Error("请先生成并确认脚本");
   try {
-    const result = await completePipeline({ app, task, config: readConfig(), outputDir: task.output_dir, script, emit: taskEmitter(id) });
+    const result = await completePipeline({
+      app, task, config, outputDir, script,
+      emit: taskEmitter(id), checkpoint: taskCheckpoint(id)
+    });
     if (result.paused) {
-      db.prepare("UPDATE tasks SET status='review',current_step=?,pipeline_data=? WHERE id=?")
-        .run(result.pauseStep || 4, JSON.stringify(result.script), id);
+      db.prepare("UPDATE tasks SET status='review',current_stage=?,current_step=?,pipeline_data=?,last_checkpoint_at=? WHERE id=?")
+        .run(result.pauseStep === 5 ? "review_audio" : "review_images", result.pauseStep || 4, JSON.stringify(result.script), Date.now(), id);
       const message = result.pauseStep === 5 ? "配音已生成，请试听后继续" : "图片已生成，请检查画廊后继续";
       mainWindow?.webContents.send("task:event", { taskId: id, status: "review", step: result.pauseStep || 4, message });
       return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
     }
-    db.prepare("UPDATE tasks SET status='completed',current_step=8,video_path=?,draft_dir=?,cover_path=?,pipeline_data=?,completed_at=datetime('now','localtime') WHERE id=?")
-      .run(result.finalVideo, result.draftDir, result.coverPath || "", JSON.stringify(result.script), id);
+    db.prepare("UPDATE tasks SET status='completed',current_stage='completed',current_step=8,video_path=?,draft_dir=?,cover_path=?,pipeline_data=?,queue_order=0,queue_batch_id='',completed_at=datetime('now','localtime'),last_checkpoint_at=? WHERE id=?")
+      .run(result.finalVideo, result.draftDir, result.coverPath || "", JSON.stringify(result.script), Date.now(), id);
     return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
   } catch (error) {
     taskFailure(id, error);
@@ -757,16 +866,15 @@ ipcMain.handle("tasks:continue", async (_event, id) => {
 });
 
 ipcMain.handle("tasks:regenerateScene", async (_event, id, sceneIndex, kind) => {
-  const task = loadTask(id);
+  const { task, config, outputDir } = beginTaskRun(id, { keepStep: true });
   const script = JSON.parse(task.pipeline_data || "{}");
-  db.prepare("UPDATE tasks SET status='running',error_message='' WHERE id=?").run(id);
   try {
     const updated = await regenerateScene({
-      app, task, config: readConfig(), outputDir: task.output_dir,
+      app, task, config, outputDir,
       script, sceneIndex, kind, emit: taskEmitter(id)
     });
-    db.prepare("UPDATE tasks SET pipeline_data=?,status='review',error_message='' WHERE id=?")
-      .run(JSON.stringify(updated), id);
+    db.prepare("UPDATE tasks SET pipeline_data=?,status='review',current_stage='review',error_message='',last_checkpoint_at=? WHERE id=?")
+      .run(JSON.stringify(updated), Date.now(), id);
     return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
   } catch (error) {
     taskFailure(id, error);
@@ -775,13 +883,12 @@ ipcMain.handle("tasks:regenerateScene", async (_event, id, sceneIndex, kind) => 
 });
 
 ipcMain.handle("tasks:render", async (_event, id) => {
-  const task = loadTask(id);
+  const { task, config, outputDir } = beginTaskRun(id, { keepStep: true });
   const script = JSON.parse(task.pipeline_data || "{}");
-  db.prepare("UPDATE tasks SET status='running',error_message='' WHERE id=?").run(id);
   try {
-    const result = await renderPrepared({ app, task, config: readConfig(), outputDir: task.output_dir, script, emit: taskEmitter(id) });
-    db.prepare("UPDATE tasks SET status='completed',current_step=8,video_path=?,draft_dir=?,cover_path=?,completed_at=datetime('now','localtime') WHERE id=?")
-      .run(result.finalVideo, result.draftDir, result.coverPath || "", id);
+    const result = await renderPrepared({ app, task, config, outputDir, script, emit: taskEmitter(id) });
+    db.prepare("UPDATE tasks SET status='completed',current_stage='completed',current_step=8,video_path=?,draft_dir=?,cover_path=?,pipeline_data=?,completed_at=datetime('now','localtime'),last_checkpoint_at=? WHERE id=?")
+      .run(result.finalVideo, result.draftDir, result.coverPath || "", JSON.stringify(result.script), Date.now(), id);
     return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
   } catch (error) {
     taskFailure(id, error);
@@ -790,79 +897,90 @@ ipcMain.handle("tasks:render", async (_event, id) => {
 });
 
 ipcMain.handle("tasks:run", async (_event, id) => {
-  db.prepare("UPDATE tasks SET status='running', current_step=0, error_message='' WHERE id=?").run(id);
-  const task = loadTask(id);
-  const emit = (step, message) => {
-    db.prepare("UPDATE tasks SET current_step=? WHERE id=?").run(step, id);
-    db.prepare(
-      "INSERT INTO task_events(task_id,type,step,detail,data_json,ts) VALUES(?,?,?,?,?,?)"
-    ).run(id, "progress", step, message, "{}", Date.now());
-    mainWindow?.webContents.send("task:event", {
-      taskId: id, status: "running", step, message
-    });
-  };
+  const { task, config } = beginTaskRun(id);
   try {
     const result = await runPipeline({
       app,
       task,
-      config: readConfig(),
+      config,
       baseOutputDir: path.join(app.getPath("documents"), "Storybound"),
-      emit
+      emit: taskEmitter(id),
+      checkpoint: taskCheckpoint(id)
     });
-    db.prepare(
-      "UPDATE tasks SET status='completed', current_step=8, output_dir=?, video_path=?, draft_dir=?, cover_path=?, pipeline_data=?, completed_at=datetime('now','localtime') WHERE id=?"
-    ).run(result.outputDir, result.finalVideo, result.draftDir, result.coverPath || "", JSON.stringify(result.script), id);
+    if (result.paused) {
+      db.prepare("UPDATE tasks SET status='review',current_stage=?,current_step=?,output_dir=?,pipeline_data=?,last_checkpoint_at=? WHERE id=?")
+        .run(result.pauseStep === 5 ? "review_audio" : "review_images", result.pauseStep || 4, result.outputDir, JSON.stringify(result.script), Date.now(), id);
+      const message = result.pauseStep === 5 ? "配音已生成，请试听后继续" : "图片已生成，请检查画廊后继续";
+      mainWindow?.webContents.send("task:event", {
+        taskId: id, status: "review", step: result.pauseStep || 4, message
+      });
+      return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
+    }
+    db.prepare(`UPDATE tasks SET status='completed',current_stage='completed',current_step=8,output_dir=?,video_path=?,draft_dir=?,cover_path=?,
+      pipeline_data=?,queue_order=0,queue_batch_id='',completed_at=datetime('now','localtime'),last_checkpoint_at=? WHERE id=?`)
+      .run(result.outputDir, result.finalVideo, result.draftDir, result.coverPath || "", JSON.stringify(result.script), Date.now(), id);
     mainWindow?.webContents.send("task:event", {
       taskId: id, status: "completed", step: 8, message: `视频已生成：${result.finalVideo}`
     });
+    return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    db.prepare("UPDATE tasks SET status='failed', error_message=? WHERE id=?").run(message, id);
-    db.prepare(
-      "INSERT INTO task_events(task_id,type,step,detail,data_json,ts) VALUES(?,?,?,?,?,?)"
-    ).run(id, "error", 0, message, "{}", Date.now());
-    mainWindow?.webContents.send("task:event", {
-      taskId: id, status: "failed", step: 0, message
-    });
+    taskFailure(id, error);
+    throw error;
   }
 });
 
 async function runQueuedTask(id) {
-  let task = loadTask(id);
-  db.prepare("UPDATE tasks SET status='running',cancel_requested=0,error_message='' WHERE id=?").run(id);
+  const { task, config } = beginTaskRun(id);
+  task.pause_mode = "none";
   try {
-    let script = task.pipeline_data ? JSON.parse(task.pipeline_data) : null;
-    let outputDir = task.output_dir;
-    if (!script?.scenes?.length) {
-      const prepared = await preparePipeline({
-        task, config: readConfig(), baseOutputDir: path.join(app.getPath("documents"), "Storybound"), emit: taskEmitter(id)
-      });
-      script = prepared.script;
-      outputDir = prepared.outputDir;
-      db.prepare("UPDATE tasks SET output_dir=?,pipeline_data=? WHERE id=?").run(outputDir, JSON.stringify(script), id);
-    }
-    task = loadTask(id);
-    task.pause_mode = "none";
-    const result = await completePipeline({ app, task, config: readConfig(), outputDir, script, emit: taskEmitter(id) });
-    db.prepare("UPDATE tasks SET status='completed',current_step=8,video_path=?,draft_dir=?,cover_path=?,pipeline_data=?,completed_at=datetime('now','localtime') WHERE id=?")
-      .run(result.finalVideo, result.draftDir, result.coverPath || "", JSON.stringify(result.script), id);
+    const result = await runPipeline({
+      app,
+      task,
+      config,
+      baseOutputDir: path.join(app.getPath("documents"), "Storybound"),
+      emit: taskEmitter(id),
+      checkpoint: taskCheckpoint(id)
+    });
+    db.prepare(`UPDATE tasks SET status='completed',current_stage='completed',current_step=8,output_dir=?,video_path=?,draft_dir=?,cover_path=?,
+      pipeline_data=?,queue_order=0,queue_batch_id='',completed_at=datetime('now','localtime'),last_checkpoint_at=? WHERE id=?`)
+      .run(result.outputDir, result.finalVideo, result.draftDir, result.coverPath || "", JSON.stringify(result.script), Date.now(), id);
   } catch (error) {
     if (String(error?.message || error).includes("取消")) {
-      db.prepare("UPDATE tasks SET status='cancelled',error_message='任务已取消' WHERE id=?").run(id);
-    } else taskFailure(id, error);
+      db.prepare("UPDATE tasks SET status='cancelled',current_stage='cancelled',error_message='任务已取消',last_heartbeat_at=?,queue_order=0,queue_batch_id='' WHERE id=?")
+        .run(Date.now(), id);
+    } else {
+      taskFailure(id, error);
+    }
   }
 }
 
-ipcMain.handle("queue:run", async (_event, ids) => {
+async function startPersistedQueue(ids) {
   if (queueRunning) return { running: true };
+  let queueIds = Array.isArray(ids) ? ids.filter(Boolean) : [];
+  if (!queueIds.length) {
+    queueIds = db.prepare(`SELECT id FROM tasks WHERE queue_order>0 AND status NOT IN ('completed','cancelled') ORDER BY queue_order ASC`).all().map(row => row.id);
+  }
+  if (!queueIds.length) return { running: false, empty: true };
+  const batchId = crypto.randomUUID();
+  const setQueue = db.prepare("UPDATE tasks SET queue_order=?,queue_batch_id=? WHERE id=?");
+  const transaction = db.transaction(items => items.forEach((id, index) => setQueue.run(index + 1, batchId, id)));
+  transaction(queueIds);
   queueRunning = true;
   setImmediate(async () => {
     try {
-      for (const id of ids || []) await runQueuedTask(id);
+      for (const id of queueIds) {
+        const row = db.prepare("SELECT status,cancel_requested FROM tasks WHERE id=?").get(id);
+        if (!row || row.status === "completed" || row.status === "cancelled" || row.cancel_requested) continue;
+        await runQueuedTask(id);
+      }
     } finally {
       queueRunning = false;
       mainWindow?.webContents.send("queue:event", { running: false });
     }
   });
-  return { running: true };
-});
+  return { running: true, count: queueIds.length };
+}
+
+ipcMain.handle("queue:run", async (_event, ids) => startPersistedQueue(ids));
+ipcMain.handle("queue:resume", async () => startPersistedQueue([]));
+
