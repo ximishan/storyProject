@@ -29,6 +29,8 @@ const defaultConfig: AppConfig = {
     quality: "high",
     response_format: "auto",
     edit_response_format: "b64_json",
+    moderation: "none",
+    policy_fallback: true,
     status_path: "",
     task_id_field: "task_id",
     status_field: "status",
@@ -247,7 +249,7 @@ export function installBrowserMock() {
       return tasks.find(task => task.id === id)!;
     },
     replaceSceneImage: async id => tasks.find(task => task.id === id)!,
-    renderTask: async id => {
+    renderTask: async (id, _options) => {
       tasks = tasks.map(task => task.id === id ? {
         ...task, status: "completed", current_step: 8,
         video_path: "C:\\demo\\final.mp4", draft_dir: "C:\\demo\\draft"

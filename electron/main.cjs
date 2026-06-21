@@ -10,6 +10,7 @@ const { renderMusicVideo } = require("./media.cjs");
 const { generateMusicDraft } = require("./draft.cjs");
 const crypto = require("node:crypto");
 const { atomicWriteJson } = require("./checkpoint.cjs");
+const { buildPolicySafeImagePrompt } = require("./image-prompt-safety.cjs");
 
 let mainWindow;
 let db;
@@ -46,6 +47,8 @@ const defaultConfig = {
     quality: "high",
     response_format: "auto",
     edit_response_format: "b64_json",
+    moderation: "none",
+    policy_fallback: true,
     status_path: "",
     task_id_field: "task_id",
     status_field: "status",
@@ -232,7 +235,7 @@ app.on("window-all-closed", () => {
 });
 
 ipcMain.handle("tasks:list", () =>
-  db.prepare("SELECT * FROM tasks ORDER BY datetime(created_at) DESC").all()
+  db.prepare("SELECT * FROM tasks ORDER BY datetime(created_at) DESC").all().map(sanitizeStoredTaskPrompts)
 );
 ipcMain.handle("tasks:create", (_event, input) => createTask(db, input));
 ipcMain.handle("tasks:delete", (_event, id) => {
@@ -693,8 +696,51 @@ ipcMain.handle("music:generate", async (_event, input) => {
   return { outputDir, videoPath: video.finalVideo, draftDir };
 });
 
+function sanitizeStoredTaskPrompts(task) {
+  if (!task?.pipeline_data) return task;
+  let script;
+  try { script = JSON.parse(task.pipeline_data); } catch { return task; }
+  if (!Array.isArray(script?.scenes)) return task;
+  let changed = false;
+  for (const scene of script.scenes) {
+    const rawDesc = String(scene.desc_prompt || "");
+    if (rawDesc) {
+      const safeDesc = buildPolicySafeImagePrompt(rawDesc, "preflight");
+      if (safeDesc.adjusted && safeDesc.prompt !== rawDesc) {
+        scene.desc_prompt_original = scene.desc_prompt_original || rawDesc;
+        scene.desc_prompt = safeDesc.prompt;
+        scene.image_prompt_safety_adjusted = true;
+        scene.image_prompt_safety_reasons = [...new Set([...(scene.image_prompt_safety_reasons || []), ...(safeDesc.reasons || [])])];
+        changed = true;
+      }
+    }
+    const rawPrompt = String(scene.image_prompt || "");
+    if (rawPrompt) {
+      const safePrompt = buildPolicySafeImagePrompt(rawPrompt, "preflight");
+      if (safePrompt.adjusted && safePrompt.prompt !== rawPrompt) {
+        scene.image_prompt_original = scene.image_prompt_original || rawPrompt;
+        scene.image_prompt = safePrompt.prompt;
+        scene.image_prompt_safety_adjusted = true;
+        scene.image_prompt_safety_reasons = [...new Set([...(scene.image_prompt_safety_reasons || []), ...(safePrompt.reasons || [])])];
+        changed = true;
+      }
+    }
+  }
+  if (!changed) return task;
+  const pipelineData = JSON.stringify(script);
+  task.pipeline_data = pipelineData;
+  try {
+    db.prepare("UPDATE tasks SET pipeline_data=?,last_checkpoint_at=? WHERE id=?").run(pipelineData, Date.now(), task.id);
+    if (task.output_dir) {
+      atomicWriteJson(path.join(task.output_dir, "script.json"), script);
+      atomicWriteJson(path.join(task.output_dir, "pipeline.json"), script);
+    }
+  } catch {}
+  return task;
+}
+
 function loadTask(id) {
-  const task = db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
+  const task = sanitizeStoredTaskPrompts(db.prepare("SELECT * FROM tasks WHERE id=?").get(id));
   if (!task) throw new Error("任务不存在");
   if (task.prompt_template_id) {
     task.prompt_template = db.prepare("SELECT * FROM user_prompt_templates WHERE id=?").get(task.prompt_template_id);
@@ -875,6 +921,12 @@ ipcMain.handle("tasks:regenerateScene", async (_event, id, sceneIndex, kind) => 
     });
     db.prepare("UPDATE tasks SET pipeline_data=?,status='review',current_stage='review',error_message='',last_checkpoint_at=? WHERE id=?")
       .run(JSON.stringify(updated), Date.now(), id);
+    mainWindow?.webContents.send("task:event", {
+      taskId: id,
+      status: "review",
+      step: kind === "image" ? 4 : 5,
+      message: kind === "image" ? `第 ${sceneIndex} 镜画面重新生成完成` : `第 ${sceneIndex} 镜配音重新生成完成`
+    });
     return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
   } catch (error) {
     taskFailure(id, error);
@@ -882,11 +934,11 @@ ipcMain.handle("tasks:regenerateScene", async (_event, id, sceneIndex, kind) => 
   }
 });
 
-ipcMain.handle("tasks:render", async (_event, id) => {
+ipcMain.handle("tasks:render", async (_event, id, options = {}) => {
   const { task, config, outputDir } = beginTaskRun(id, { keepStep: true });
   const script = JSON.parse(task.pipeline_data || "{}");
   try {
-    const result = await renderPrepared({ app, task, config, outputDir, script, emit: taskEmitter(id) });
+    const result = await renderPrepared({ app, task, config, outputDir, script, emit: taskEmitter(id), options });
     db.prepare("UPDATE tasks SET status='completed',current_stage='completed',current_step=8,video_path=?,draft_dir=?,cover_path=?,pipeline_data=?,completed_at=datetime('now','localtime'),last_checkpoint_at=? WHERE id=?")
       .run(result.finalVideo, result.draftDir, result.coverPath || "", JSON.stringify(result.script), Date.now(), id);
     return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);

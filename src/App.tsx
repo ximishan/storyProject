@@ -70,7 +70,7 @@ export default function App() {
           <Settings size={18} /><span>设置</span>
         </button>
         <button><CircleHelp size={18} /><span>使用帮助</span></button>
-        <div className="version">Storybound Rebuild · v0.7.7</div>
+        <div className="version">Storybound Rebuild · v0.8.3</div>
       </div>
       </aside>
       <main className="main">
@@ -188,6 +188,18 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
   const [busy, setBusy] = useState("");
   const [message, setMessage] = useState("");
   const [imageUrls, setImageUrls] = useState<Record<number, string>>({});
+  const [showRenderOptions, setShowRenderOptions] = useState(false);
+  const [renderOptions, setRenderOptions] = useState<RenderTaskOptions>({
+    animation: "左拉镜",
+    motionStrength: 0.5,
+    forceStaticImages: true,
+    burnCaption: true,
+    burnTitle: true,
+    burnSubtitle: true,
+    burnDisclaimer: true,
+    autoTextLayout: true,
+    titleDuration: 3.2
+  });
 
   useEffect(() => setPipeline(parsePipeline()), [task.pipeline_data]);
   useEffect(() => {
@@ -195,14 +207,35 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
     Promise.all(paths.map(async scene => [scene.index, await window.storybound.pathToDataUrl(scene.image_path!)] as const))
       .then(entries => setImageUrls(Object.fromEntries(entries)));
   }, [task.pipeline_data, pipeline?.scenes?.length]);
+  useEffect(() => window.storybound.onTaskEvent(event => {
+    if (event.taskId !== task.id) return;
+    setMessage(event.message || "任务处理中…");
+    if (event.status !== "running") setBusy("");
+  }), [task.id]);
+
+  const applyReturnedTask = async (result: unknown) => {
+    if (!result || typeof result !== "object") return;
+    const record = result as Partial<TaskRecord>;
+    if (!record.pipeline_data) return;
+    try {
+      const nextPipeline = JSON.parse(record.pipeline_data) as PipelineData;
+      setPipeline(nextPipeline);
+      const paths = nextPipeline.scenes?.filter(scene => scene.image_path) || [];
+      const entries = await Promise.all(paths.map(async scene => [scene.index, await window.storybound.pathToDataUrl(scene.image_path!)] as const));
+      setImageUrls(Object.fromEntries(entries));
+    } catch {}
+  };
 
   const run = async (label: string, action: () => Promise<unknown>) => {
     setBusy(label);
-    setMessage("");
+    setMessage(label.includes("合成")
+      ? `${label}已开始，请不要重复点击。正在本地处理现有图片、配音和文字图层…`
+      : `${label}已开始，请不要重复点击。正在等待处理结果…`);
     try {
-      await action();
+      const result = await action();
+      await applyReturnedTask(result);
       await onRefresh();
-      setMessage(`${label}完成`);
+      setMessage(label.includes("合成") ? `${label}完成，请点击“播放视频”查看新成品` : `${label}完成，任务信息已刷新`);
     } catch (error) {
       setMessage(error instanceof Error ? error.message : String(error));
     } finally {
@@ -281,7 +314,10 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
       <div className="stage-strip">{stages.map((stage, index) => <div className={task.current_step >= index + 1 ? "done" : task.status === "review" && index === 3 ? "next" : ""} key={stage}>
         <span>{task.current_step > index ? <CheckCircle2 size={13} /> : index + 1}</span><small>{stage}</small>
       </div>)}</div>
-      {message && <div className="workbench-message">{message}</div>}
+      {(busy || message) && <div className={`workbench-message${busy ? " running" : ""}`}>
+        {busy && <LoaderCircle size={15} className="spin" />}
+        <span>{message || `${busy}处理中…`}</span>
+      </div>}
       <div className="workflow-actions">
         {!pipeline && <button className="primary" disabled={Boolean(busy)} onClick={() => run("生成脚本", () => window.storybound.prepareTask(task.id))}><Sparkles size={16} />生成脚本与分镜</button>}
         {pipeline && <button disabled={Boolean(busy)} onClick={save}><Save size={16} />保存修改</button>}
@@ -289,15 +325,13 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
           await save();
           await run("生成全部素材与视频", () => window.storybound.continueTask(task.id));
         }}><Play size={16} />{task.status === "interrupted" ? "从断点继续" : "确认并补齐素材生成视频"}</button>}
-        {hasAssets && <button className="primary" disabled={Boolean(busy)} onClick={async () => {
-          await save();
-          await run("重新合成视频", () => window.storybound.renderTask(task.id));
-        }}><RefreshCw size={16} />使用现有素材重新合成</button>}
+        {hasAssets && <button className="primary" disabled={Boolean(busy)} onClick={() => setShowRenderOptions(true)}><RefreshCw size={16} />使用现有素材重新合成</button>}
       </div>
       <div className="artifact-actions">
         {task.video_path && <button className="primary" onClick={() => window.storybound.openPath(task.video_path!)}><Video size={16} />播放视频</button>}
         {task.output_dir && <button onClick={() => window.storybound.openPath(task.output_dir!)}><FolderOpen size={16} />打开产物目录</button>}
         {task.output_dir && pipeline && <button onClick={() => window.storybound.openPath(`${task.output_dir}/llm-debug`)}><FileText size={16} />查看模型请求日志</button>}
+        {task.output_dir && pipeline && <button onClick={() => window.storybound.openPath(`${task.output_dir}/image-debug`)}><Image size={16} />查看图片任务日志</button>}
         {task.draft_dir && <button onClick={() => window.storybound.openPath(task.draft_dir!)}><ExternalLink size={16} />打开剪映草稿</button>}
         {task.cover_path && <button onClick={() => window.storybound.openPath(task.cover_path!)}><Image size={16} />查看封面海报</button>}
       </div>
@@ -311,6 +345,33 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
         </div>
         {pipeline.metadata.visual_continuity?.length ? <p><b>一致性规则：</b>{pipeline.metadata.visual_continuity.join("；")}</p> : null}
       </div>}
+      {showRenderOptions && <EditorModal title="使用现有素材重新合成" saveLabel="开始重新合成" onClose={() => setShowRenderOptions(false)} onSave={async () => {
+        setShowRenderOptions(false);
+        if (pipeline) await window.storybound.updatePipeline(task.id, pipeline);
+        await run("重新合成视频", () => window.storybound.renderTask(task.id, renderOptions));
+      }}>
+        <div className="rerender-note">不会重新调用文案、图片或配音接口。程序会删除旧渲染缓存，使用现有素材生成 <b>final-rerender.mp4</b>，原来的 final.mp4 会保留。</div>
+        <label>全部图片动画
+          <select value={renderOptions.animation} onChange={event => setRenderOptions(current => ({ ...current, animation: event.target.value }))}>
+            {["交替拉镜", ...IMAGE_ANIMATION_OPTIONS].map(item => <option key={item} value={item}>{item}</option>)}
+          </select>
+        </label>
+        <label>运镜强度：{renderOptions.motionStrength.toFixed(2)}
+          <input type="range" min="0.25" max="2" step="0.05" value={renderOptions.motionStrength} onChange={event => setRenderOptions(current => ({ ...current, motionStrength: Number(event.target.value) }))} />
+        </label>
+        <div className="rerender-checks">
+          <label><input type="checkbox" checked={renderOptions.forceStaticImages} onChange={event => setRenderOptions(current => ({ ...current, forceStaticImages: event.target.checked }))} />全部使用现有静态图片，不使用图生视频片段</label>
+          <label><input type="checkbox" checked={renderOptions.burnCaption} onChange={event => setRenderOptions(current => ({ ...current, burnCaption: event.target.checked }))} />烧录逐句旁白字幕</label>
+          <label><input type="checkbox" checked={renderOptions.burnTitle} onChange={event => setRenderOptions(current => ({ ...current, burnTitle: event.target.checked }))} />烧录片头主标题</label>
+          <label><input type="checkbox" checked={renderOptions.burnSubtitle} onChange={event => setRenderOptions(current => ({ ...current, burnSubtitle: event.target.checked }))} />烧录片头副标题</label>
+          <label><input type="checkbox" checked={renderOptions.burnDisclaimer} onChange={event => setRenderOptions(current => ({ ...current, burnDisclaimer: event.target.checked }))} />烧录安全提示/免责声明</label>
+          <label><input type="checkbox" checked={renderOptions.autoTextLayout} onChange={event => setRenderOptions(current => ({ ...current, autoTextLayout: event.target.checked }))} />自动避让文字，防止标题与字幕重叠</label>
+        </div>
+        <label>片头标题显示时长：{renderOptions.titleDuration.toFixed(1)} 秒
+          <input type="range" min="0" max="8" step="0.2" value={renderOptions.titleDuration} onChange={event => setRenderOptions(current => ({ ...current, titleDuration: Number(event.target.value) }))} />
+        </label>
+        <div className="prompt-safety-note">主标题和副标题只在片头显示；旁白字幕会按标点拆成每次最多两行。左拉镜与右拉镜使用 60fps 小幅平移和轻量帧混合；如仍希望画面完全稳定，可直接选择“无动画”。</div>
+      </EditorModal>}
       {pipeline?.scenes?.length ? <div className="scene-list">
         <h3>分镜工作台 · {pipeline.scenes.length} 镜</h3>
         {pipeline.scenes.map(scene => <div className="scene-editor" key={scene.index}>
@@ -318,7 +379,10 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
             <strong>镜头 {String(scene.index).padStart(2, "0")}</strong>
             <span>{scene.duration?.toFixed(1) || "—"}s</span>
             <div>
-              <button disabled={Boolean(busy)} onClick={() => run(`重做镜头 ${scene.index} 画面`, () => window.storybound.regenerateScene(task.id, scene.index, "image"))}><RefreshCw size={13} />重做画面</button>
+              <button disabled={Boolean(busy)} onClick={() => run(`重做镜头 ${scene.index} 画面`, () => window.storybound.regenerateScene(task.id, scene.index, "image"))}>
+                {busy === `重做镜头 ${scene.index} 画面` ? <LoaderCircle size={13} className="spin" /> : <RefreshCw size={13} />}
+                {busy === `重做镜头 ${scene.index} 画面` ? "生成中…" : "重做画面"}
+              </button>
               <button disabled={Boolean(busy)} onClick={() => run(`替换镜头 ${scene.index} 画面`, () => window.storybound.replaceSceneImage(task.id, scene.index))}><Upload size={13} />上传替换</button>
               <button disabled={Boolean(busy)} onClick={() => run(`重做镜头 ${scene.index} 配音`, () => window.storybound.regenerateScene(task.id, scene.index, "audio"))}><Volume2 size={13} />重做配音</button>
             </div>
@@ -326,8 +390,9 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
           {imageUrls[scene.index] && <div className="scene-preview"><img src={imageUrls[scene.index]} alt={`镜头 ${scene.index}`} /></div>}
           <label>旁白<textarea value={scene.narration} onChange={e => updateScene(scene.index, { narration: e.target.value })} /></label>
           <label>画面描述<textarea value={scene.visual} onChange={e => updateScene(scene.index, { visual: e.target.value })} /></label>
-          {scene.desc_prompt && <label>分镜基础提示词（desc_prompt）<textarea value={scene.desc_prompt} readOnly /></label>}
+          {scene.desc_prompt && <label>{scene.image_prompt_safety_adjusted ? "分镜基础提示词（已自动改为克制画面）" : "分镜基础提示词（desc_prompt）"}<textarea value={scene.desc_prompt} readOnly /></label>}
           <label>最终图片提示词<textarea value={scene.image_prompt} onChange={e => updateScene(scene.index, { image_prompt: e.target.value })} /></label>
+          {scene.image_prompt_safety_adjusted && <div className="prompt-safety-note">已在调用图片接口前自动替换高风险画面。旁白内容保持不变，图片只表现包扎后的状态、人物神情与环境，不再发送直接的受伤细节。</div>}
           <div className="scene-reference-control">
             <label><input type="checkbox" checked={Boolean(scene.use_reference)} onChange={e => updateScene(scene.index, { use_reference: e.target.checked })} />本镜使用主角/产品参考图</label>
             <span>{scene.reference_reason || "大模型未提供判断说明"}</span>
@@ -830,11 +895,13 @@ function ImageSettings({ draft, setDraft }: { draft: AppConfig; setDraft: (next:
           <label>图片质量<select value={draft.custom_image.quality} onChange={e => updateCustom({ quality: e.target.value })}><option value="high">high</option><option value="medium">medium</option><option value="low">low</option><option value="auto">auto</option></select></label>
           <label>文生图返回格式<select value={draft.custom_image.response_format} onChange={e => updateCustom({ response_format: e.target.value })}><option value="auto">不传（按接口默认）</option><option value="b64_json">b64_json</option><option value="url">url</option></select></label>
           <label>参考图返回格式<select value={draft.custom_image.edit_response_format} onChange={e => updateCustom({ edit_response_format: e.target.value })}><option value="b64_json">b64_json（文档示例）</option><option value="url">url</option><option value="auto">不传此字段</option></select></label>
+          <label>审核灵敏度<select value={draft.custom_image.moderation || "none"} onChange={e => updateCustom({ moderation: e.target.value })}><option value="none">不传（兼容中转站）</option><option value="auto">auto（标准）</option><option value="low">low（较宽松）</option></select><small>仅支持该参数的 GPT Image 兼容接口有效。</small></label>
           <label className="full">代理地址（可选）<input value={draft.custom_image.proxy_url} onChange={e => updateCustom({ proxy_url: e.target.value })} placeholder="http://127.0.0.1:7890" /></label>
         </div>
         <button className="text-action" onClick={() => setShowAdvanced(value => !value)}>{showAdvanced ? "收起高级设置" : "展开高级设置"}</button>
         {showAdvanced && <div className="form-grid advanced-image-fields">
           <label className="check-label"><input type="checkbox" checked={draft.custom_image.async_mode} onChange={e => updateCustom({ async_mode: e.target.checked })} />异步任务模式</label>
+          <label className="check-label"><input type="checkbox" checked={draft.custom_image.policy_fallback !== false} onChange={e => updateCustom({ policy_fallback: e.target.checked })} />审核拒绝后自动改写为克制画面并重试</label>
           {draft.custom_image.async_mode && <>
             <label className="full">状态查询路径<input value={draft.custom_image.status_path} onChange={e => updateCustom({ status_path: e.target.value })} placeholder="/tasks/{task_id}" /></label>
             <label>任务 ID 字段<input value={draft.custom_image.task_id_field} onChange={e => updateCustom({ task_id_field: e.target.value })} /></label>
@@ -1299,11 +1366,11 @@ function PromptTemplates() {
   </section>;
 }
 
-function EditorModal({ title, children, onClose, onSave }: { title: string; children: React.ReactNode; onClose: () => void; onSave: () => void }) {
+function EditorModal({ title, children, onClose, onSave, saveLabel = "保存" }: { title: string; children: React.ReactNode; onClose: () => void; onSave: () => void; saveLabel?: string }) {
   return <div className="modal-backdrop" onClick={onClose}><div className="editor-modal" onClick={e => e.stopPropagation()}>
     <button className="modal-close" onClick={onClose}><X size={18} /></button><h2>{title}</h2>
     <div className="editor-form">{children}</div>
-    <button className="primary wide" onClick={onSave}>保存</button>
+    <button className="primary wide" onClick={onSave}>{saveLabel}</button>
   </div></div>;
 }
 
@@ -1341,7 +1408,7 @@ const createDraftLayer = (overrides: Record<string, unknown> = {}) => ({
 function createDraftTemplateConfig() {
   return {
     canvas: { width: 1080, height: 1920, ratio: "9:16", backgroundColor: "#000000", backgroundImage: "" },
-    image: { ratio: "9:16", fit: "cover", top: 0, height: 1, animation: "缩放", motionStrength: 1 },
+    image: { ratio: "9:16", fit: "cover", top: 0, height: 1, animation: "左拉镜", motionStrength: 0.5 },
     title: createDraftLayer({ y: .0473958333, fontSize: 25, color: "#FFDE00", bold: true, underline: true, border: { color: "#000000", width: 40, alpha: 1 } }),
     subtitle: createDraftLayer({ y: -.2166666667, fontSize: 12, letterSpacing: 2, lineSpacing: 4, border: { color: "#000000", width: 40, alpha: 1 } }),
     caption: { ...createDraftLayer({ y: -.2151041667, fontSize: 12, color: "#FFDE00" }), maxCharsPerLine: 12, background: { color: "#000000", alpha: .5, roundRadius: .3 } },

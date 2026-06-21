@@ -1,0 +1,214 @@
+const GRAPHIC_PATTERNS = [
+  /鲜血四溅|血流成河|血肉模糊|血淋淋|大量出血|喷血|流血不止|鲜血|血液|血迹|染血|暗红色[^，。；]{0,16}(?:渗出|滴落|流淌)/i,
+  /开放性伤口|伤口特写|创口特写|伤口清晰可见|创口清晰可见|新鲜割口|割口清晰可见|器官外露|内脏|断肢|残肢|肢解|爆头|尸体特写|遗体特写|尸骸/i,
+  /切开皮肤|剖开身体|解剖过程|缝合伤口|取出子弹|清创过程|伤口进行缝合|患处进行缝合/i,
+  /痛苦特写|濒死|挣扎特写|面目狰狞/i
+];
+
+const PROCEDURE_PATTERN = /正在做手术|实施手术|外科手术现场|手术过程|手术操作|缝合操作|清创|解剖|急救过程|处理伤口|处理创口/i;
+const VIOLENCE_PATTERN = /处决|虐杀|残杀|刺杀|枪杀|砍杀|爆头|肢解|枪击过程|刀刺过程|爆炸冲击|战斗特写/i;
+const CLOSEUP_PATTERN = /极近景|微距特写|超近景|伤口特写|创口特写|细节清晰|清晰可见/i;
+const REAL_PERSON_HARM_PATTERN = /(?:白求恩|诺尔曼·白求恩|名人|真实人物|本人)[^，。；]{0,30}(?:受伤|流血|伤口|割口|死亡|尸体|手术)/i;
+
+function normalizePromptText(prompt) {
+  return String(prompt || "")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, " ")
+    .replace(/\s+/g, " ")
+    .replace(/[，,]{2,}/g, "，")
+    .replace(/[。]{2,}/g, "。")
+    .trim();
+}
+
+function analyzeImagePromptRisk(prompt) {
+  const text = normalizePromptText(prompt);
+  const reasons = [];
+  let score = 0;
+  for (const pattern of GRAPHIC_PATTERNS) {
+    if (pattern.test(text)) {
+      score += 4;
+      reasons.push("graphic-detail");
+      break;
+    }
+  }
+  if (PROCEDURE_PATTERN.test(text)) {
+    score += 2;
+    reasons.push("medical-procedure");
+  }
+  if (VIOLENCE_PATTERN.test(text)) {
+    score += 4;
+    reasons.push("explicit-violence");
+  }
+  if (CLOSEUP_PATTERN.test(text) && score > 0) {
+    score += 2;
+    reasons.push("risky-closeup");
+  }
+  if (REAL_PERSON_HARM_PATTERN.test(text)) {
+    score += 3;
+    reasons.push("real-person-harm");
+  }
+  const category = /手术|医生|医疗|伤员|患者|感染|纱布|缝合|割口|伤口|创口/i.test(text)
+    ? "medical"
+    : /战争|战斗|枪|刀|爆炸|处决|虐杀|残杀|刺杀|枪杀/i.test(text)
+      ? "violence"
+      : /死亡|逝世|遗体|葬礼|墓地|追悼/i.test(text)
+        ? "loss"
+        : "general";
+  return { risky: score >= 2, score, reasons: [...new Set(reasons)], category, text };
+}
+
+function extractFirst(text, patterns, fallback = "") {
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match?.[0]) return match[0].trim();
+  }
+  return fallback;
+}
+
+function extractContext(text) {
+  const era = extractFirst(text, [/(?:18|19|20)\d{2}年(?:\d{1,2}月)?/, /(?:民国|抗战|二战|古代|近代)[^，。；]{0,12}/]);
+  const location = extractFirst(text, [/(?:中国)?华北前线/, /(?:中国)?(?:东北|华北|华东|华中|西北|西南|华南)[^，。；]{0,10}/, /[^，。；]{0,12}(?:医院|医疗站|诊所|营地|战地)/]);
+  const style = extractFirst(text, [/(?:黑白|彩色)?(?:历史)?纪实摄影/, /真实胶片颗粒/, /电影感/, /油画风格/, /插画风格/, /纪录片风格/], "历史纪实摄影");
+  const ratio = extractFirst(text, [/(?:9:16|16:9|1:1|4:3|3:4|2:3|3:2)(?:竖构图|横构图|构图)?/], "9:16竖构图");
+  const light = extractFirst(text, [/煤油灯[^，。；]{0,28}/, /自然光[^，。；]{0,20}/, /侧光[^，。；]{0,20}/, /柔和光线[^，。；]{0,20}/], "柔和侧光");
+  return { era, location, style, ratio, light };
+}
+
+function joinPrompt(parts) {
+  return parts
+    .map(item => normalizePromptText(item))
+    .filter(Boolean)
+    .join("，")
+    .replace(/[，,]{2,}/g, "，")
+    .replace(/^，|，$/g, "")
+    .trim();
+}
+
+function medicalSafePrompt(text, level) {
+  const context = extractContext(text);
+  const scene = level === "ultra"
+    ? "一位医生的演员化历史形象站在简朴医疗站内，医护人员安静整理医疗器械，人物神情专注而疲惫"
+    : level === "minimal"
+      ? "一位医生的演员化历史形象站在简朴医疗站内，低头查看已经妥善包扎好的左手食指，身后医护人员安静整理医疗器械，人物神情专注而疲惫"
+      : "一位外国医生的演员化历史形象站在简朴医疗站内，低头查看已经用干净纱布妥善包扎好的左手食指，身后医护人员整理医疗器械，患者区域由布帘和景深自然遮挡，人物神情专注而疲惫";
+  return joinPrompt([
+    context.era,
+    context.location,
+    context.style,
+    scene,
+    context.light,
+    "中近景叙事镜头",
+    "真实胶片颗粒",
+    "情绪克制",
+    "适合大众观看",
+    context.ratio,
+    "主体明确，构图完整，无文字无水印"
+  ]);
+}
+
+function violenceSafePrompt(text, level) {
+  const context = extractContext(text);
+  const scene = level === "ultra"
+    ? "安静的历史环境，远处人物有序行走，镜头聚焦建筑、道路与时代氛围"
+    : level === "minimal"
+      ? "几名人物的演员化历史形象在远处穿行，镜头聚焦环境、神情与时代氛围"
+      : "历史事件发生后的安静环境，人物采用演员化演绎，远处人群有序行动，镜头聚焦环境、神情、尘土与光影";
+  return joinPrompt([
+    context.era,
+    context.location,
+    context.style,
+    scene,
+    context.light,
+    "中远景叙事镜头",
+    "情绪克制",
+    "适合大众观看",
+    context.ratio,
+    "主体明确，构图完整，无文字无水印"
+  ]);
+}
+
+function lossSafePrompt(text) {
+  const context = extractContext(text);
+  return joinPrompt([
+    context.era,
+    context.location,
+    context.style,
+    "安静的纪念场景，空椅、旧照片、桌面物件与窗边光线传达人物离去后的情绪",
+    context.light,
+    "中景叙事镜头",
+    "情绪克制",
+    "适合大众观看",
+    context.ratio,
+    "主体明确，构图完整，无文字无水印"
+  ]);
+}
+
+function genericSafePrompt(text) {
+  const context = extractContext(text);
+  return joinPrompt([
+    context.era,
+    context.location,
+    context.style,
+    "人物采用演员化历史形象，镜头聚焦人物神情、环境与具有叙事作用的物件",
+    context.light,
+    "中景叙事镜头",
+    "情绪克制",
+    "适合大众观看",
+    context.ratio,
+    "主体明确，构图完整，无文字无水印"
+  ]);
+}
+
+function scrubResidualRisk(prompt) {
+  let text = normalizePromptText(prompt);
+  const replacements = [
+    [/简陋手术室|手术室/gi, "简朴医疗站"],
+    [/极近景特写|极近景|微距特写|超近景|伤口特写|创口特写/gi, "中近景叙事镜头"],
+    [/白求恩|诺尔曼·白求恩/gi, "一位外国医生的演员化历史形象"],
+    [/左手食指[^，。；]*(?:割口|伤口|创口|流血|渗出|滴落)[^，。；]*/gi, "左手食指已经用干净纱布妥善包扎，人物低头查看手指"],
+    [/(?:暗红色|鲜红色)?(?:血液|鲜血|血迹)[^，。；]*(?:滴落|渗出|流淌)?/gi, "画面情绪保持克制"],
+    [/(?:正在|为|对)[^，。；]{0,36}(?:伤员|患者)[^，。；]{0,18}(?:伤口|创口|患处)[^，。；]{0,18}(?:缝合|清创|处理)[^，。；]*/gi, "在医疗台旁专注救治，患者区域由医护人员和布帘自然遮挡"],
+    [/伤口进行缝合操作|创口进行缝合操作|缝合伤口|清创过程|切开皮肤|剖开身体|解剖过程|取出子弹/gi, "专注救治"],
+    [/染血纱布|沾血纱布/gi, "干净纱布"],
+    [/金属手术钳|缝合针|解剖刀|手术刀/gi, "金属医疗器械"],
+    [/开放性伤口|伤口清晰可见|创口清晰可见|新鲜割口|割口清晰可见|器官外露|内脏|断肢|残肢|肢解|爆头|尸体特写|遗体特写|尸骸/gi, ""],
+    [/鲜血四溅|血流成河|血肉模糊|血淋淋|大量出血|喷血|流血不止|鲜血|血液|血迹|染血/gi, ""],
+    [/正在做手术|实施手术|外科手术现场|手术过程|手术操作|缝合操作|处理伤口|处理创口/gi, "在简朴医疗站专注工作"],
+    [/处决|虐杀|残杀|刺杀|枪杀|砍杀|爆头|肢解/gi, "紧张的历史事件"]
+  ];
+  for (const [pattern, replacement] of replacements) text = text.replace(pattern, replacement);
+  return joinPrompt(text.split(/[，。；;\n]+/).filter(Boolean));
+}
+
+function buildPolicySafeImagePrompt(prompt, level = "safe") {
+  const analysis = analyzeImagePromptRisk(prompt);
+  if (!analysis.risky && level === "preflight") {
+    return { prompt: analysis.text, adjusted: false, reasons: [], category: analysis.category, level };
+  }
+  let safePrompt;
+  if (analysis.category === "medical") safePrompt = medicalSafePrompt(analysis.text, level);
+  else if (analysis.category === "violence") safePrompt = violenceSafePrompt(analysis.text, level);
+  else if (analysis.category === "loss") safePrompt = lossSafePrompt(analysis.text);
+  else safePrompt = genericSafePrompt(analysis.text);
+
+  safePrompt = scrubResidualRisk(safePrompt);
+  const remaining = analyzeImagePromptRisk(safePrompt);
+  if (remaining.risky) {
+    safePrompt = analysis.category === "medical"
+      ? medicalSafePrompt("历史纪实摄影，9:16竖构图", "minimal")
+      : genericSafePrompt("历史纪实摄影，9:16竖构图");
+  }
+  return {
+    prompt: safePrompt,
+    adjusted: safePrompt !== analysis.text,
+    reasons: analysis.reasons,
+    category: analysis.category,
+    level
+  };
+}
+
+module.exports = {
+  normalizePromptText,
+  analyzeImagePromptRisk,
+  buildPolicySafeImagePrompt,
+  scrubResidualRisk
+};

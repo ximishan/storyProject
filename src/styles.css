@@ -919,3 +919,31 @@ select, .form-grid input, .create-options input { height:39px; padding:0 11px; c
 .tts-field>input[type="range"] { padding:0; accent-color:#18aa7b; }
 .tts-preview-audio { margin-top:14px; padding:12px; border:1px solid #2d333e; border-radius:9px; background:#0b0d12; }
 .tts-preview-audio audio { width:100%; }
+
+.prompt-safety-note { margin-top:-4px; padding:9px 11px; border:1px solid #315946; border-radius:8px; background:#10251d; color:#77d7b2; font-size:11px; line-height:1.55; }
+.workbench-message.running { display:flex; align-items:center; gap:8px; border-color:#3b4f72; background:#111b2b; color:#b8d2ff; }
+
+.rerender-note {
+  padding: 12px 14px;
+  border: 1px solid rgba(255,255,255,.1);
+  border-radius: 10px;
+  background: rgba(255,255,255,.04);
+  line-height: 1.65;
+  color: var(--muted, #aeb6c2);
+}
+.rerender-checks {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid rgba(255,255,255,.08);
+  border-radius: 10px;
+}
+.rerender-checks label {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.rerender-checks input[type="checkbox"] {
+  width: auto;
+  margin: 0;
+}

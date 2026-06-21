@@ -5,6 +5,7 @@ const os = require("node:os");
 const { spawn } = require("node:child_process");
 const { ProxyAgent } = require("undici");
 const { testModelConnection } = require("./llm-planner.cjs");
+const { analyzeImagePromptRisk, buildPolicySafeImagePrompt } = require("./image-prompt-safety.cjs");
 
 function spawnAsync(command, args, options = {}) {
   return new Promise((resolve, reject) => {
@@ -26,6 +27,23 @@ function fetchWithProxy(url, options = {}, proxyUrl = "") {
     ...options,
     ...(proxyUrl ? { dispatcher: new ProxyAgent(proxyUrl) } : {})
   });
+}
+
+async function fetchWithTimeout(url, options = {}, proxyUrl = "", timeoutMs = 20000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(3000, Number(timeoutMs || 20000)));
+  try {
+    return await fetchWithProxy(url, { ...options, signal: controller.signal }, proxyUrl);
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      const timeoutError = new Error(`请求超过 ${Math.round(Math.max(3000, Number(timeoutMs || 20000)) / 1000)} 秒未响应`);
+      timeoutError.code = "REQUEST_TIMEOUT";
+      throw timeoutError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function resolveResource(app, ...parts) {
@@ -61,18 +79,620 @@ function mappedImageSize(section, ratio) {
   }
 }
 
-async function saveImageResponse(item, destination, proxyUrl = "") {
-  if (typeof item === "string" && /^data:image\//.test(item)) {
-    fs.writeFileSync(destination, Buffer.from(item.split(",")[1], "base64"));
-  } else if (typeof item === "string" && /^https?:\/\//.test(item)) {
-    await downloadFile(item, destination, {}, proxyUrl);
-  } else if (item?.b64_json || item?.base64) {
-    fs.writeFileSync(destination, Buffer.from(item.b64_json || item.base64, "base64"));
-  } else if (item?.url || item?.fileUrl) {
-    await downloadFile(item.url || item.fileUrl, destination, {}, proxyUrl);
-  } else {
-    throw new Error("图片接口未返回可识别的图片地址或 Base64 数据");
+function isImageBuffer(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 8) return false;
+  return (
+    buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+    || buffer.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))
+    || buffer.subarray(0, 6).toString("ascii") === "GIF87a"
+    || buffer.subarray(0, 6).toString("ascii") === "GIF89a"
+    || (buffer.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "WEBP")
+    || buffer.subarray(0, 2).toString("ascii") === "BM"
+    || buffer.subarray(0, 4).toString("hex") === "00000100"
+    || buffer.subarray(4, 12).toString("ascii").startsWith("ftypavif")
+    || buffer.subarray(4, 12).toString("ascii").startsWith("ftypheic")
+  );
+}
+
+function decodeImageBase64(value) {
+  const source = String(value || "").trim().replace(/^data:image\/[^;]+;base64,/i, "").replace(/\s+/g, "");
+  if (source.length < 32 || !/^[A-Za-z0-9+/_=-]+$/.test(source)) return null;
+  try {
+    const normalized = source.replace(/-/g, "+").replace(/_/g, "/");
+    const buffer = Buffer.from(normalized, "base64");
+    return isImageBuffer(buffer) ? buffer : null;
+  } catch {
+    return null;
   }
+}
+
+function normalizeImageUrl(value, baseUrl = "") {
+  let text = String(value || "").trim()
+    .replace(/&amp;/gi, "&")
+    .replace(/\\u0026/gi, "&")
+    .replace(/\\\//g, "/");
+  const markdown = text.match(/!\[[^\]]*\]\((https?:\/\/[^)\s]+)\)/i);
+  if (markdown) text = markdown[1];
+  const embedded = text.match(/https?:\/\/[^\s"'<>]+/i);
+  if (embedded && !/^https?:\/\//i.test(text)) text = embedded[0];
+  if (/^\/\//.test(text)) return `https:${text}`;
+  if (/^https?:\/\//i.test(text)) return text;
+  if (/^\//.test(text) && baseUrl) {
+    try { return new URL(text, baseUrl).toString(); } catch {}
+  }
+  return "";
+}
+
+function isPollingSourcePath(sourcePath = "") {
+  return /(?:^|\.)(?:poll(?:ing)?_?url|status_?url|task_?url|query_?url|result_?url|check_?url)$/i.test(String(sourcePath));
+}
+
+function isLikelyPollingUrl(value = "", sourcePath = "") {
+  if (isPollingSourcePath(sourcePath)) return true;
+  try {
+    const parsed = new URL(String(value));
+    return /\/(?:api\/)?(?:image-?tasks?|tasks?\/(?:status|result)|operations?)(?:\/|$)/i.test(parsed.pathname)
+      && /(?:^|[?&])(?:ids?|task_ids?|operation_ids?)=/i.test(parsed.search);
+  } catch {
+    return false;
+  }
+}
+
+function imageCandidateFromValue(value, baseUrl = "", sourcePath = "response") {
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (/^data:image\//i.test(text)) {
+      const buffer = decodeImageBase64(text);
+      if (buffer) return { kind: "buffer", buffer, sourcePath };
+    }
+    const url = normalizeImageUrl(text, baseUrl);
+    if (url && !isLikelyPollingUrl(url, sourcePath)) return { kind: "url", url, sourcePath };
+    const buffer = decodeImageBase64(text);
+    if (buffer) return { kind: "buffer", buffer, sourcePath };
+    return null;
+  }
+  if (Buffer.isBuffer(value) && isImageBuffer(value)) return { kind: "buffer", buffer: value, sourcePath };
+  return null;
+}
+
+const IMAGE_VALUE_KEYS = [
+  "b64_json", "b64", "base64", "image_base64", "imageBase64", "image_data", "imageData",
+  "url", "fileUrl", "file_url", "image_url", "imageUrl", "output_url", "outputUrl",
+  "download_url", "downloadUrl", "src", "image"
+];
+
+const IMAGE_CONTAINER_KEYS = [
+  "data", "output", "outputs", "images", "image", "result", "results", "response", "content",
+  "artifacts", "files", "generations", "choices"
+];
+
+function findImageCandidate(payload, configuredField = "", baseUrl = "") {
+  const visited = new Set();
+  const candidates = [];
+  if (configuredField) candidates.push([getByPath(payload, configuredField), configuredField]);
+  const knownPaths = [
+    "data.0", "data.images.0", "data.output.0", "output.images.0", "output.0", "outputs.0",
+    "images.0", "result.data.0", "result.images.0", "result.0", "results.0",
+    "response.data.0", "response.images.0", "artifacts.0", "files.0",
+    "choices.0.message.content", "choices.0.message.image_url", "choices.0.message.images.0"
+  ];
+  for (const fieldPath of knownPaths) candidates.push([getByPath(payload, fieldPath), fieldPath]);
+
+  for (const [value, sourcePath] of candidates) {
+    const direct = imageCandidateFromValue(value, baseUrl, sourcePath);
+    if (direct) return direct;
+    if (value && typeof value === "object") {
+      for (const key of IMAGE_VALUE_KEYS) {
+        const nested = imageCandidateFromValue(value[key], baseUrl, `${sourcePath}.${key}`);
+        if (nested) return nested;
+      }
+    }
+  }
+
+  const walk = (value, sourcePath, depth) => {
+    if (depth > 8 || value === null || value === undefined) return null;
+    const direct = imageCandidateFromValue(value, baseUrl, sourcePath);
+    if (direct) return direct;
+    if (typeof value !== "object") return null;
+    if (visited.has(value)) return null;
+    visited.add(value);
+    if (Array.isArray(value)) {
+      for (let index = 0; index < value.length; index += 1) {
+        const found = walk(value[index], `${sourcePath}.${index}`, depth + 1);
+        if (found) return found;
+      }
+      return null;
+    }
+    for (const key of IMAGE_VALUE_KEYS) {
+      if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+      const found = walk(value[key], `${sourcePath}.${key}`, depth + 1);
+      if (found) return found;
+    }
+    for (const key of IMAGE_CONTAINER_KEYS) {
+      if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+      const found = walk(value[key], `${sourcePath}.${key}`, depth + 1);
+      if (found) return found;
+    }
+    for (const [key, child] of Object.entries(value)) {
+      if (IMAGE_VALUE_KEYS.includes(key) || IMAGE_CONTAINER_KEYS.includes(key)) continue;
+      const found = walk(child, `${sourcePath}.${key}`, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  };
+  return walk(payload, "response", 0);
+}
+
+
+const IMAGE_POLL_URL_KEYS = [
+  "poll_url", "pollUrl", "polling_url", "pollingUrl", "status_url", "statusUrl",
+  "task_url", "taskUrl", "query_url", "queryUrl", "result_url", "resultUrl",
+  "check_url", "checkUrl"
+];
+
+function findImagePollCandidate(payload, baseUrl = "") {
+  const visited = new Set();
+  const knownPaths = [
+    "poll_url", "pollUrl", "status_url", "statusUrl", "task_url", "taskUrl",
+    "response.poll_url", "response.pollUrl", "response.status_url", "response.statusUrl",
+    "data.poll_url", "data.pollUrl", "data.status_url", "data.statusUrl",
+    "result.poll_url", "result.pollUrl", "result.status_url", "result.statusUrl"
+  ];
+  for (const fieldPath of knownPaths) {
+    const url = normalizeImageUrl(getByPath(payload, fieldPath), baseUrl);
+    if (url) return { url, sourcePath: fieldPath };
+  }
+  const walk = (value, sourcePath, depth) => {
+    if (depth > 8 || value === null || value === undefined || typeof value !== "object") return null;
+    if (visited.has(value)) return null;
+    visited.add(value);
+    if (Array.isArray(value)) {
+      for (let index = 0; index < value.length; index += 1) {
+        const found = walk(value[index], `${sourcePath}.${index}`, depth + 1);
+        if (found) return found;
+      }
+      return null;
+    }
+    for (const key of IMAGE_POLL_URL_KEYS) {
+      if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+      const url = normalizeImageUrl(value[key], baseUrl);
+      if (url) return { url, sourcePath: `${sourcePath}.${key}` };
+    }
+    for (const [key, child] of Object.entries(value)) {
+      const found = walk(child, `${sourcePath}.${key}`, depth + 1);
+      if (found) return found;
+    }
+    return null;
+  };
+  return walk(payload, "response", 0);
+}
+
+function imageTaskIdFromPayload(payload, pollUrl = "") {
+  const paths = [
+    "task_id", "taskId", "id", "response.task_id", "response.taskId", "response.id",
+    "data.task_id", "data.taskId", "data.id", "result.task_id", "result.taskId", "result.id"
+  ];
+  for (const fieldPath of paths) {
+    const value = getByPath(payload, fieldPath);
+    if (value !== undefined && value !== null && String(value).trim()) return String(value).trim();
+  }
+  try {
+    const parsed = new URL(pollUrl);
+    return parsed.searchParams.get("ids") || parsed.searchParams.get("id")
+      || parsed.searchParams.get("task_id") || parsed.searchParams.get("taskId") || "";
+  } catch {
+    return "";
+  }
+}
+
+function imageTaskStatus(payload) {
+  const paths = [
+    "status", "state", "task_status", "taskStatus", "response.status", "response.state",
+    "response.task_status", "response.taskStatus", "data.status", "data.state",
+    "data.task_status", "data.taskStatus", "result.status", "result.state",
+    "results.0.status", "results.0.state", "tasks.0.status", "tasks.0.state"
+  ];
+  for (const fieldPath of paths) {
+    const value = getByPath(payload, fieldPath);
+    if (value !== undefined && value !== null && String(value).trim()) return String(value).trim().toLowerCase();
+  }
+  return "";
+}
+
+function imageTaskMessage(payload) {
+  const paths = [
+    "error.message", "error", "message", "msg", "detail", "response.error.message",
+    "response.message", "data.error.message", "data.message", "result.error.message", "result.message"
+  ];
+  for (const fieldPath of paths) {
+    const value = getByPath(payload, fieldPath);
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return "";
+}
+
+function redactImagePayloadForDebug(value, depth = 0) {
+  if (depth > 10) return "[max-depth]";
+  if (Array.isArray(value)) return value.slice(0, 20).map(item => redactImagePayloadForDebug(item, depth + 1));
+  if (value && typeof value === "object") {
+    const output = {};
+    for (const [key, child] of Object.entries(value)) {
+      if (/api[_-]?key|authorization|token/i.test(key)) output[key] = "[redacted]";
+      else output[key] = redactImagePayloadForDebug(child, depth + 1);
+    }
+    return output;
+  }
+  if (typeof value === "string") {
+    if (/^data:image\//i.test(value) || decodeImageBase64(value)) return `[image-base64 length=${value.length}]`;
+    const redacted = value.replace(/([?&](?:token|access_token|signature|sig|key|api_key|x-amz-signature|x-goog-signature)=)[^&\s]+/gi, "$1[redacted]");
+    return redacted.length > 4000 ? `${redacted.slice(0, 4000)}...[truncated ${redacted.length - 4000} chars]` : redacted;
+  }
+  return value;
+}
+
+function imageResponseDebugPath(destination) {
+  const imageDir = path.dirname(destination);
+  const outputDir = path.basename(imageDir).toLowerCase() === "images" ? path.dirname(imageDir) : imageDir;
+  const debugDir = path.join(outputDir, "image-debug");
+  fs.mkdirSync(debugDir, { recursive: true });
+  return path.join(debugDir, `${path.basename(destination, path.extname(destination))}-response.json`);
+}
+
+function writeImageResponseDebug(destination, data) {
+  const debugPath = imageResponseDebugPath(destination);
+  try {
+    fs.writeFileSync(debugPath, JSON.stringify({
+      created_at: new Date().toISOString(),
+      ...redactImagePayloadForDebug(data)
+    }, null, 2), "utf8");
+  } catch {}
+  return debugPath;
+}
+
+function imageDownloadDebugPath(destination) {
+  const imageDir = path.dirname(destination);
+  const outputDir = path.basename(imageDir).toLowerCase() === "images" ? path.dirname(imageDir) : imageDir;
+  const debugDir = path.join(outputDir, "image-debug");
+  fs.mkdirSync(debugDir, { recursive: true });
+  return path.join(debugDir, `${path.basename(destination, path.extname(destination))}-download.json`);
+}
+
+function writeImageDownloadDebug(destination, data) {
+  const debugPath = imageDownloadDebugPath(destination);
+  try {
+    fs.writeFileSync(debugPath, JSON.stringify({
+      created_at: new Date().toISOString(),
+      ...redactImagePayloadForDebug(data)
+    }, null, 2), "utf8");
+  } catch {}
+  return debugPath;
+}
+
+function imagePollDebugPath(destination) {
+  const imageDir = path.dirname(destination);
+  const outputDir = path.basename(imageDir).toLowerCase() === "images" ? path.dirname(imageDir) : imageDir;
+  const debugDir = path.join(outputDir, "image-debug");
+  fs.mkdirSync(debugDir, { recursive: true });
+  return path.join(debugDir, `${path.basename(destination, path.extname(destination))}-poll.json`);
+}
+
+function writeImagePollDebug(destination, data) {
+  const debugPath = imagePollDebugPath(destination);
+  try {
+    fs.writeFileSync(debugPath, JSON.stringify({
+      created_at: new Date().toISOString(),
+      ...redactImagePayloadForDebug(data)
+    }, null, 2), "utf8");
+  } catch {}
+  return debugPath;
+}
+
+function urlOrigin(value) {
+  try { return new URL(value).origin; } catch { return ""; }
+}
+
+function imageDownloadHeaders(candidateUrl, baseUrl, apiKey = "") {
+  const headers = {
+    accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    "accept-language": "zh-CN,zh;q=0.9,en;q=0.7",
+    "cache-control": "no-cache",
+    pragma: "no-cache",
+    "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36"
+  };
+  const candidateOrigin = urlOrigin(candidateUrl);
+  const apiOrigin = urlOrigin(baseUrl);
+  // 只向同源下载地址附带 API Key，避免把密钥泄露给第三方 CDN。
+  if (apiKey && candidateOrigin && apiOrigin && candidateOrigin === apiOrigin) {
+    headers.authorization = `Bearer ${apiKey}`;
+    headers.referer = `${apiOrigin}/`;
+  }
+  return headers;
+}
+
+function retryDelayMs(response, attempt) {
+  const retryAfter = response?.headers?.get?.("retry-after");
+  if (retryAfter) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds)) return Math.max(0, Math.min(15000, seconds * 1000));
+    const date = Date.parse(retryAfter);
+    if (Number.isFinite(date)) return Math.max(0, Math.min(15000, date - Date.now()));
+  }
+  return Math.min(8000, 500 * (2 ** Math.max(0, attempt - 1)));
+}
+
+function isRetryableImageDownloadStatus(status) {
+  return [408, 409, 425, 429, 500, 502, 503, 504].includes(Number(status));
+}
+
+async function saveImageResponse(item, destination, proxyUrl = "", baseUrl = "", downloadContext = {}, depth = 0) {
+  const candidate = item?.kind ? item : findImageCandidate(item, "", baseUrl);
+  if (!candidate) throw new Error("图片接口未返回可识别的图片地址或 Base64 数据");
+  if (candidate.kind === "buffer") {
+    fs.writeFileSync(destination, candidate.buffer);
+    return { sourcePath: candidate.sourcePath, sourceUrl: "" };
+  }
+  if (candidate.kind === "url") {
+    const maxAttempts = Math.max(1, Number(downloadContext.maxAttempts || 6));
+    const attempts = [];
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      let response;
+      try {
+        response = await fetchWithProxy(candidate.url, {
+          headers: imageDownloadHeaders(candidate.url, baseUrl, downloadContext.apiKey || ""),
+          redirect: "follow"
+        }, proxyUrl);
+      } catch (error) {
+        lastError = error;
+        attempts.push({ attempt, network_error: String(error?.message || error) });
+        if (attempt < maxAttempts) {
+          await sleep(Math.min(8000, 500 * (2 ** Math.max(0, attempt - 1))));
+          continue;
+        }
+        break;
+      }
+
+      const contentType = response.headers.get("content-type") || "";
+      if (!response.ok) {
+        let body = "";
+        try { body = (await response.text()).slice(0, 1200); } catch {}
+        attempts.push({
+          attempt,
+          status: response.status,
+          status_text: response.statusText || "",
+          content_type: contentType,
+          response_body: body
+        });
+        lastError = new Error(`HTTP ${response.status}`);
+        if (attempt < maxAttempts && isRetryableImageDownloadStatus(response.status)) {
+          await sleep(retryDelayMs(response, attempt));
+          continue;
+        }
+        break;
+      }
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (isImageBuffer(buffer)) {
+        fs.writeFileSync(destination, buffer);
+        return { sourcePath: candidate.sourcePath, sourceUrl: candidate.url };
+      }
+
+      const text = buffer.toString("utf8").trim();
+      attempts.push({
+        attempt,
+        status: response.status,
+        content_type: contentType || "未知类型",
+        response_body: text.slice(0, 1200)
+      });
+      // 某些中转站的“图片地址”实际上仍返回一层 JSON，再从中提取真实地址或 Base64。
+      if (depth < 2 && text && (/json|text/i.test(contentType || "") || /^[\[{]/.test(text))) {
+        try {
+          const nestedPayload = JSON.parse(text);
+          const nestedCandidate = findImageCandidate(nestedPayload, "", candidate.url);
+          if (nestedCandidate) {
+            return saveImageResponse(nestedCandidate, destination, proxyUrl, candidate.url, downloadContext, depth + 1);
+          }
+        } catch {}
+      }
+      lastError = new Error(`返回内容不是有效图片（${contentType || "未知类型"}）`);
+      if (attempt < maxAttempts) {
+        await sleep(Math.min(4000, 400 * attempt));
+        continue;
+      }
+    }
+
+    const debugPath = writeImageDownloadDebug(destination, {
+      image_url: candidate.url,
+      response_field: candidate.sourcePath || "",
+      api_base_url: baseUrl,
+      proxy_enabled: Boolean(proxyUrl),
+      attempts
+    });
+    const lastStatus = [...attempts].reverse().find(entry => entry.status)?.status;
+    if (lastStatus) {
+      throw new Error(`下载图片结果失败 (${lastStatus})，已自动重试 ${attempts.length} 次。通常是中转站图片 CDN 暂时不可用、临时地址尚未就绪，或该下载地址需要同源鉴权。调试文件：${debugPath}`);
+    }
+    throw new Error(`下载图片结果失败：${String(lastError?.message || lastError || "网络异常")}。已自动重试 ${attempts.length} 次。调试文件：${debugPath}`);
+  }
+  throw new Error("图片接口返回了未知的图片数据类型");
+}
+
+async function pollImageResultUrl({
+  pollUrl, section, endpoint, destination, provider = "custom_image", taskId = "", onProgress = () => {}
+}) {
+  let currentUrl = normalizeImageUrl(pollUrl, endpoint) || String(pollUrl || "").trim();
+  if (!currentUrl) throw new Error("图片接口返回了空的任务查询地址");
+  const startedAt = Date.now();
+  const timeoutMs = Math.max(30000, Number(section.poll_timeout_seconds || 360) * 1000);
+  const intervalMs = Math.max(1000, Math.min(10000, Number(section.poll_interval_ms || 2500)));
+  const requestTimeoutMs = Math.max(5000, Math.min(60000, Number(section.poll_request_timeout_seconds || 20) * 1000));
+  const attempts = [];
+  let lastStatus = "";
+  let lastMessage = "";
+  let attempt = 0;
+  const reportProgress = (state, message, extra = {}) => {
+    const elapsedMs = Date.now() - startedAt;
+    const payload = {
+      state,
+      poll_url: currentUrl,
+      api_endpoint: endpoint,
+      provider,
+      task_id: taskId || imageTaskIdFromPayload({}, currentUrl),
+      attempt,
+      elapsed_ms: elapsedMs,
+      timeout_ms: timeoutMs,
+      message,
+      attempts,
+      ...extra
+    };
+    const debugPath = writeImagePollDebug(destination, payload);
+    try { onProgress({ ...payload, debugPath }); } catch {}
+    return debugPath;
+  };
+
+  reportProgress("polling", "已开始查询远程图片任务");
+
+  while (Date.now() - startedAt < timeoutMs) {
+    attempt += 1;
+    let response;
+    try {
+      const headers = imageDownloadHeaders(currentUrl, endpoint, section.api_key || "");
+      headers.accept = "application/json,image/avif,image/webp,image/png,image/jpeg,image/*,*/*;q=0.8";
+      response = await fetchWithTimeout(
+        currentUrl,
+        { method: "GET", headers, redirect: "follow" },
+        section.proxy_url,
+        requestTimeoutMs
+      );
+    } catch (error) {
+      attempts.push({ attempt, network_error: String(error?.message || error), code: error?.code || "" });
+      if (attempts.length > 80) attempts.shift();
+      reportProgress("polling", `第 ${attempt} 次查询未成功：${String(error?.message || error)}`);
+      await sleep(intervalMs);
+      continue;
+    }
+
+    const contentType = response.headers.get("content-type") || "";
+    if (!response.ok) {
+      let body = "";
+      try { body = (await response.text()).slice(0, 1600); } catch {}
+      attempts.push({
+        attempt,
+        status: response.status,
+        status_text: response.statusText || "",
+        content_type: contentType,
+        response_body: body
+      });
+      if (attempts.length > 80) attempts.shift();
+      if ([401, 403].includes(response.status)) {
+        const debugPath = reportProgress("failed", `图片任务查询鉴权失败 (${response.status})`, {
+          http_status: response.status
+        });
+        throw new Error(`图片任务查询鉴权失败 (${response.status})。调试文件：${debugPath}`);
+      }
+      if (!isRetryableImageDownloadStatus(response.status) && response.status !== 404) {
+        const debugPath = reportProgress("failed", `查询图片任务失败 (${response.status})`, {
+          http_status: response.status
+        });
+        throw new Error(`查询图片任务失败 (${response.status})。调试文件：${debugPath}`);
+      }
+      reportProgress("polling", `第 ${attempt} 次查询返回 ${response.status}，程序将继续等待`, {
+        http_status: response.status
+      });
+      await sleep(Math.max(intervalMs, retryDelayMs(response, attempt)));
+      continue;
+    }
+
+    const buffer = Buffer.from(await response.arrayBuffer());
+    if (isImageBuffer(buffer)) {
+      fs.writeFileSync(destination, buffer);
+      reportProgress("completed", "远程图片任务已完成，图片已保存", { image_path: destination });
+      return {
+        path: destination,
+        provider,
+        taskId: taskId || imageTaskIdFromPayload({}, currentUrl),
+        sourceUrl: currentUrl,
+        responseField: "poll_response_binary"
+      };
+    }
+
+    const text = buffer.toString("utf8").trim();
+    let payload = null;
+    if (text) {
+      try { payload = JSON.parse(text); } catch {}
+    }
+
+    attempts.push({
+      attempt,
+      status: response.status,
+      content_type: contentType || "未知类型",
+      response_body: payload ? redactImagePayloadForDebug(payload) : text.slice(0, 1600)
+    });
+    if (attempts.length > 80) attempts.shift();
+
+    if (!payload) {
+      const direct = imageCandidateFromValue(text, currentUrl, "poll.response");
+      if (direct) {
+        const saved = await saveImageResponse(direct, destination, section.proxy_url, currentUrl, { apiKey: section.api_key });
+        reportProgress("completed", "远程图片任务已完成，图片已保存", {
+          image_path: destination,
+          response_field: direct.sourcePath || "poll.response"
+        });
+        return {
+          path: destination,
+          provider,
+          taskId: taskId || imageTaskIdFromPayload({}, currentUrl),
+          sourceUrl: saved.sourceUrl || "",
+          responseField: direct.sourcePath || "poll.response"
+        };
+      }
+      lastMessage = text.slice(0, 240);
+      reportProgress("polling", `第 ${attempt} 次查询尚未返回图片${lastMessage ? `：${lastMessage}` : ""}`);
+      await sleep(intervalMs);
+      continue;
+    }
+
+    const candidate = findImageCandidate(payload, section.image_field || "", currentUrl);
+    if (candidate) {
+      const saved = await saveImageResponse(candidate, destination, section.proxy_url, currentUrl, { apiKey: section.api_key });
+      reportProgress("completed", "远程图片任务已完成，图片已保存", {
+        image_path: destination,
+        response_field: candidate.sourcePath || "poll.response"
+      });
+      return {
+        path: destination,
+        provider,
+        taskId: taskId || imageTaskIdFromPayload(payload, currentUrl),
+        sourceUrl: saved.sourceUrl || "",
+        responseField: candidate.sourcePath || "poll.response"
+      };
+    }
+
+    const nestedPoll = findImagePollCandidate(payload, currentUrl);
+    if (nestedPoll?.url) currentUrl = nestedPoll.url;
+    lastStatus = imageTaskStatus(payload);
+    lastMessage = imageTaskMessage(payload);
+    if (/failed|failure|error|cancelled|canceled|rejected|blocked|expired/.test(lastStatus)) {
+      const debugPath = reportProgress("failed", `图片任务失败${lastStatus ? `：${lastStatus}` : ""}${lastMessage ? `，${lastMessage}` : ""}`, {
+        task_id: taskId || imageTaskIdFromPayload(payload, currentUrl),
+        final_status: lastStatus,
+        final_message: lastMessage
+      });
+      throw new Error(`图片任务失败${lastStatus ? `：${lastStatus}` : ""}${lastMessage ? `，${lastMessage}` : ""}。调试文件：${debugPath}`);
+    }
+
+    reportProgress("polling", `第 ${attempt} 次查询完成，远程任务仍在处理中${lastStatus ? `（${lastStatus}）` : ""}`, {
+      final_status: lastStatus,
+      final_message: lastMessage
+    });
+    await sleep(intervalMs);
+  }
+
+  const debugPath = reportProgress("timeout", `图片任务等待超时（约 ${Math.round(timeoutMs / 1000)} 秒）`, {
+    final_status: lastStatus,
+    final_message: lastMessage
+  });
+  throw new Error(`图片任务等待超时（约 ${Math.round(timeoutMs / 1000)} 秒）${lastStatus ? `，最后状态：${lastStatus}` : ""}。该地址是任务查询接口，不是图片下载地址。调试文件：${debugPath}`);
 }
 
 function imageSize(ratio) {
@@ -127,14 +747,72 @@ async function readJsonResponse(response, actionName) {
   if (text.trim()) {
     try { payload = JSON.parse(text); }
     catch {
-      throw new Error(`${actionName}返回的不是有效 JSON：${text.slice(0, 240)}`);
+      const error = new Error(`${actionName}返回的不是有效 JSON：${text.slice(0, 240)}`);
+      error.status = response.status;
+      error.responseText = text.slice(0, 2000);
+      throw error;
     }
   }
   if (!response.ok) {
     const message = payload?.error?.message || payload?.message || payload?.msg || `${actionName}失败 (${response.status})`;
-    throw new Error(message);
+    const error = new Error(message);
+    error.status = response.status;
+    error.code = payload?.error?.code || payload?.code || "";
+    error.type = payload?.error?.type || payload?.type || "";
+    error.param = payload?.error?.param || payload?.param || "";
+    error.responsePayload = payload;
+    throw error;
   }
   return payload;
+}
+
+function isContentPolicyError(error) {
+  const text = [error?.message, error?.code, error?.type, error?.param]
+    .filter(Boolean).join(" ").toLowerCase();
+  return /content[ _-]?policy|policy[ _-]?(?:violation|rejection)|safety[ _-]?(?:system|violation)|moderation|blocked|rejected by the content|审核|内容策略|违规|敏感内容/.test(text);
+}
+
+function imagePolicyDebugPath(destination) {
+  const imageDir = path.dirname(destination);
+  const outputDir = path.basename(imageDir).toLowerCase() === "images" ? path.dirname(imageDir) : imageDir;
+  const debugDir = path.join(outputDir, "image-debug");
+  fs.mkdirSync(debugDir, { recursive: true });
+  return path.join(debugDir, `${path.basename(destination, path.extname(destination))}-content-policy.json`);
+}
+
+function writeImagePolicyDebug(destination, data) {
+  try {
+    fs.writeFileSync(imagePolicyDebugPath(destination), JSON.stringify({
+      created_at: new Date().toISOString(),
+      ...data
+    }, null, 2), "utf8");
+  } catch {}
+}
+
+function imageSubmitDebugPath(destination) {
+  const imageDir = path.dirname(destination);
+  const outputDir = path.basename(imageDir).toLowerCase() === "images" ? path.dirname(imageDir) : imageDir;
+  const debugDir = path.join(outputDir, "image-debug");
+  fs.mkdirSync(debugDir, { recursive: true });
+  return path.join(debugDir, `${path.basename(destination, path.extname(destination))}-submit.json`);
+}
+
+function writeImageSubmitDebug(destination, data) {
+  try {
+    fs.writeFileSync(imageSubmitDebugPath(destination), JSON.stringify({
+      created_at: new Date().toISOString(),
+      ...data
+    }, null, 2), "utf8");
+  } catch {}
+}
+
+function imageRequestHeaders(section, requestId = "") {
+  const headers = { "content-type": "application/json", authorization: `Bearer ${section.api_key}` };
+  if (requestId) {
+    headers["idempotency-key"] = requestId;
+    headers["x-idempotency-key"] = requestId;
+  }
+  return headers;
 }
 
 function parseExtraBody(section) {
@@ -172,58 +850,213 @@ async function pollCustomImageTask({ section, baseUrl, taskId, destination }) {
     const statusPayload = await readJsonResponse(poll, "查询图片任务");
     const status = String(getByPath(statusPayload, section.status_field || "status") || "").toLowerCase();
     if (successValues.includes(status)) {
-      const item = getByPath(statusPayload, section.image_field || "data.0.url");
-      await saveImageResponse(item, destination, section.proxy_url);
-      return { path: destination, provider: "custom_image", taskId, sourceUrl: item?.url || (typeof item === "string" ? item : "") };
+      const candidate = findImageCandidate(statusPayload, section.image_field || "data.0.url", statusUrl);
+      if (!candidate) {
+        const debugPath = writeImageResponseDebug(destination, {
+          provider: "custom_image",
+          mode: "async_poll",
+          status_url: statusUrl,
+          configured_image_field: section.image_field || "data.0.url",
+          payload: statusPayload
+        });
+        throw new Error(`异步图片任务已完成，但状态响应中没有找到图片地址或 Base64 数据。原始响应已保存：${debugPath}`);
+      }
+      const saved = await saveImageResponse(candidate, destination, section.proxy_url, statusUrl, { apiKey: section.api_key });
+      return { path: destination, provider: "custom_image", taskId, sourceUrl: saved.sourceUrl || "", responseField: candidate.sourcePath || "" };
     }
     if (["failed", "error", "cancelled"].includes(status)) throw new Error(statusPayload?.message || `图片任务失败：${status}`);
   }
   throw new Error("图片任务等待超时");
 }
 
-async function generateOpenAiImage({ provider, config, prompt, destination, ratio, resumeTaskId = "", onRemoteTask = () => {}, requestId = "" }) {
+async function generateOpenAiImage({ provider, config, prompt, destination, ratio, resumeTaskId = "", onRemoteTask = () => {}, onProgress = () => {}, requestId = "" }) {
   const section = provider === "modelscope" ? config.modelscope
     : provider === "custom_image" ? config.custom_image : config.gpt_image;
   const baseUrl = section.base_url || (provider === "modelscope"
     ? "https://api-inference.modelscope.cn/v1"
     : "https://api.openai.com/v1");
   if (!section.api_key) throw new Error(`${provider} 尚未配置 API Key`);
+  const endpoint = resolveImageEndpoint(baseUrl, provider === "custom_image" ? section.submit_path : "/images/generations", "generation");
+  if (resumeTaskId && /^https?:\/\//i.test(String(resumeTaskId))) {
+    return pollImageResultUrl({
+      pollUrl: String(resumeTaskId), section, endpoint, destination, provider,
+      taskId: imageTaskIdFromPayload({}, String(resumeTaskId)), onProgress
+    });
+  }
   if (provider === "custom_image" && section.async_mode && resumeTaskId) {
     if (!section.status_path) throw new Error("异步图片接口尚未填写状态查询路径");
     return pollCustomImageTask({ section, baseUrl, taskId: resumeTaskId, destination });
   }
-  const endpoint = resolveImageEndpoint(baseUrl, provider === "custom_image" ? section.submit_path : "/images/generations", "generation");
   const extraBody = parseExtraBody(section);
-  const responseFormat = section.response_format || "b64_json";
-  const body = {
-    model: section.model || "gpt-image-2",
-    prompt,
-    n: 1,
-    size: mappedImageSize(section, ratio),
-    ...(section.quality ? { quality: section.quality } : {}),
-    ...(responseFormat && responseFormat !== "auto" ? { response_format: responseFormat } : {}),
-    ...extraBody
+  const responseFormat = String(section.response_format || "auto").trim();
+  const moderation = String(section.moderation || "none").trim();
+
+  const submit = async (requestPrompt, suffix = "") => {
+    const body = {
+      model: section.model || "gpt-image-2",
+      prompt: requestPrompt,
+      n: 1,
+      size: mappedImageSize(section, ratio),
+      ...(section.quality ? { quality: section.quality } : {}),
+      ...(responseFormat && responseFormat !== "auto" ? { response_format: responseFormat } : {}),
+      ...(moderation && moderation !== "none" ? { moderation } : {}),
+      ...extraBody
+    };
+    writeImageSubmitDebug(destination, {
+      provider,
+      endpoint,
+      request_body: body,
+      request_suffix: suffix || "",
+      response_format_source: responseFormat || "auto",
+      async_mode: Boolean(section.async_mode)
+    });
+    const response = await fetchWithProxy(endpoint, {
+      method: "POST",
+      headers: imageRequestHeaders(section, requestId ? `${requestId}${suffix}` : ""),
+      body: JSON.stringify(body)
+    }, section.proxy_url);
+    const payload = await readJsonResponse(response, "图片生成");
+    writeImageSubmitDebug(destination, {
+      provider,
+      endpoint,
+      request_body: body,
+      request_suffix: suffix || "",
+      response_format_source: responseFormat || "auto",
+      async_mode: Boolean(section.async_mode),
+      response_status: response.status,
+      response_payload: redactImagePayloadForDebug(payload)
+    });
+    return payload;
   };
-  const headers = { "content-type": "application/json", authorization: `Bearer ${section.api_key}` };
-  if (requestId) {
-    headers["idempotency-key"] = requestId;
-    headers["x-idempotency-key"] = requestId;
+
+  const originalPrompt = String(prompt || "");
+  const risk = analyzeImagePromptRisk(originalPrompt);
+  const first = buildPolicySafeImagePrompt(originalPrompt, "preflight");
+  const candidateModes = first.adjusted ? ["minimal", "ultra"] : ["safe", "ultra"];
+  const candidates = [{ mode: first.adjusted ? "preflight-safe" : "original", ...first }];
+  if (section.policy_fallback !== false) {
+    for (const mode of candidateModes) {
+      const candidate = buildPolicySafeImagePrompt(originalPrompt, mode);
+      if (!candidates.some(item => item.prompt === candidate.prompt)) candidates.push({ mode, ...candidate });
+    }
   }
-  const response = await fetchWithProxy(endpoint, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body)
-  }, section.proxy_url);
-  const payload = await readJsonResponse(response, "图片生成");
+
+  let payload;
+  let promptUsed = candidates[0].prompt;
+  let policyAdjusted = Boolean(candidates[0].adjusted);
+  const errors = [];
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
+    try {
+      payload = await submit(candidate.prompt, index ? `-policy-${candidate.mode}` : (candidate.adjusted ? "-preflight-safe" : ""));
+      promptUsed = candidate.prompt;
+      policyAdjusted = Boolean(candidate.adjusted || index > 0);
+      break;
+    } catch (error) {
+      errors.push({
+        mode: candidate.mode,
+        prompt: candidate.prompt,
+        message: String(error?.message || error),
+        status: error?.status || 0,
+        code: error?.code || "",
+        type: error?.type || ""
+      });
+      if (!isContentPolicyError(error) || section.policy_fallback === false) throw error;
+      if (index >= candidates.length - 1) {
+        writeImagePolicyDebug(destination, {
+          provider,
+          endpoint,
+          model: section.model || "gpt-image-2",
+          original_prompt: originalPrompt,
+          risk,
+          attempts: errors,
+          resolved: false
+        });
+        const finalError = new Error(`图片提示词被内容审核拒绝；程序已在发送前改写，并使用更保守画面重试仍未通过。调试文件：${imagePolicyDebugPath(destination)}`);
+        finalError.code = "IMAGE_CONTENT_POLICY_REJECTED";
+        finalError.status = error?.status || 400;
+        throw finalError;
+      }
+    }
+  }
+
   if (provider === "custom_image" && section.async_mode) {
     const taskId = getByPath(payload, section.task_id_field || "task_id");
     if (!taskId || !section.status_path) throw new Error("异步图片接口未返回任务 ID，或尚未填写状态查询路径");
     onRemoteTask({ taskId: String(taskId), provider: "custom_image" });
-    return pollCustomImageTask({ section, baseUrl, taskId: String(taskId), destination });
+    const result = await pollCustomImageTask({ section, baseUrl, taskId: String(taskId), destination });
+    if (policyAdjusted || errors.length) {
+      writeImagePolicyDebug(destination, {
+        provider,
+        endpoint,
+        model: section.model || "gpt-image-2",
+        original_prompt: originalPrompt,
+        risk,
+        prompt_used: promptUsed,
+        attempts: errors,
+        resolved: true
+      });
+    }
+    return { ...result, policyAdjusted, promptUsed };
   }
-  const item = payload.data?.[0] || payload.output?.images?.[0] || getByPath(payload, section.image_field);
-  await saveImageResponse(item, destination, section.proxy_url);
-  return { path: destination, provider };
+  const imageCandidate = findImageCandidate(payload, section.image_field, endpoint);
+  const pollCandidate = findImagePollCandidate(payload, endpoint);
+  if (!imageCandidate && pollCandidate?.url) {
+    const taskId = imageTaskIdFromPayload(payload, pollCandidate.url);
+    onRemoteTask({ taskId: pollCandidate.url, provider: `${provider}-poll-url` });
+    const result = await pollImageResultUrl({
+      pollUrl: pollCandidate.url,
+      section,
+      endpoint,
+      destination,
+      provider,
+      taskId,
+      onProgress
+    });
+    if (policyAdjusted || errors.length) {
+      writeImagePolicyDebug(destination, {
+        provider,
+        endpoint,
+        model: section.model || "gpt-image-2",
+        original_prompt: originalPrompt,
+        risk,
+        prompt_used: promptUsed,
+        attempts: errors,
+        resolved: true
+      });
+    }
+    return { ...result, policyAdjusted, promptUsed, responseField: result.responseField || pollCandidate.sourcePath || "poll_url" };
+  }
+  if (!imageCandidate) {
+    const debugPath = writeImageResponseDebug(destination, {
+      provider,
+      endpoint,
+      model: section.model || "gpt-image-2",
+      configured_image_field: section.image_field || "",
+      response_top_level_keys: payload && typeof payload === "object" ? Object.keys(payload) : [],
+      payload
+    });
+    const taskId = getByPath(payload, section.task_id_field || "task_id")
+      || payload?.id || payload?.task_id || payload?.taskId || payload?.data?.task_id || payload?.data?.taskId;
+    if (taskId && provider === "custom_image" && !section.async_mode) {
+      throw new Error(`图片接口返回了任务 ID（${String(taskId).slice(0, 80)}），但当前配置为同步模式。请在图片接口设置中开启“异步模式”，并填写状态查询路径。原始响应已保存：${debugPath}`);
+    }
+    throw new Error(`图片接口请求成功，但返回结构中没有找到图片地址、Base64 数据或任务查询地址。原始响应已保存：${debugPath}`);
+  }
+  const savedImage = await saveImageResponse(imageCandidate, destination, section.proxy_url, endpoint, { apiKey: section.api_key });
+  if (policyAdjusted || errors.length) {
+    writeImagePolicyDebug(destination, {
+      provider,
+      endpoint,
+      model: section.model || "gpt-image-2",
+      original_prompt: originalPrompt,
+      risk,
+      prompt_used: promptUsed,
+      attempts: errors,
+      resolved: true
+    });
+  }
+  return { path: destination, provider, policyAdjusted, promptUsed, sourceUrl: savedImage.sourceUrl || "", responseField: imageCandidate.sourcePath || "" };
 }
 
 async function pollRunningHubWorkflowImage({ baseUrl, section, taskId, destination }) {
@@ -527,7 +1360,7 @@ async function generateRunningHubVideo({
 }
 
 
-async function generateReferenceImage({ provider, config, prompt, destination, ratio, referenceImagePath, requestId = "" }) {
+async function generateReferenceImage({ provider, config, prompt, destination, ratio, referenceImagePath, onProgress = () => {}, requestId = "" }) {
   const section = provider === "modelscope" ? config.modelscope
     : provider === "custom_image" ? config.custom_image : config.gpt_image;
   if (!section?.api_key) throw new Error(`${provider} 尚未配置 API Key`);
@@ -535,32 +1368,141 @@ async function generateReferenceImage({ provider, config, prompt, destination, r
   if (!referencePaths.length) throw new Error("参考图不存在或不可读取");
   const baseUrl = section.base_url || "https://api.openai.com/v1";
   const endpoint = resolveImageEndpoint(baseUrl, provider === "custom_image" ? section.edit_path : "/images/edits", "edit");
-  const form = new FormData();
-  form.append("model", section.model || "gpt-image-2");
-  form.append("prompt", `${prompt}\n保持参考图中的人物身份、面部特征、发型、服装与整体构图逻辑一致。`);
-  form.append("size", mappedImageSize(section, ratio));
-  if (section.quality) form.append("quality", section.quality);
-  const responseFormat = section.edit_response_format || "b64_json";
-  if (responseFormat && responseFormat !== "auto") form.append("response_format", responseFormat);
-  for (const imagePath of referencePaths) {
-    form.append("image", new Blob([fs.readFileSync(imagePath)]), path.basename(imagePath));
-  }
   const extraBody = parseExtraBody(section);
-  for (const [key, value] of Object.entries(extraBody)) appendFormField(form, key, value);
-  const headers = { authorization: `Bearer ${section.api_key}` };
-  if (requestId) {
-    headers["idempotency-key"] = requestId;
-    headers["x-idempotency-key"] = requestId;
+  const moderation = String(section.moderation || "none").trim();
+
+  const submit = async (requestPrompt, suffix = "") => {
+    const form = new FormData();
+    form.append("model", section.model || "gpt-image-2");
+    form.append("prompt", `${requestPrompt}
+保持参考图中的人物身份、发型、服装与整体构图逻辑一致；人物采用演员化演绎，不要求复刻真实人物的精确面容。`);
+    form.append("size", mappedImageSize(section, ratio));
+    if (section.quality) form.append("quality", section.quality);
+    const responseFormat = section.edit_response_format || "b64_json";
+    if (responseFormat && responseFormat !== "auto") form.append("response_format", responseFormat);
+    if (moderation && moderation !== "none") form.append("moderation", moderation);
+    for (const imagePath of referencePaths) {
+      form.append("image", new Blob([fs.readFileSync(imagePath)]), path.basename(imagePath));
+    }
+    for (const [key, value] of Object.entries(extraBody)) appendFormField(form, key, value);
+    const headers = { authorization: `Bearer ${section.api_key}` };
+    if (requestId) {
+      headers["idempotency-key"] = `${requestId}${suffix}`;
+      headers["x-idempotency-key"] = `${requestId}${suffix}`;
+    }
+    const response = await fetchWithProxy(endpoint, {
+      method: "POST",
+      headers,
+      body: form
+    }, section.proxy_url);
+    return readJsonResponse(response, "参考图编辑");
+  };
+
+  const originalPrompt = String(prompt || "");
+  const risk = analyzeImagePromptRisk(originalPrompt);
+  const first = buildPolicySafeImagePrompt(originalPrompt, "preflight");
+  const candidateModes = first.adjusted ? ["minimal", "ultra"] : ["safe", "ultra"];
+  const candidates = [{ mode: first.adjusted ? "preflight-safe" : "original", ...first }];
+  if (section.policy_fallback !== false) {
+    for (const mode of candidateModes) {
+      const candidate = buildPolicySafeImagePrompt(originalPrompt, mode);
+      if (!candidates.some(item => item.prompt === candidate.prompt)) candidates.push({ mode, ...candidate });
+    }
   }
-  const response = await fetchWithProxy(endpoint, {
-    method: "POST",
-    headers,
-    body: form
-  }, section.proxy_url);
-  const payload = await readJsonResponse(response, "参考图编辑");
-  const item = payload.data?.[0] || payload.output?.images?.[0] || getByPath(payload, section.image_field);
-  await saveImageResponse(item, destination, section.proxy_url);
-  return { path: destination, provider };
+
+  let payload;
+  let promptUsed = candidates[0].prompt;
+  let policyAdjusted = Boolean(candidates[0].adjusted);
+  const errors = [];
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
+    try {
+      payload = await submit(candidate.prompt, index ? `-policy-${candidate.mode}` : (candidate.adjusted ? "-preflight-safe" : ""));
+      promptUsed = candidate.prompt;
+      policyAdjusted = Boolean(candidate.adjusted || index > 0);
+      break;
+    } catch (error) {
+      errors.push({
+        mode: candidate.mode,
+        prompt: candidate.prompt,
+        message: String(error?.message || error),
+        status: error?.status || 0,
+        code: error?.code || "",
+        type: error?.type || ""
+      });
+      if (!isContentPolicyError(error) || section.policy_fallback === false) throw error;
+      if (index >= candidates.length - 1) {
+        writeImagePolicyDebug(destination, {
+          provider,
+          endpoint,
+          model: section.model || "gpt-image-2",
+          mode: "reference_edit",
+          original_prompt: originalPrompt,
+          risk,
+          attempts: errors,
+          resolved: false
+        });
+        const finalError = new Error(`参考图提示词被内容审核拒绝；程序已在发送前改写，并使用更保守画面重试仍未通过。调试文件：${imagePolicyDebugPath(destination)}`);
+        finalError.code = "IMAGE_CONTENT_POLICY_REJECTED";
+        finalError.status = error?.status || 400;
+        throw finalError;
+      }
+    }
+  }
+  const imageCandidate = findImageCandidate(payload, section.image_field, endpoint);
+  const pollCandidate = findImagePollCandidate(payload, endpoint);
+  if (!imageCandidate && pollCandidate?.url) {
+    const result = await pollImageResultUrl({
+      pollUrl: pollCandidate.url,
+      section,
+      endpoint,
+      destination,
+      provider,
+      taskId: imageTaskIdFromPayload(payload, pollCandidate.url),
+      onProgress
+    });
+    if (policyAdjusted || errors.length) {
+      writeImagePolicyDebug(destination, {
+        provider,
+        endpoint,
+        model: section.model || "gpt-image-2",
+        mode: "reference_edit",
+        original_prompt: originalPrompt,
+        risk,
+        prompt_used: promptUsed,
+        attempts: errors,
+        resolved: true
+      });
+    }
+    return { ...result, policyAdjusted, promptUsed, responseField: result.responseField || pollCandidate.sourcePath || "poll_url" };
+  }
+  if (!imageCandidate) {
+    const debugPath = writeImageResponseDebug(destination, {
+      provider,
+      endpoint,
+      model: section.model || "gpt-image-2",
+      mode: "reference_edit",
+      configured_image_field: section.image_field || "",
+      response_top_level_keys: payload && typeof payload === "object" ? Object.keys(payload) : [],
+      payload
+    });
+    throw new Error(`参考图接口请求成功，但返回结构中没有找到图片地址、Base64 数据或任务查询地址。原始响应已保存：${debugPath}`);
+  }
+  const savedImage = await saveImageResponse(imageCandidate, destination, section.proxy_url, endpoint, { apiKey: section.api_key });
+  if (policyAdjusted || errors.length) {
+    writeImagePolicyDebug(destination, {
+      provider,
+      endpoint,
+      model: section.model || "gpt-image-2",
+      mode: "reference_edit",
+      original_prompt: originalPrompt,
+      risk,
+      prompt_used: promptUsed,
+      attempts: errors,
+      resolved: true
+    });
+  }
+  return { path: destination, provider, policyAdjusted, promptUsed, sourceUrl: savedImage.sourceUrl || "", responseField: imageCandidate.sourcePath || "" };
 }
 
 async function generateNetworkImage({ app, config, prompt, destination, ratio }) {

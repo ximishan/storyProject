@@ -13,7 +13,7 @@ interface StoryboundApi {
   updatePipeline(id: string, pipeline: PipelineData): Promise<TaskRecord>;
   regenerateScene(id: string, sceneIndex: number, kind: "image" | "audio"): Promise<TaskRecord>;
   replaceSceneImage(id: string, sceneIndex: number): Promise<TaskRecord>;
-  renderTask(id: string): Promise<TaskRecord>;
+  renderTask(id: string, options?: RenderTaskOptions): Promise<TaskRecord>;
   getConfig(): Promise<AppConfig>;
   saveConfig(config: AppConfig): Promise<AppConfig>;
   testConfig(kind: string, config: AppConfig): Promise<{ ok: boolean; message: string; provider?: string; dataUrl?: string }>;
@@ -58,6 +58,18 @@ interface StoryboundApi {
 
 interface Window {
   storybound: StoryboundApi;
+}
+
+interface RenderTaskOptions {
+  animation: string;
+  motionStrength: number;
+  forceStaticImages: boolean;
+  burnCaption: boolean;
+  burnTitle: boolean;
+  burnSubtitle: boolean;
+  burnDisclaimer: boolean;
+  autoTextLayout: boolean;
+  titleDuration: number;
 }
 
 type TaskStatus = "pending" | "running" | "interrupted" | "review" | "completed" | "failed" | "cancelled";
@@ -172,7 +184,13 @@ interface PipelineScene {
   narration: string;
   visual: string;
   desc_prompt?: string;
+  desc_prompt_original?: string;
   image_prompt: string;
+  image_prompt_original?: string;
+  image_prompt_used?: string;
+  image_prompt_safety_adjusted?: boolean;
+  image_prompt_safety_reasons?: string[];
+  image_policy_adjusted?: boolean;
   use_reference?: boolean;
   reference_reason?: string;
   subject_presence?: "character" | "product" | "both" | "none";
@@ -328,6 +346,8 @@ interface AppConfig {
     quality: string;
     response_format: string;
     edit_response_format: string;
+    moderation: string;
+    policy_fallback: boolean;
     status_path: string;
     task_id_field: string;
     status_field: string;

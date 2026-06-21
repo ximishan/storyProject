@@ -2,6 +2,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { ProxyAgent } = require("undici");
 const { atomicWriteJson, atomicWriteFile, readJsonSafe, fingerprint } = require("./checkpoint.cjs");
+const { buildPolicySafeImagePrompt } = require("./image-prompt-safety.cjs");
 
 const systemPromptTemplates = Object.fromEntries(
   require("../shared/system-prompt-templates.json").map(item => [item.id, item])
@@ -63,7 +64,7 @@ const SCENE_BASE_PROMPT = `你是专业短视频分镜师和图片提示词工�
     }
   ]
 }
-每镜只表达一个明确视觉重点。旁白必须完整覆盖，不得改写、漏句或重复。use_reference 必须根据本镜是否真正出现需要保持一致的主角/产品来判断，空镜、环境、器物、资料画面通常为 false。`;
+每镜只表达一个明确视觉重点。旁白必须完整覆盖，不得改写、漏句或重复。use_reference 必须根据本镜是否真正出现需要保持一致的主角/产品来判断，空镜、环境、器物、资料画面通常为 false。\n图片合规硬规则：当旁白涉及手术、受伤、流血、尸体、暴力或死亡时，不得在 desc_prompt 中直接描写令人不适的细节。必须改用包扎后的手指、医生神情、医疗站环境、布帘遮挡、器械整理、远景或象征性画面。不得输出“鲜血、血液、染血、伤口特写、割口清晰可见、缝合伤口、器官外露、尸体特写、极近景微距”等表达。赛道专用要求不得覆盖本条规则。`;
 
 const JSON_REPAIR_PROMPT = `你是严格的 JSON 修复器。用户会提供一段本应为 JSON、但可能包含未转义引号、非法换行、尾逗号或多余说明的文本。
 只返回修复后的合法 JSON，不要输出 Markdown，不要解释，不要改写字段含义，不要删除原有有效内容。JSON 字符串中的英文双引号必须正确转义。`;
@@ -124,12 +125,18 @@ function buildMechanicalScript(task, sourceText = task.input_text, template = {}
   const hasReference = Boolean(task.reference_image_path);
   const scenes = chunks.map((item, index) => {
     const useReference = localReferenceDecision(item.text, referenceKind, hasReference);
+    const rawImagePrompt = `${task.style}风格，${item.text}，主体明确，构图完整，适合${task.ratio}短视频画面，无文字无水印`;
+    const promptSafety = buildPolicySafeImagePrompt(rawImagePrompt, "preflight");
     return {
       index: index + 1,
       narration: item.text,
       visual: item.text,
-      desc_prompt: item.text,
-      image_prompt: `${task.style}风格，${item.text}，主体明确，构图完整，适合${task.ratio}短视频画面，无文字无水印`,
+      desc_prompt: promptSafety.prompt,
+      desc_prompt_original: promptSafety.adjusted ? item.text : "",
+      image_prompt: promptSafety.prompt,
+      image_prompt_original: promptSafety.adjusted ? rawImagePrompt : "",
+      image_prompt_safety_adjusted: promptSafety.adjusted,
+      image_prompt_safety_reasons: promptSafety.reasons,
       use_reference: useReference,
       reference_reason: useReference ? "直接出片模式使用本地关键词规则判断" : "本镜未识别到需要保持一致的主体",
       subject_presence: useReference ? referenceKind : "none",
@@ -688,11 +695,14 @@ function normalizeScene(scene, index, task, metadata, template, modules) {
         ? ["product", "both"].includes(subjectPresence)
         : false;
   const useReference = hasReference && referenceKind !== "none" && kindMatches && asBoolean(scene.use_reference);
+  const rawDescPrompt = String(scene.desc_prompt || scene.image_prompt || scene.visual || "");
+  const descSafety = buildPolicySafeImagePrompt(rawDescPrompt, "preflight");
   const normalized = {
     index: index + 1,
     narration: String(scene.narration || ""),
     visual: String(scene.visual || scene.desc_prompt || ""),
-    desc_prompt: String(scene.desc_prompt || scene.image_prompt || scene.visual || ""),
+    desc_prompt: descSafety.prompt,
+    desc_prompt_original: descSafety.adjusted ? rawDescPrompt : "",
     image_prompt: "",
     use_reference: useReference,
     reference_reason: hasReference
@@ -705,7 +715,12 @@ function normalizeScene(scene, index, task, metadata, template, modules) {
     speaker_name: String(scene.speaker_name || ""),
     speaker_id: String(scene.speaker_id || "")
   };
-  normalized.image_prompt = applyImagePromptTemplate({ scene: normalized, metadata, template, ratio: task.ratio, modules });
+  const templatedPrompt = applyImagePromptTemplate({ scene: normalized, metadata, template, ratio: task.ratio, modules });
+  const promptSafety = buildPolicySafeImagePrompt(templatedPrompt, "preflight");
+  normalized.image_prompt = promptSafety.prompt;
+  normalized.image_prompt_original = promptSafety.adjusted ? templatedPrompt : "";
+  normalized.image_prompt_safety_adjusted = Boolean(descSafety.adjusted || promptSafety.adjusted);
+  normalized.image_prompt_safety_reasons = [...new Set([...(descSafety.reasons || []), ...(promptSafety.reasons || [])])];
   return normalized;
 }
 
@@ -719,7 +734,7 @@ function buildMetadataUserPrompt(task, template, content, characterMode, referen
 
 function buildSceneUserPrompt(task, template, content, metadata, modules, seedPools, referenceKind) {
   const referenceRule = template.reference_decision_prompt || "只有镜头中清晰出现主角/产品且保持身份外观一致有价值时，use_reference 才能为 true；环境、空镜、器物特写和资料画面设为 false。";
-  return `内容类型：${task.track}\n视频形态：${task.task_type === "podcast" ? "双人播客；每个镜头必须输出 speaker_role(A/B)" : "单人旁白"}\n目标分镜数：${task.target_scenes || "根据旁白长度自动决定"}\n画面比例：${task.ratio}\n视觉风格：${task.style}\n参考图类型：${referenceKind}\n是否已上传参考图：${task.reference_image_path ? "是" : "否"}\n参考图判断标准：${referenceRule}\n分镜骨架模块：${JSON.stringify(modules)}\n图片种子池：${JSON.stringify(seedPools)}\n\n模板分镜要求：\n${template.step3_system_prompt || "按通用分镜规则处理"}\n\n元数据：\n${JSON.stringify(metadata, null, 2)}\n\n必须完整覆盖的旁白：\n${content.narration}`;
+  return `内容类型：${task.track}\n视频形态：${task.task_type === "podcast" ? "双人播客；每个镜头必须输出 speaker_role(A/B)" : "单人旁白"}\n目标分镜数：${task.target_scenes || "根据旁白长度自动决定"}\n画面比例：${task.ratio}\n视觉风格：${task.style}\n参考图类型：${referenceKind}\n是否已上传参考图：${task.reference_image_path ? "是" : "否"}\n参考图判断标准：${referenceRule}\n分镜骨架模块：${JSON.stringify(modules)}\n图片种子池：${JSON.stringify(seedPools)}\n\n图片合规硬规则：\n涉及医疗救治、受伤、暴力或死亡的旁白，只能使用克制的替代画面。优先表现包扎后的状态、人物神情、环境、器械、布帘遮挡、中景或远景，不得描述开放性创口、流体细节、缝合过程、尸体细节或极近景微距。\n\n模板分镜要求：\n${template.step3_system_prompt || "按通用分镜规则处理"}\n\n元数据：\n${JSON.stringify(metadata, null, 2)}\n\n必须完整覆盖的旁白：\n${content.narration}`;
 }
 
 function llmIdentity(config) {

@@ -16,6 +16,7 @@ async function readBody(req) {
 async function main() {
   let generationCalls = 0;
   let editCalls = 0;
+  const generationPrompts = [];
   const server = http.createServer(async (req, res) => {
     try {
       assert.strictEqual(req.headers.authorization, "Bearer sk-local-test");
@@ -29,6 +30,12 @@ async function main() {
         assert.strictEqual(Object.prototype.hasOwnProperty.call(payload, "response_format"), false);
         assert.ok(["1536x1024", "1024x1024"].includes(payload.size));
         assert.ok(payload.prompt);
+        generationPrompts.push(payload.prompt);
+        if (/血淋淋/.test(payload.prompt)) {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: { message: "The request was rejected by the content policy.", code: "content_policy_violation", type: "invalid_request_error" } }));
+          return;
+        }
       } else if (req.url === "/codex/v1/images/edits") {
         editCalls += 1;
         assert.match(req.headers["content-type"] || "", /multipart\/form-data; boundary=/);
@@ -85,6 +92,18 @@ async function main() {
     await generateSceneImage({ config, prompt: "一个小男孩", destination: generated, ratio: "16:9" });
     assert.ok(fs.existsSync(generated));
 
+    const policyAdjusted = path.join(tempDir, "policy-adjusted.png");
+    const adjustedResult = await generateSceneImage({
+      config,
+      prompt: "战地外科医生正在处理血淋淋的开放性伤口，伤口特写，黑白纪实摄影",
+      destination: policyAdjusted,
+      ratio: "16:9"
+    });
+    assert.ok(fs.existsSync(policyAdjusted));
+    assert.strictEqual(adjustedResult.policyAdjusted, true);
+    assert.doesNotMatch(adjustedResult.promptUsed, /血淋淋|开放性伤口|伤口特写/);
+    assert.ok(fs.existsSync(path.join(tempDir, "image-debug", "policy-adjusted-content-policy.json")));
+
     const edited = path.join(tempDir, "edited.png");
     await generateSceneImage({ config, prompt: "保持人物，改成雨天", destination: edited, ratio: "16:9", referenceImagePath });
     assert.ok(fs.existsSync(edited));
@@ -92,8 +111,9 @@ async function main() {
     const tested = await testConnection(config, "image");
     assert.strictEqual(tested.ok, true);
     assert.match(tested.message, /连接成功/);
-    assert.strictEqual(generationCalls, 2);
+    assert.strictEqual(generationCalls, 3);
     assert.strictEqual(editCalls, 1);
+    assert.ok(generationPrompts.every(item => !/血淋淋|开放性伤口|伤口特写|鲜血|血液|染血/.test(item)), "高风险细节不得发送给图片接口");
     console.log("OpenAI-compatible image generation/edit integration test passed");
   } finally {
     server.close();

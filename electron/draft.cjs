@@ -13,9 +13,9 @@ function templateForRatio(ratio) {
   const size = sizes[ratio] || sizes["9:16"];
   return {
     canvas: { width: size.width, height: size.height, ratio, backgroundColor: "#000000", backgroundImage: "" },
-    image: { ratio, fit: "cover", top: 0, height: 1, animation: "缩放", motionStrength: 1 },
-    title: { visible: true, x: 0, y: .05, fontSize: 25, color: "#FFDE00", alpha: 1, bold: true, align: 1, border: { color: "#000000", width: 40, alpha: 1 } },
-    caption: { visible: true, x: 0, y: -.22, fontSize: 12, color: "#FFFFFF", alpha: 1, align: 1, maxCharsPerLine: 14, background: { color: "#000000", alpha: .5, roundRadius: .3 }, border: { color: "#000000", width: 0, alpha: 0 } },
+    image: { ratio, fit: "cover", top: 0, height: 1, animation: "左拉镜", motionStrength: 0.5 },
+    title: { visible: true, x: 0, y: .68, fontSize: 25, color: "#FFDE00", alpha: 1, bold: true, align: 1, border: { color: "#000000", width: 40, alpha: 1 } },
+    caption: { visible: true, x: 0, y: -.58, fontSize: 12, color: "#FFFFFF", alpha: 1, align: 1, maxCharsPerLine: 14, background: { color: "#000000", alpha: .5, roundRadius: .3 }, border: { color: "#000000", width: 0, alpha: 0 } },
     audio: { narrationVolume: 10, bgmVolume: 3, bgmFadeOutMs: 2000 }
   };
 }
