@@ -1,6 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
-const { ProxyAgent } = require("undici");
+let ProxyAgent = null;
+try { ({ ProxyAgent } = require("undici")); } catch {}
 const { atomicWriteJson, atomicWriteFile, readJsonSafe, fingerprint } = require("./checkpoint.cjs");
 const { buildPolicySafeImagePrompt } = require("./image-prompt-safety.cjs");
 
@@ -20,6 +21,13 @@ const REWRITE_BASE_PROMPT = `你是专业的中文短视频文案编导。请根
 const METADATA_BASE_PROMPT = `你是短视频视觉策划。请从旁白中抽取后续分镜和人物/产品一致性所需的结构化元数据。
 只返回合法 JSON，不要输出 Markdown 代码块。JSON 字符串内部如需引用原话，优先使用中文引号“”，不得直接插入未转义的英文双引号。JSON 结构：
 {
+  "publish": {
+    "title": "封面主标题",
+    "subtitle": ["副标题第一句", "副标题第二句"],
+    "summary": "视频发布简介",
+    "tags": ["#标签1", "#标签2"],
+    "comments": ["种子评论1", "种子评论2", "种子评论3", "种子评论4", "种子评论5"]
+  },
   "character_card": {
     "enabled": true,
     "name": "主角名或unknown",
@@ -44,7 +52,8 @@ const METADATA_BASE_PROMPT = `你是短视频视觉策划。请从旁白中抽�
   "facts": ["不可改动的事实"],
   "visual_continuity": ["跨镜头必须保持的视觉规则"]
 }
-不明确的信息必须写 unknown 或留空，不得猜测。`;
+publish 必须依据旁白与赛道规则生成；没有副标题、标签或评论时返回空数组。不得编造旁白中不存在的人名、品牌、价格、疗效、身份、年份或历史事实。
+不明确的视觉信息必须写 unknown 或留空，不得猜测。`;
 
 const SCENE_BASE_PROMPT = `你是专业短视频分镜师和图片提示词工程师。请把旁白拆成连续分镜。
 只返回合法 JSON，不要输出 Markdown 代码块。JSON 字符串内部如需引用原话，优先使用中文引号“”，不得直接插入未转义的英文双引号。JSON 结构：
@@ -70,6 +79,7 @@ const JSON_REPAIR_PROMPT = `你是严格的 JSON 修复器。用户会提供一�
 只返回修复后的合法 JSON，不要输出 Markdown，不要解释，不要改写字段含义，不要删除原有有效内容。JSON 字符串中的英文双引号必须正确转义。`;
 
 function llmFetch(url, options, proxyUrl) {
+  if (proxyUrl && !ProxyAgent) throw new Error("已配置 LLM 代理，但 undici 依赖不可用，请重新安装项目依赖");
   return fetch(url, {
     ...options,
     ...(proxyUrl ? { dispatcher: new ProxyAgent(proxyUrl) } : {})
@@ -148,8 +158,18 @@ function buildMechanicalScript(task, sourceText = task.input_text, template = {}
   return {
     title: task.title || String(sourceText || "").slice(0, 18),
     summary: String(sourceText || "").slice(0, 80),
+    subtitle: [],
+    tags: [],
+    comments: [],
     narration: scenes.map(scene => scene.narration).join(task.task_type === "podcast" ? "\n" : ""),
     metadata: {
+      publish: {
+        title: task.title || String(sourceText || "").slice(0, 18),
+        subtitle: [],
+        summary: String(sourceText || "").slice(0, 80),
+        tags: [],
+        comments: []
+      },
       character_card: { enabled: false, stable_prompt: "" },
       product_card: { enabled: false, stable_prompt: "" },
       era_and_location: [],
@@ -629,6 +649,16 @@ function cardPrompt(card) {
     .filter(Boolean).join("，") || "");
 }
 
+function normalizeStringArray(value, limit = 0) {
+  const items = Array.isArray(value)
+    ? value
+    : typeof value === "string"
+      ? value.split(/[\r\n,，]+/)
+      : [];
+  const normalized = items.map(item => String(item || "").trim()).filter(Boolean);
+  return limit > 0 ? normalized.slice(0, limit) : normalized;
+}
+
 function eraPrompt(metadata, scene) {
   if (scene?.era_and_location) return String(scene.era_and_location);
   const items = Array.isArray(metadata?.era_and_location) ? metadata.era_and_location : [];
@@ -662,6 +692,16 @@ function applyImagePromptTemplate({ scene, metadata, template, ratio, modules })
 
 function normalizeMetadata(raw, template) {
   const metadata = raw && typeof raw === "object" ? { ...raw } : {};
+  const rawPublish = metadata.publish && typeof metadata.publish === "object"
+    ? metadata.publish
+    : metadata;
+  const publish = {
+    title: String(rawPublish.title || "").trim(),
+    subtitle: normalizeStringArray(rawPublish.subtitle, 3),
+    summary: String(rawPublish.summary || "").trim().slice(0, 500),
+    tags: normalizeStringArray(rawPublish.tags, 12),
+    comments: normalizeStringArray(rawPublish.comments, 8)
+  };
   const wantCharacter = characterCardEnabled(template);
   const character = metadata.character_card && typeof metadata.character_card === "object"
     ? { ...metadata.character_card }
@@ -673,6 +713,7 @@ function normalizeMetadata(raw, template) {
     : { stable_prompt: typeof metadata.product_card === "string" ? metadata.product_card : "" };
   product.enabled = product.enabled !== false && Boolean(cardPrompt(product));
   return {
+    publish,
     character_card: character,
     product_card: product,
     era_and_location: Array.isArray(metadata.era_and_location) ? metadata.era_and_location : [],
@@ -725,16 +766,16 @@ function normalizeScene(scene, index, task, metadata, template, modules) {
 }
 
 function buildRewriteUserPrompt(task, template) {
-  return `内容类型：${task.track}\n视频形态：${task.task_type === "podcast" ? "双人播客" : "单人旁白"}\n处理模式：${normalizeProcessingMode(task.processing_mode)}\n改写强度：${task.rewrite_intensity || "standard"}\n叙事视角：${task.narrative_pov || "original"}\n目标字数：${task.target_length || "跟随原文"}\n推广内容：${task.keep_promotion ? "保留" : "删除"}\n\n模板要求：\n${template.step1_rewrite_system_prompt || "按通用短视频旁白规则处理"}\n\n原始文案：\n${task.input_text}`;
+  return `内容类型：${task.track}\n视频形态：${task.task_type === "podcast" ? "双人播客" : "单人旁白"}\n处理模式：${normalizeProcessingMode(task.processing_mode)}\n改写强度：${task.rewrite_intensity || "standard"}\n叙事视角：${task.narrative_pov || "original"}\n目标字数：${task.target_length || "跟随原文"}\n推广内容：${task.keep_promotion ? "保留" : "删除"}\n\n请严格执行 system 中的赛道专用规则。\n\n原始文案：\n${task.input_text}`;
 }
 
 function buildMetadataUserPrompt(task, template, content, characterMode, referenceKind) {
-  return `内容类型：${task.track}\n主角档案模式：${characterMode}（follow=跟随赛道，force=强制提取，skip=强制跳过）\n本赛道是否需要主角档案：${template.needs_character_card ? "是" : "否"}\n参考图类型：${referenceKind}\n是否已上传参考图：${task.reference_image_path ? "是" : "否"}\n\n模板元数据要求：\n${template.step1_metadata_system_prompt || "按通用规则提取"}\n\n标题：${content.title}\n摘要：${content.summary}\n旁白：\n${content.narration}`;
+  return `内容类型：${task.track}\n主角档案模式：${characterMode}（follow=跟随赛道，force=强制提取，skip=强制跳过）\n本赛道是否需要主角档案：${template.needs_character_card ? "是" : "否"}\n参考图类型：${referenceKind}\n是否已上传参考图：${task.reference_image_path ? "是" : "否"}\n\n请严格执行 system 中的封面、发布与视觉元数据规则，并同时完整填写 publish 与视觉元数据字段。\n\n工作标题：${content.title}\n工作摘要：${content.summary}\n旁白：\n${content.narration}`;
 }
 
 function buildSceneUserPrompt(task, template, content, metadata, modules, seedPools, referenceKind) {
   const referenceRule = template.reference_decision_prompt || "只有镜头中清晰出现主角/产品且保持身份外观一致有价值时，use_reference 才能为 true；环境、空镜、器物特写和资料画面设为 false。";
-  return `内容类型：${task.track}\n视频形态：${task.task_type === "podcast" ? "双人播客；每个镜头必须输出 speaker_role(A/B)" : "单人旁白"}\n目标分镜数：${task.target_scenes || "根据旁白长度自动决定"}\n画面比例：${task.ratio}\n视觉风格：${task.style}\n参考图类型：${referenceKind}\n是否已上传参考图：${task.reference_image_path ? "是" : "否"}\n参考图判断标准：${referenceRule}\n分镜骨架模块：${JSON.stringify(modules)}\n图片种子池：${JSON.stringify(seedPools)}\n\n图片合规硬规则：\n涉及医疗救治、受伤、暴力或死亡的旁白，只能使用克制的替代画面。优先表现包扎后的状态、人物神情、环境、器械、布帘遮挡、中景或远景，不得描述开放性创口、流体细节、缝合过程、尸体细节或极近景微距。\n\n模板分镜要求：\n${template.step3_system_prompt || "按通用分镜规则处理"}\n\n元数据：\n${JSON.stringify(metadata, null, 2)}\n\n必须完整覆盖的旁白：\n${content.narration}`;
+  return `内容类型：${task.track}\n视频形态：${task.task_type === "podcast" ? "双人播客；每个镜头必须输出 speaker_role(A/B)" : "单人旁白"}\n目标分镜数：${task.target_scenes || "根据旁白长度自动决定"}\n画面比例：${task.ratio}\n视觉风格：${task.style}\n参考图类型：${referenceKind}\n是否已上传参考图：${task.reference_image_path ? "是" : "否"}\n参考图判断标准：${referenceRule}\n分镜骨架模块：${JSON.stringify(modules)}\n图片种子池：${JSON.stringify(seedPools)}\n\n图片合规硬规则：\n涉及医疗救治、受伤、暴力或死亡的旁白，只能使用克制的替代画面。优先表现包扎后的状态、人物神情、环境、器械、布帘遮挡、中景或远景，不得描述开放性创口、流体细节、缝合过程、尸体细节或极近景微距。\n\n请严格执行 system 中的赛道分镜规则，最终输出格式只遵守 system 统一 scenes JSON 协议。\n\n元数据：\n${JSON.stringify(metadata, null, 2)}\n\n必须完整覆盖的旁白：\n${content.narration}`;
 }
 
 function llmIdentity(config) {
@@ -811,7 +852,7 @@ async function planVideoScript({ config, task, outputDir, onStage = () => {} }) 
     writeDebug(debugDir, "01-rewrite-skipped.json", { reason: "semi_auto 保留原文", content });
   } else {
     const rewriteInput = {
-      version: 1,
+      version: 2,
       model: modelIdentity,
       input_text: task.input_text,
       track: task.track,
@@ -845,7 +886,7 @@ async function planVideoScript({ config, task, outputDir, onStage = () => {} }) 
   if (!content.narration) throw new Error("文案处理阶段没有返回 narration");
 
   const metadataInput = {
-    version: 1,
+    version: 2,
     model: modelIdentity,
     content,
     track: task.track,
@@ -869,9 +910,12 @@ async function planVideoScript({ config, task, outputDir, onStage = () => {} }) 
   }
   onStage("02-metadata", "completed");
   const metadata = normalizeMetadata(rawMetadata, template);
+  const publish = metadata.publish || {};
+  if (publish.title) content.title = publish.title;
+  if (publish.summary) content.summary = publish.summary;
 
   const scenesInput = {
-    version: 1,
+    version: 2,
     model: modelIdentity,
     content,
     metadata,
@@ -909,6 +953,9 @@ async function planVideoScript({ config, task, outputDir, onStage = () => {} }) 
     checkpoint_version: 2,
     title: content.title,
     summary: content.summary,
+    subtitle: normalizeStringArray(publish.subtitle, 3),
+    tags: normalizeStringArray(publish.tags, 12),
+    comments: normalizeStringArray(publish.comments, 8),
     narration: task.task_type === "podcast" ? narrationCoverage : content.narration,
     metadata: {
       ...metadata,

@@ -838,9 +838,11 @@ select, .form-grid input, .create-options input { height:39px; padding:0 11px; c
 .animation-thumbnail > div {
   animation-duration: 3.2s;
   animation-iteration-count: infinite;
-  animation-timing-function: ease-in-out;
+  animation-timing-function: cubic-bezier(.42, 0, .58, 1);
   animation-direction: alternate;
   transform-origin: center;
+  backface-visibility: hidden;
+  will-change: transform;
 }
 .motion-none { animation: none !important; }
 .motion-zoom { animation-name: draftZoom; }
@@ -866,20 +868,20 @@ select, .form-grid input, .create-options input { height:39px; padding:0 11px; c
 @keyframes draftZoomTwo { from { transform: scale(1.16); } to { transform: scale(1.02); } }
 @keyframes draftPanLeft { from { transform: scale(1.16) translateX(5%); } to { transform: scale(1.16) translateX(-5%); } }
 @keyframes draftPanRight { from { transform: scale(1.16) translateX(-5%); } to { transform: scale(1.16) translateX(5%); } }
-@keyframes draftShrinkLeft { from { transform: scale(1.16) translateX(0); } to { transform: scale(.94) translateX(-5%); } }
-@keyframes draftShrinkRight { from { transform: scale(1.16) translateX(0); } to { transform: scale(.94) translateX(5%); } }
-@keyframes draftWarpLeft { from { transform: scale(1.12) skewX(0); } to { transform: scale(.95) skewX(-5deg) translateX(-4%); } }
-@keyframes draftWarpRight { from { transform: scale(1.12) skewX(0); } to { transform: scale(.95) skewX(5deg) translateX(4%); } }
+@keyframes draftShrinkLeft { from { transform: scale(1.16) translateX(0); } to { transform: scale(1.02) translateX(-5%); } }
+@keyframes draftShrinkRight { from { transform: scale(1.16) translateX(0); } to { transform: scale(1.02) translateX(5%); } }
+@keyframes draftWarpLeft { from { transform: scale(1.14) rotate(0); } to { transform: scale(1.03) rotate(-1.8deg) translate(-5%, 2%); } }
+@keyframes draftWarpRight { from { transform: scale(1.14) rotate(0); } to { transform: scale(1.03) rotate(1.8deg) translate(5%, 2%); } }
 @keyframes draftSplitVertical { from { clip-path: inset(0 0 0 0); transform: scale(1.08); } to { clip-path: inset(5% 0 5% 0); transform: scale(1); } }
 @keyframes draftSplitHorizontal { from { clip-path: inset(0 0 0 0); transform: scale(1.08); } to { clip-path: inset(0 5% 0 5%); transform: scale(1); } }
 @keyframes draftDropLeft { from { transform: scale(1.1) translate(3%, -4%); } to { transform: scale(1) translate(-4%, 5%); } }
 @keyframes draftDropRight { from { transform: scale(1.1) translate(-3%, -4%); } to { transform: scale(1) translate(4%, 5%); } }
-@keyframes draftRotateShrink { from { transform: scale(1.18) rotate(0); } to { transform: scale(.96) rotate(-3deg); } }
-@keyframes draftRotateRise { from { transform: scale(1.02) translateY(5%) rotate(-2deg); } to { transform: scale(1.12) translateY(-3%) rotate(2deg); } }
+@keyframes draftRotateShrink { from { transform: scale(1.2) rotate(0); } to { transform: scale(1.04) rotate(-2.8deg); } }
+@keyframes draftRotateRise { from { transform: scale(1.04) translateY(6%) rotate(-1.6deg); } to { transform: scale(1.15) translateY(-6%) rotate(1.6deg); } }
 @keyframes draftFlip { from { transform: perspective(500px) rotateY(0); } to { transform: perspective(500px) rotateY(16deg); } }
-@keyframes draftWarpShrink { from { transform: scale(1.16) skew(0); } to { transform: scale(.94) skew(-3deg, 2deg); } }
-@keyframes draftBounce { 0% { transform: scale(1); } 60% { transform: scale(1.13); } 100% { transform: scale(1.06); } }
-@keyframes draftSlide { from { transform: scale(1.12) translate(-7%, -5%) rotate(-2deg); } to { transform: scale(1.02) translate(6%, 6%) rotate(1deg); } }
+@keyframes draftWarpShrink { from { transform: scale(1.18) rotate(0); } to { transform: scale(1.03) rotate(-1.8deg) translate(4%, 2%); } }
+@keyframes draftBounce { 0% { transform: scale(1); } 62% { transform: scale(1.145); } 100% { transform: scale(1.07); } }
+@keyframes draftSlide { from { transform: scale(1.16) translate(-7%, -6%) rotate(-2deg); } to { transform: scale(1.04) translate(7%, 6%) rotate(1.2deg); } }
 
 @media (max-width: 1250px) {
   .draft-template-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
@@ -910,8 +912,9 @@ select, .form-grid input, .create-options input { height:39px; padding:0 11px; c
 .template-editor-section{display:grid;gap:10px;padding:14px;border:1px solid #2d333e;border-radius:10px;background:#11141a}.template-editor-section h3{margin:0;color:#edf1f7;font-size:13px}.template-editor-section>p{margin:0;color:#818a99;font-size:11px;line-height:1.65}
 .template-module-grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}.template-module-item{display:flex!important;align-items:flex-start!important;gap:9px;padding:10px;border:1px solid #303641;border-radius:8px;background:#0d1015}.template-module-item input{width:auto!important;margin-top:3px}.template-module-item span{display:grid;gap:3px}.template-module-item b{font-size:12px;color:#e6eaf0}.template-module-item small{font-size:10px;color:#788190;line-height:1.45}
 .planner-metadata{margin:14px 0 18px;padding:15px;border:1px solid #2d3a35;border-radius:11px;background:linear-gradient(180deg,#111a16,#0e1311)}.planner-metadata-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}.planner-metadata-head>div{display:flex;align-items:center;gap:8px;color:#6fe0b2}.planner-metadata-head span{padding:4px 8px;border:1px solid #315243;border-radius:999px;color:#85d8b5;font-size:10px}.planner-metadata-grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}.planner-metadata-grid>div{display:grid;gap:4px;padding:10px;border:1px solid #28332e;border-radius:8px;background:#0d1310}.planner-metadata-grid small{color:#6f7b75;font-size:9px}.planner-metadata-grid b{color:#cbd6d0;font-size:11px;line-height:1.6;font-weight:500;word-break:break-word}.planner-metadata>p{margin:10px 0 0;color:#8f9b95;font-size:11px;line-height:1.7}
+.publish-result-card{margin:14px 0;padding:15px;border:1px solid #3c3654;border-radius:11px;background:linear-gradient(180deg,#171425,#100f18)}.publish-result-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}.publish-result-head>div{display:flex;align-items:center;gap:8px;color:#b8a5ff}.publish-result-head span{padding:4px 8px;border:1px solid #4b426b;border-radius:999px;color:#b9a9ef;font-size:10px}.publish-result-grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}.publish-result-grid>div{display:grid;gap:4px;padding:10px;border:1px solid #302b45;border-radius:8px;background:#0f0d18}.publish-result-grid small{color:#7e7695;font-size:9px}.publish-result-grid b{color:#ddd6f5;font-size:12px;line-height:1.6;word-break:break-word}.publish-result-card>p{margin:10px 0 0;color:#aaa2bb;font-size:11px;line-height:1.7}.publish-comments{display:grid;gap:6px;margin-top:10px;color:#aaa2bb;font-size:11px;line-height:1.7}.publish-comments>span{display:block;padding-left:8px;border-left:2px solid #3d3656}
 .scene-reference-control{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:8px;padding:9px 11px;border:1px dashed #354139;border-radius:8px;background:#0e1411}.scene-reference-control label{display:flex!important;align-items:center!important;gap:7px!important;margin:0!important;color:#b8d7ca;font-size:11px}.scene-reference-control input{width:auto!important}.scene-reference-control span{color:#78857f;font-size:10px;line-height:1.5;flex:1;min-width:220px}.scene-reference-control em{font-style:normal;color:#73c9a6;font-size:10px;padding:3px 7px;border-radius:999px;background:#14241d}
-@media(max-width:900px){.template-module-grid,.planner-metadata-grid{grid-template-columns:1fr}.prompt-flow-note{align-items:flex-start;flex-direction:column;gap:5px}}
+@media(max-width:900px){.template-module-grid,.planner-metadata-grid,.publish-result-grid{grid-template-columns:1fr}.prompt-flow-note{align-items:flex-start;flex-direction:column;gap:5px}}
 .status.interrupted { background:#43351d; color:#ffc86a; border:1px solid #6d5425; }
 .checkpoint-box { margin:10px 0 14px; padding:10px 12px; border:1px solid #3f4656; border-radius:8px; background:#171a21; color:#aeb7ca; font-size:11px; }
 

@@ -3,7 +3,8 @@ const path = require("node:path");
 const crypto = require("node:crypto");
 const os = require("node:os");
 const { spawn } = require("node:child_process");
-const { ProxyAgent } = require("undici");
+let ProxyAgent = null;
+try { ({ ProxyAgent } = require("undici")); } catch {}
 const { testModelConnection } = require("./llm-planner.cjs");
 const { analyzeImagePromptRisk, buildPolicySafeImagePrompt } = require("./image-prompt-safety.cjs");
 
@@ -23,6 +24,7 @@ function spawnAsync(command, args, options = {}) {
 }
 
 function fetchWithProxy(url, options = {}, proxyUrl = "") {
+  if (proxyUrl && !ProxyAgent) throw new Error("已配置网络代理，但 undici 依赖不可用，请重新安装项目依赖");
   return fetch(url, {
     ...options,
     ...(proxyUrl ? { dispatcher: new ProxyAgent(proxyUrl) } : {})

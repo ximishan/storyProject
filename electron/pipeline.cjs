@@ -103,6 +103,32 @@ function pipelineSnapshot(script, scenes, runtime) {
   };
 }
 
+function subtitleText(script) {
+  const subtitle = Array.isArray(script?.subtitle)
+    ? script.subtitle.map(item => String(item || "").trim()).filter(Boolean)
+    : [];
+  return subtitle.length ? subtitle.join("\n") : String(script?.summary || "");
+}
+
+function writePublishAssets(outputDir, script) {
+  const publish = {
+    title: String(script?.title || ""),
+    subtitle: Array.isArray(script?.subtitle) ? script.subtitle : [],
+    summary: String(script?.summary || ""),
+    tags: Array.isArray(script?.tags) ? script.tags : [],
+    comments: Array.isArray(script?.comments) ? script.comments : []
+  };
+  atomicWriteJson(path.join(outputDir, "publish-metadata.json"), publish);
+  const text = [
+    `主标题：${publish.title}`,
+    publish.subtitle.length ? `副标题：${publish.subtitle.join(" / ")}` : "",
+    `视频简介：${publish.summary}`,
+    publish.tags.length ? `发布标签：${publish.tags.join(" ")}` : "",
+    publish.comments.length ? `\n种子评论：\n${publish.comments.map((item, index) => `${index + 1}. ${item}`).join("\n")}` : ""
+  ].filter(Boolean).join("\n");
+  atomicWriteFile(path.join(outputDir, "publish-copy.txt"), text, "utf8");
+}
+
 async function preparePipeline({ task, config, baseOutputDir, emit, checkpoint = () => {} }) {
   const outputDir = taskOutputDir(task, config, baseOutputDir);
   fs.mkdirSync(outputDir, { recursive: true });
@@ -126,6 +152,7 @@ async function preparePipeline({ task, config, baseOutputDir, emit, checkpoint =
       detail: status
     })
   });
+  writePublishAssets(outputDir, script);
   atomicWriteJson(path.join(outputDir, "model-response.txt"), script);
 
   emit(3, "正在校验分镜、提示词和参考图标记");
@@ -473,7 +500,7 @@ async function completePipeline({ app, task, config, outputDir, script, emit, ch
       ratio: task.ratio, bgmPath: configuredBgm, template: task.draft_template, videoIntro: task.video_intro,
       forceRebuild: true,
       title: script.title || task.title,
-      subtitle: script.summary || "",
+      subtitle: subtitleText(script),
       renderOptions: {
         animation: task.draft_template?.image?.animation || "左拉镜",
         motionStrength: task.draft_template?.image?.motionStrength ?? 1,
@@ -705,7 +732,7 @@ async function renderPrepared({ app, task, config, outputDir, script, emit, opti
     outputName: "final-rerender.mp4",
     renderOptions,
     title: script.title || task.title,
-    subtitle: script.summary || "",
+    subtitle: subtitleText(script),
     onProgress: progress => {
       if (progress.phase === "clip") emit(6, `正在重新合成镜头 ${progress.current}/${progress.total}`);
       else if (progress.phase === "concat") emit(6, "镜头合并完成，正在准备文字图层");

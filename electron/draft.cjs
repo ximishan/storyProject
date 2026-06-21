@@ -40,14 +40,19 @@ async function generateJianyingDraft({ app, config, task, outputDir, scenes, bgm
 
   const exe = resolveResource(app, "draft-generator.exe");
   if (!fs.existsSync(exe)) throw new Error("剪映草稿生成器不存在");
+  let coverTitle = task.title;
   let subtitle = [];
   try {
-    const summary = JSON.parse(task.pipeline_data || "{}").summary;
-    if (summary) subtitle = [summary];
+    const pipeline = JSON.parse(task.pipeline_data || "{}");
+    if (pipeline.title) coverTitle = String(pipeline.title);
+    if (Array.isArray(pipeline.subtitle)) {
+      subtitle = pipeline.subtitle.map(item => String(item || "").trim()).filter(Boolean).slice(0, 3);
+    }
+    if (!subtitle.length && pipeline.summary) subtitle = [String(pipeline.summary)];
   } catch {}
   const input = {
     task_dir: outputDir,
-    cover_title: { title: task.title, subtitle },
+    cover_title: { title: coverTitle, subtitle },
     bgm_path: bgmPath || "",
     jianying_draft_path: config.jianying?.draft_path || "",
     template: task.draft_template || templateForRatio(task.ratio),

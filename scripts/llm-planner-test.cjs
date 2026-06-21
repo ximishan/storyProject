@@ -14,6 +14,13 @@ const { planVideoScript } = require("../electron/llm-planner.cjs");
       narration: "1938年，他离开车站。雨中的老街空无一人。"
     },
     {
+      publish: {
+        title: "雨夜归乡",
+        subtitle: ["他离开多年", "终于回到故乡"],
+        summary: "1938年的雨夜，一名青年提着旧皮箱回到空寂老街。",
+        tags: ["#人物故事", "#雨夜归乡"],
+        comments: ["那个年代的归乡太有画面了。", "旧皮箱这个细节很戳人。"]
+      },
       character_card: {
         enabled: true,
         name: "林安",
@@ -100,6 +107,9 @@ const { planVideoScript } = require("../electron/llm-planner.cjs");
     assert.equal(calls.length, 3, "应依次执行文案、元数据、分镜三次请求");
     assert.equal(calls[0].url, "/v1/chat/completions");
     assert.equal(result.metadata.planner_mode, "staged-llm");
+    assert.equal(result.title, "雨夜归乡");
+    assert.equal(result.subtitle.length, 2);
+    assert.equal(result.tags[0], "#人物故事");
     assert.equal(result.scenes.length, 2);
     assert.equal(result.scenes[0].use_reference, true);
     assert.equal(result.scenes[1].use_reference, false);

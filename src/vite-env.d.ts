@@ -221,6 +221,13 @@ interface PipelineScene {
 }
 
 interface PipelineMetadata {
+  publish?: {
+    title?: string;
+    subtitle?: string[];
+    summary?: string;
+    tags?: string[];
+    comments?: string[];
+  };
   character_card?: Record<string, unknown>;
   product_card?: Record<string, unknown>;
   era_and_location?: Array<Record<string, unknown> | string>;
@@ -248,6 +255,9 @@ interface PipelineData {
   };
   title: string;
   summary: string;
+  subtitle?: string[];
+  tags?: string[];
+  comments?: string[];
   narration: string;
   metadata?: PipelineMetadata;
   scenes: PipelineScene[];

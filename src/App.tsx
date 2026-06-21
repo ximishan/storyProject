@@ -335,6 +335,16 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
         {task.draft_dir && <button onClick={() => window.storybound.openPath(task.draft_dir!)}><ExternalLink size={16} />打开剪映草稿</button>}
         {task.cover_path && <button onClick={() => window.storybound.openPath(task.cover_path!)}><Image size={16} />查看封面海报</button>}
       </div>
+      {pipeline && <div className="publish-result-card">
+        <div className="publish-result-head"><div><FileText size={16} /><b>发布文案结果</b></div><span>已按赛道提示词生成</span></div>
+        <div className="publish-result-grid">
+          <div><small>主标题</small><b>{pipeline.title || "未生成"}</b></div>
+          <div><small>副标题</small><b>{pipeline.subtitle?.length ? pipeline.subtitle.join(" / ") : "未生成"}</b></div>
+        </div>
+        <p><b>视频简介：</b>{pipeline.summary || "未生成"}</p>
+        {pipeline.tags?.length ? <p><b>发布标签：</b>{pipeline.tags.join(" ")}</p> : null}
+        {pipeline.comments?.length ? <div className="publish-comments"><b>种子评论：</b>{pipeline.comments.map((item, index) => <span key={`${index}-${item}`}>{index + 1}. {item}</span>)}</div> : null}
+      </div>}
       {pipeline?.metadata && <div className="planner-metadata">
         <div className="planner-metadata-head"><div><Sparkles size={16} /><b>大模型视觉规划结果</b></div><span>{pipeline.metadata.planner_mode === "staged-llm" ? "三阶段规划" : "本地规则"}</span></div>
         <div className="planner-metadata-grid">
@@ -370,7 +380,7 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
         <label>片头标题显示时长：{renderOptions.titleDuration.toFixed(1)} 秒
           <input type="range" min="0" max="8" step="0.2" value={renderOptions.titleDuration} onChange={event => setRenderOptions(current => ({ ...current, titleDuration: Number(event.target.value) }))} />
         </label>
-        <div className="prompt-safety-note">主标题和副标题只在片头显示；旁白字幕会按标点拆成每次最多两行。左拉镜与右拉镜使用 60fps 小幅平移和轻量帧混合；如仍希望画面完全稳定，可直接选择“无动画”。</div>
+        <div className="prompt-safety-note">主标题和副标题只在片头显示；旁白字幕会按标点拆成每次最多两行。图片动画采用剪映风格关键帧、连续缓入缓出与高分辨率超采样渲染；运镜强度只改变幅度，不会切换算法。</div>
       </EditorModal>}
       {pipeline?.scenes?.length ? <div className="scene-list">
         <h3>分镜工作台 · {pipeline.scenes.length} 镜</h3>

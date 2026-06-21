@@ -245,100 +245,170 @@ function writeAssOverlay({ scenes, destination, width, height, template = {}, ti
   return destination;
 }
 
-function buildStablePanFilter({ fitted, width, height, frames, direction, motionStrength = 1, fps = 60 }) {
-  const safeFrames = Math.max(2, Number(frames) || 2);
-  const safeFps = Math.max(30, Math.min(60, Number(fps) || 60));
-  const strength = clamp(motionStrength || 1, 0.25, 2);
+const CAPCUT_MOTION_PRESETS = Object.freeze({
+  "缩放": { startScale: 1.00, endScale: 1.14, startX: .50, endX: .50, startY: .50, endY: .50 },
+  "缩放 II": { startScale: 1.16, endScale: 1.02, startX: .50, endX: .50, startY: .50, endY: .50 },
+  "左拉镜": { startScale: 1.16, endScale: 1.16, startX: .84, endX: .16, startY: .50, endY: .50 },
+  "右拉镜": { startScale: 1.16, endScale: 1.16, startX: .16, endX: .84, startY: .50, endY: .50 },
+  "向左缩小": { startScale: 1.16, endScale: 1.02, startX: .55, endX: .16, startY: .50, endY: .50 },
+  "向右缩小": { startScale: 1.16, endScale: 1.02, startX: .45, endX: .84, startY: .50, endY: .50 },
+  "形变左缩": { startScale: 1.14, endScale: 1.03, startX: .70, endX: .18, startY: .42, endY: .58, startAngle: 0, endAngle: -1.8 },
+  "形变右缩": { startScale: 1.14, endScale: 1.03, startX: .30, endX: .82, startY: .42, endY: .58, startAngle: 0, endAngle: 1.8 },
+  "上下分割": { startScale: 1.12, endScale: 1.03, startX: .50, endX: .50, startY: .16, endY: .84 },
+  "左右分割": { startScale: 1.12, endScale: 1.03, startX: .16, endX: .84, startY: .50, endY: .50 },
+  "向左下降": { startScale: 1.13, endScale: 1.03, startX: .80, endX: .18, startY: .18, endY: .82, startAngle: 0, endAngle: -1.2 },
+  "向右下降": { startScale: 1.13, endScale: 1.03, startX: .20, endX: .82, startY: .18, endY: .82, startAngle: 0, endAngle: 1.2 },
+  "旋转缩小": { startScale: 1.20, endScale: 1.04, startX: .50, endX: .50, startY: .50, endY: .50, startAngle: 0, endAngle: -2.8 },
+  "旋转上升": { startScale: 1.04, endScale: 1.15, startX: .50, endX: .50, startY: .82, endY: .22, startAngle: -1.6, endAngle: 1.6 },
+  "翻转": { startScale: 1.10, endScale: 1.10, startX: .50, endX: .50, startY: .50, endY: .50, startAngle: -1.2, endAngle: 1.2, flip: true },
+  "形变缩小": { startScale: 1.18, endScale: 1.03, startX: .30, endX: .70, startY: .40, endY: .60, startAngle: 0, endAngle: -1.8 },
+  "回弹伸缩": { startScale: 1.00, endScale: 1.07, startX: .50, endX: .50, startY: .50, endY: .50, bounce: true },
+  "滑滑梯": { startScale: 1.16, endScale: 1.04, startX: .12, endX: .88, startY: .12, endY: .88, startAngle: -2.0, endAngle: 1.2 }
+});
 
-  // 0.8.7：不再从整张超扫区域的一端拉到另一端。
-  // 旧实现位移过大，短镜头里每帧移动距离明显，视觉上会像抖动。
-  // 现在只在画面中心附近做小幅平移，并以 60fps 输出。
-  const scale = clamp(1.075 + 0.025 * strength, 1.075, 1.125);
-  const supersample = 2;
-  const overscanWidth = even(width * scale);
-  const overscanHeight = even(height * scale);
-  const highWidth = even(overscanWidth * supersample);
-  const highHeight = even(overscanHeight * supersample);
-  const cropWidth = even(width * supersample);
-  const cropHeight = even(height * supersample);
-  const maxX = Math.max(0, highWidth - cropWidth);
-  const maxY = Math.max(0, highHeight - cropHeight);
-  const centerX = maxX / 2;
-  const centerY = maxY / 2;
-
-  // 最多移动输出画面宽度约 3.5%～7%，避免短镜头快速扫动。
-  const requestedTravel = width * supersample * (0.035 + 0.015 * strength);
-  const travel = Math.max(2, Math.min(maxX * 0.72, requestedTravel));
-  const halfTravel = travel / 2;
-  const startX = direction === "right" ? centerX - halfTravel : centerX + halfTravel;
-  const endX = direction === "right" ? centerX + halfTravel : centerX - halfTravel;
-  const progress = `min(1,max(0,n/${safeFrames - 1}))`;
-  const x = `max(0,min(${maxX},round(${startX.toFixed(4)}+(${(endX - startX).toFixed(4)})*${progress})))`;
-  const y = `max(0,min(${maxY},round(${centerY.toFixed(4)})))`;
-
-  // 在二倍画布上移动、缩回目标尺寸，并用相邻帧轻量混合消除整数像素步进感。
-  return `${fitted},scale=${highWidth}:${highHeight}:flags=lanczos,setsar=1,` +
-    `crop=${cropWidth}:${cropHeight}:x='${x}':y='${y}',` +
-    `scale=${width}:${height}:flags=lanczos,fps=${safeFps},setpts=N/(${safeFps}*TB),` +
-    `tmix=frames=2:weights='1 1'`;
+function ffNumber(value, digits = 8) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number.toFixed(digits).replace(/0+$/, "").replace(/\.$/, "") : "0";
 }
 
-function buildImageMotionFilter({ fitted, width, height, frames, animation, motionStrength = 1, dynamicScene = false, sceneIndex = 1, fps = 30 }) {
-  const safeFrames = Math.max(1, Number(frames) || 1);
-  const strength = clamp(motionStrength || 1, 0.25, 3);
+function motionStrengthFactor(value, dynamicScene = false) {
+  const strength = clamp(value ?? .5, .25, 2);
+  // 旧模板默认强度是 0.5，因此把 0.5 作为剪映标准档。
+  // 对数映射能避免强度稍微变化时位移突然翻倍，也不再切换渲染算法。
+  const factor = clamp(.65 + .6 * Math.log2(1 + strength), .82, 1.60);
+  return dynamicScene ? Math.min(1.65, factor * 1.06) : factor;
+}
+
+function scaleAroundOne(value, factor) {
+  return 1 + (Number(value || 1) - 1) * factor;
+}
+
+function anchorAroundCenter(value, factor) {
+  return clamp(.5 + (Number(value ?? .5) - .5) * factor, .02, .98);
+}
+
+function fittedImageFilter({ width, height, fit = "cover", backgroundColor = "0x000000" }) {
+  return fit === "contain"
+    ? `scale=${width}:${height}:force_original_aspect_ratio=decrease:flags=lanczos+accurate_rnd+full_chroma_int,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:color=${backgroundColor},setsar=1`
+    : `scale=${width}:${height}:force_original_aspect_ratio=increase:flags=lanczos+accurate_rnd+full_chroma_int,crop=${width}:${height},setsar=1`;
+}
+
+function buildCapCutMotionFilter({
+  width, height, frames, animation, motionStrength = .5, dynamicScene = false,
+  sceneIndex = 1, fps = 30, fit = "cover", backgroundColor = "0x000000"
+}) {
+  const safeFrames = Math.max(2, Number(frames) || 2);
+  const safeFps = Math.max(24, Math.min(60, Number(fps) || 30));
   let selected = String(animation || "无动画");
   if (selected === "交替拉镜") selected = Number(sceneIndex) % 2 === 0 ? "右拉镜" : "左拉镜";
-  const progress = `min(1,max(0,on/${Math.max(1, safeFrames - 1)}))`;
-  const centerX = "trunc((iw-iw/zoom)/4)*2";
-  const centerY = "trunc((ih-ih/zoom)/4)*2";
-  const zoomInStep = (dynamicScene ? 0.0010 : 0.00035) * strength;
-  const zoomOutStep = (dynamicScene ? 0.0008 : 0.00030) * strength;
-  const zoomLimit = dynamicScene ? 1.13 : 1.08;
-  const safeFps = Math.max(24, Math.min(60, Number(fps) || 30));
-  const zoompan = ({ z, x = centerX, y = centerY, prefix = "" }) =>
-    `${fitted},${prefix}zoompan=z='${z}':x='${x}':y='${y}':d=${safeFrames}:s=${width}x${height}:fps=${safeFps}`;
 
-  switch (selected) {
-    case "无动画":
-      return `${fitted},fps=${safeFps},setpts=N/(${safeFps}*TB)`;
-    case "左拉镜":
-      return buildStablePanFilter({ fitted, width, height, frames: safeFrames, direction: "left", motionStrength: strength, fps: safeFps });
-    case "右拉镜":
-      return buildStablePanFilter({ fitted, width, height, frames: safeFrames, direction: "right", motionStrength: strength, fps: safeFps });
-    case "缩放 II":
-      return zoompan({ z: `if(eq(on,0),${zoomLimit},max(1.0,zoom-${zoomOutStep.toFixed(6)}))` });
-    case "向左缩小":
-      return zoompan({ z: `if(eq(on,0),1.12,max(1.0,zoom-${zoomOutStep.toFixed(6)}))`, x: "0" });
-    case "向右缩小":
-      return zoompan({ z: `if(eq(on,0),1.12,max(1.0,zoom-${zoomOutStep.toFixed(6)}))`, x: "trunc((iw-iw/zoom)/2)*2" });
-    case "形变左缩":
-      return zoompan({ z: `if(eq(on,0),1.11,max(1.0,zoom-${zoomOutStep.toFixed(6)}))`, x: `trunc(((iw-iw/zoom)*(1-${progress}))/2)*2`, y: `trunc(((ih-ih/zoom)*(0.35+0.15*${progress}))/2)*2` });
-    case "形变右缩":
-      return zoompan({ z: `if(eq(on,0),1.11,max(1.0,zoom-${zoomOutStep.toFixed(6)}))`, x: `trunc(((iw-iw/zoom)*${progress})/2)*2`, y: `trunc(((ih-ih/zoom)*(0.35+0.15*${progress}))/2)*2` });
-    case "上下分割":
-      return zoompan({ z: "1.08", y: `trunc(((ih-ih/zoom)*${progress})/2)*2` });
-    case "左右分割":
-      return zoompan({ z: "1.08", x: `trunc(((iw-iw/zoom)*${progress})/2)*2` });
-    case "向左下降":
-      return zoompan({ z: "1.08", x: `trunc(((iw-iw/zoom)*(1-${progress}))/2)*2`, y: `trunc(((ih-ih/zoom)*${progress})/2)*2` });
-    case "向右下降":
-      return zoompan({ z: "1.08", x: `trunc(((iw-iw/zoom)*${progress})/2)*2`, y: `trunc(((ih-ih/zoom)*${progress})/2)*2` });
-    case "旋转缩小":
-      return `${zoompan({ z: `if(eq(on,0),1.10,max(1.0,zoom-${zoomOutStep.toFixed(6)}))` })},rotate='-0.02*n/${safeFrames}':ow=iw:oh=ih:c=black@0`;
-    case "旋转上升":
-      return `${zoompan({ z: `min(zoom+${zoomInStep.toFixed(6)},1.10)`, y: `trunc(((ih-ih/zoom)*(1-${progress}))/2)*2` })},rotate='0.02*n/${safeFrames}':ow=iw:oh=ih:c=black@0`;
-    case "翻转":
-      return zoompan({ z: `min(zoom+${(zoomInStep * .5).toFixed(6)},1.06)`, prefix: "hflip," });
-    case "形变缩小":
-      return zoompan({ z: `if(eq(on,0),1.12,max(1.0,zoom-${zoomOutStep.toFixed(6)}))`, x: `trunc(((iw-iw/zoom)*(0.25+0.5*${progress}))/2)*2` });
-    case "回弹伸缩":
-      return zoompan({ z: `1+0.06*sin(PI*${progress})` });
-    case "滑滑梯":
-      return zoompan({ z: "1.09", x: `trunc(((iw-iw/zoom)*${progress})/2)*2`, y: `trunc(((ih-ih/zoom)*${progress})/2)*2` });
-    case "缩放":
-    default:
-      return zoompan({ z: `min(zoom+${zoomInStep.toFixed(6)},${zoomLimit})` });
+  const fitted = fittedImageFilter({ width, height, fit, backgroundColor });
+  if (selected === "无" || selected === "无动画") {
+    return `${fitted},fps=${safeFps},setpts=N/(${safeFps}*TB),format=yuv420p`;
   }
+
+  const preset = CAPCUT_MOTION_PRESETS[selected] || CAPCUT_MOTION_PRESETS["缩放"];
+  const factor = motionStrengthFactor(motionStrength, dynamicScene);
+  const startScale = Math.max(1.0001, scaleAroundOne(preset.startScale, factor));
+  const endScale = Math.max(1.0001, scaleAroundOne(preset.endScale, factor));
+  const startX = anchorAroundCenter(preset.startX, factor);
+  const endX = anchorAroundCenter(preset.endX, factor);
+  const startY = anchorAroundCenter(preset.startY, factor);
+  const endY = anchorAroundCenter(preset.endY, factor);
+  const startAngle = Number(preset.startAngle || 0) * factor;
+  const endAngle = Number(preset.endAngle || 0) * factor;
+
+  // perspective 会在每一帧重新计算浮点变换矩阵，并使用 cubic 插值。
+  // 与 zoompan 的整数裁剪坐标不同，这条路径不需要 floor/trunc，也不需要
+  // 巨大的 2～3 倍画布，因此既能保持亚像素运动，也能显著降低内存占用。
+  const linear = `min(1,max(0,on/${safeFrames - 1}))`;
+  const eased = `(0.5-0.5*cos(PI*(${linear})))`;
+  const lerp = (from, to, progress = eased) => `(${ffNumber(from)}+(${ffNumber(to - from)})*(${progress}))`;
+
+  let scaleExpression;
+  if (preset.bounce) {
+    const split = .62;
+    const peak = scaleAroundOne(1.145, factor);
+    const settle = scaleAroundOne(1.07, factor);
+    const firstProgress = `min(1,max(0,(${linear})/${split}))`;
+    const secondProgress = `min(1,max(0,((${linear})-${split})/${1 - split}))`;
+    const firstEase = `(0.5-0.5*cos(PI*(${firstProgress})))`;
+    const secondEase = `(0.5-0.5*cos(PI*(${secondProgress})))`;
+    scaleExpression = `if(lt(${linear},${split}),${lerp(1, peak, firstEase)},${lerp(peak, settle, secondEase)})`;
+  } else {
+    scaleExpression = lerp(startScale, endScale);
+  }
+
+  const xAnchor = lerp(startX, endX);
+  const yAnchor = lerp(startY, endY);
+  const angleDegrees = lerp(startAngle, endAngle);
+  const angleRadians = `((${angleDegrees})*PI/180)`;
+  const cosAngle = `cos(${angleRadians})`;
+  const sinAngle = `sin(${angleRadians})`;
+  const centerX = `(W/2+W*((${scaleExpression})-1)*(0.5-(${xAnchor})))`;
+  const centerY = `(H/2+H*((${scaleExpression})-1)*(0.5-(${yAnchor})))`;
+
+  const corner = (vx, vy) => ({
+    x: `(${centerX}+(${scaleExpression})*((${vx})*(${cosAngle})-(${vy})*(${sinAngle})))`,
+    y: `(${centerY}+(${scaleExpression})*((${vx})*(${sinAngle})+(${vy})*(${cosAngle})))`
+  });
+  const topLeft = corner("-W/2", "-H/2");
+  const topRight = corner("W/2", "-H/2");
+  const bottomLeft = corner("-W/2", "H/2");
+  const bottomRight = corner("W/2", "H/2");
+
+  let filter = `${fitted},fps=${safeFps},setpts=N/(${safeFps}*TB),format=gbrp,` +
+    `perspective=` +
+    `x0='${topLeft.x}':y0='${topLeft.y}':` +
+    `x1='${topRight.x}':y1='${topRight.y}':` +
+    `x2='${bottomLeft.x}':y2='${bottomLeft.y}':` +
+    `x3='${bottomRight.x}':y3='${bottomRight.y}':` +
+    `sense=destination:eval=frame:interpolation=cubic`;
+
+  if (preset.flip) {
+    const flipAmount = `(W*${ffNumber(Math.min(.035 * factor, .055))}*(${eased}))`;
+    filter += `,perspective=` +
+      `x0='${flipAmount}':y0='0':` +
+      `x1='W-1-(${flipAmount})':y1='(${flipAmount})*0.10':` +
+      `x2='0':y2='H-1':` +
+      `x3='W-1':y3='H-1-(${flipAmount})*0.10':` +
+      `sense=destination:eval=frame:interpolation=cubic`;
+  }
+
+  return `${filter},setsar=1,format=yuv420p`;
+}
+
+function buildStablePanFilter({ width, height, frames, direction, motionStrength = .5, fps = 30, fit = "cover", backgroundColor = "0x000000" }) {
+  return buildCapCutMotionFilter({
+    width,
+    height,
+    frames,
+    animation: direction === "right" ? "右拉镜" : "左拉镜",
+    motionStrength,
+    fps,
+    fit,
+    backgroundColor
+  });
+}
+
+function buildImageMotionFilter({
+  fitted, width, height, frames, animation, motionStrength = .5, dynamicScene = false,
+  sceneIndex = 1, fps = 30, fit = "cover", backgroundColor = "0x000000"
+}) {
+  // fitted 参数仅为兼容旧调用保留；新动画引擎会直接在高分辨率工作画布上完成适配。
+  void fitted;
+  return buildCapCutMotionFilter({
+    width,
+    height,
+    frames,
+    animation,
+    motionStrength,
+    dynamicScene,
+    sceneIndex,
+    fps,
+    fit,
+    backgroundColor
+  });
 }
 
 function normalizedGain(value, fallback) {
@@ -351,6 +421,7 @@ async function renderVideo({
   app, config, scenes, outputDir, ratio, bgmPath, template = {}, videoIntro = 0,
   forceRebuild = false, outputName = "final.mp4", renderOptions = {}, title = "", subtitle = "", onProgress = () => {}
 }) {
+  if (!Array.isArray(scenes) || !scenes.length) throw new Error("至少需要一个场景");
   const ffmpeg = ffmpegPath(app, config);
   const fallbackSize = imageSize(ratio);
   const width = even(Number(template.canvas?.width || fallbackSize.width));
@@ -358,8 +429,7 @@ async function renderVideo({
   const imageConfig = { ...(template.image || {}), ...(renderOptions.image || {}) };
   const selectedAnimation = renderOptions.animation || imageConfig.animation || "无动画";
   const selectedStrength = renderOptions.motionStrength ?? imageConfig.motionStrength ?? 1;
-  const smoothPanMode = ["左拉镜", "右拉镜", "交替拉镜"].includes(String(selectedAnimation));
-  const renderFps = smoothPanMode ? 60 : 30;
+  const renderFps = 30;
   const forceStaticImages = renderOptions.forceStaticImages !== false;
   const regionTop = Math.max(0, Math.min(height - 2, Math.round(Number(imageConfig.top || 0) * height / 2) * 2));
   const regionHeight = Math.max(2, Math.min(height - regionTop, even(Number(imageConfig.height || 1) * height)));
@@ -412,7 +482,9 @@ async function renderVideo({
         motionStrength: selectedStrength,
         dynamicScene,
         sceneIndex: scene.index,
-        fps: renderFps
+        fps: renderFps,
+        fit: imageConfig.fit === "contain" ? "contain" : "cover",
+        backgroundColor: ffBackgroundColor
       });
     }
     const useBackgroundImage = backgroundImage && fs.existsSync(backgroundImage);
@@ -426,8 +498,9 @@ async function renderVideo({
     if (useBackgroundImage) clipArgs.push("-loop", "1", "-framerate", String(renderFps), "-i", backgroundImage);
     else clipArgs.push("-f", "lavfi", "-i", `color=c=${ffBackgroundColor}:s=${width}x${height}:r=${renderFps}`);
     clipArgs.push(
+      "-filter_complex_threads", "2",
       "-t", Number(scene.duration || 0).toFixed(3), "-filter_complex", filter, "-map", "[v]", "-map", "1:a",
-      "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-r", String(renderFps),
+      "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-threads", "4", "-r", String(renderFps),
       "-c:a", "aac", "-b:a", "160k", "-shortest", clip
     );
     await spawnAsync(ffmpeg, clipArgs);
@@ -462,7 +535,7 @@ async function renderVideo({
     const total = scenes.reduce((n, s) => n + Number(s.duration || 0), 0);
     args.push("-stream_loop", "-1", "-i", bgmPath);
     args.push("-filter_complex",
-      `[0:a]volume=${narrationGain}[a0];[1:a]volume=${bgmGain},afade=t=out:st=${Math.max(0, total - fadeSeconds)}:d=${fadeSeconds}[a1];[a0][a1]amix=inputs=2:duration=first[a]`,
+      `[0:a]volume=${narrationGain}[a0];[1:a]volume=${bgmGain},afade=t=out:st=${Math.max(0, total - fadeSeconds)}:d=${fadeSeconds}[a1];[a0][a1]amix=inputs=2:duration=first:normalize=0[a]`,
       "-map", "0:v", "-map", "[a]");
   } else {
     args.push("-map", "0:v", "-map", "0:a");
@@ -470,7 +543,7 @@ async function renderVideo({
   onProgress({ phase: "overlay", current: scenes.length, total: scenes.length });
   args.push(
     "-vf", `ass='${escapeFilterPath(assPath)}'`,
-    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-r", String(renderFps),
+    "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", "4", "-r", String(renderFps),
     "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", "-shortest", finalVideo
   );
   await spawnAsync(ffmpeg, args);
@@ -480,7 +553,6 @@ async function renderVideo({
 async function renderMusicVideo({ app, config, audioPath, images, lyrics, outputDir, ratio }) {
   if (!images.length) throw new Error("至少选择一张图片");
   const ffmpeg = ffmpegPath(app, config);
-  const { mediaDuration } = require("./services.cjs");
   const totalDuration = await mediaDuration(app, config, audioPath);
   const { width, height } = imageSize(ratio);
   const renderDir = path.join(outputDir, "render");
@@ -492,7 +564,9 @@ async function renderMusicVideo({ app, config, audioPath, images, lyrics, output
     const frames = Math.max(1, Math.ceil(eachDuration * 30));
     await spawnAsync(ffmpeg, [
       "-y", "-loop", "1", "-i", images[index], "-t", eachDuration.toFixed(3),
-      "-vf", `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height},zoompan=z='min(zoom+0.0006,1.07)':d=${frames}:s=${width}x${height}:fps=30,format=yuv420p`,
+      "-vf", buildImageMotionFilter({
+        width, height, frames, animation: "缩放", motionStrength: .5, fps: 30, fit: "cover", backgroundColor: "0x000000"
+      }),
       "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-an", clip
     ]);
     clips.push(clip);
@@ -507,7 +581,7 @@ async function renderMusicVideo({ app, config, audioPath, images, lyrics, output
   if (lyricLines.length) {
     const duration = totalDuration / lyricLines.length;
     subtitlePath = path.join(outputDir, "lyrics.srt");
-    fs.writeFileSync(subtitlePath, lyricLines.map((line, index) =>
+    atomicWriteFile(subtitlePath, lyricLines.map((line, index) =>
       `${index + 1}\n${srtTime(index * duration)} --> ${srtTime((index + 1) * duration)}\n${line}\n`
     ).join("\n"), "utf8");
   }
