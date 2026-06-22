@@ -19,6 +19,7 @@ contextBridge.exposeInMainWorld("storybound", {
   saveConfig: (config) => ipcRenderer.invoke("config:save", config),
   testConfig: (kind, config) => ipcRenderer.invoke("config:test", kind, config),
   runDiagnostics: () => ipcRenderer.invoke("diagnostics:run"),
+  runNonImageTests: (target) => ipcRenderer.invoke("tests:runNonImage", target),
   getTemplates: () => ipcRenderer.invoke("templates:list"),
   saveDraftTemplate: (input) => ipcRenderer.invoke("templates:save", input),
   deleteDraftTemplate: (id) => ipcRenderer.invoke("templates:delete", id),

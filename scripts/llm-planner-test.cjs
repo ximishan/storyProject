@@ -43,6 +43,7 @@ const { planVideoScript } = require("../electron/llm-planner.cjs");
         {
           index: 1,
           narration: "1938年，他离开车站。",
+          caption_segments: ["1938年", "他离开车站"],
           visual: "青年提着皮箱走出车站",
           desc_prompt: "青年提着旧皮箱走出木质车站，中景",
           use_reference: true,
@@ -54,6 +55,7 @@ const { planVideoScript } = require("../electron/llm-planner.cjs");
         {
           index: 2,
           narration: "雨中的老街空无一人。",
+          caption_segments: ["雨中的老街", "空无一人"],
           visual: "雨夜老街空镜",
           desc_prompt: "空无一人的石板老街，雨水反光，远景",
           use_reference: false,
@@ -111,6 +113,7 @@ const { planVideoScript } = require("../electron/llm-planner.cjs");
     assert.equal(result.subtitle.length, 2);
     assert.equal(result.tags[0], "#人物故事");
     assert.equal(result.scenes.length, 2);
+    assert.deepEqual(result.scenes[0].caption_segments, ["1938年", "他离开车站"]);
     assert.equal(result.scenes[0].use_reference, true);
     assert.equal(result.scenes[1].use_reference, false);
     assert.match(result.scenes[0].image_prompt, /清瘦长脸/);

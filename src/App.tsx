@@ -9,7 +9,7 @@ import {
 import systemPromptTemplatesData from "../shared/system-prompt-templates.json";
 import { DEFAULT_VOLC_VOICE_ID, VOLC_VOICES, type VolcVoiceOption } from "./volcVoices";
 
-type Page = "tasks" | "history" | "create" | "playground" | "voice" | "music" | "templates" | "styles" | "drafts" | "settings";
+type Page = "tasks" | "history" | "create" | "playground" | "voice" | "music" | "tests" | "templates" | "styles" | "drafts" | "settings";
 type SettingsTab = "llm" | "image" | "tts" | "output" | "diagnostics";
 
 const nav = [
@@ -19,6 +19,7 @@ const nav = [
   { page: "playground" as Page, label: "图片实验室", icon: Image },
   { page: "voice" as Page, label: "配音实验室", icon: Mic2 },
   { page: "music" as Page, label: "音乐 MV", icon: Music },
+  { page: "tests" as Page, label: "功能测试", icon: CheckCircle2 },
   { page: "templates" as Page, label: "提示词模板", icon: FileText },
   { page: "styles" as Page, label: "视觉风格", icon: Palette },
   { page: "drafts" as Page, label: "草稿模板", icon: LayoutTemplate }
@@ -95,6 +96,7 @@ export default function App() {
       {page === "playground" && <ImagePlayground />}
       {page === "voice" && <VoiceLab />}
       {page === "music" && <MusicMv />}
+      {page === "tests" && <NonImageTests />}
       {page === "templates" && <PromptTemplates />}
       {page === "styles" && <VisualStyles />}
     </main>
@@ -380,7 +382,7 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
         <label>片头标题显示时长：{renderOptions.titleDuration.toFixed(1)} 秒
           <input type="range" min="0" max="8" step="0.2" value={renderOptions.titleDuration} onChange={event => setRenderOptions(current => ({ ...current, titleDuration: Number(event.target.value) }))} />
         </label>
-        <div className="prompt-safety-note">主标题和副标题只在片头显示；旁白字幕会按标点拆成每次最多两行。图片动画采用剪映风格关键帧、连续缓入缓出与高分辨率超采样渲染；运镜强度只改变幅度，不会切换算法。</div>
+        <div className="prompt-safety-note">主标题和副标题只在片头显示；旁白字幕会按语义拆成单行短句，并跟随配音逐段显示。图片动画采用剪映风格关键帧、连续缓入缓出与高分辨率超采样渲染；运镜强度只改变幅度，不会切换算法。</div>
       </EditorModal>}
       {pipeline?.scenes?.length ? <div className="scene-list">
         <h3>分镜工作台 · {pipeline.scenes.length} 镜</h3>
@@ -470,6 +472,7 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
   const [videoIntroDuration, setVideoIntroDuration] = useState(0);
   const [templateId, setTemplateId] = useState("default-portrait-9-16");
   const [referenceImagePath, setReferenceImagePath] = useState("");
+  const [characterConsistencyMode, setCharacterConsistencyMode] = useState<"off" | "upload" | "auto">("off");
   const [coverImageMode, setCoverImageMode] = useState("off");
   const [coverTemplateId, setCoverTemplateId] = useState("cinematic-poster");
   const [processingMode, setProcessingMode] = useState("auto");
@@ -569,6 +572,7 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
         keepPromotion: normalizedProcessingMode === "auto" ? keepPromotion : true,
         materialSource, templateId,
         referenceImagePath: materialSource === "ai" ? referenceImagePath : "",
+        characterConsistencyMode: materialSource === "ai" ? characterConsistencyMode : "off",
         coverImageMode: effectiveCoverMode, coverTemplateId,
         pauseMode: effectivePause,
         sourceMode, sourceQuery, sourceRequirements, bgmId, speaker,
@@ -665,7 +669,13 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
         <OptionGroup title="草稿模板"><div className="template-choice-grid">{draftTemplates.map(item => { const cfg = JSON.parse(item.config); return <Choice key={item.id} active={templateId === item.id} onClick={() => chooseTemplate(item.id)} title={`${item.is_default ? "★ " : ""}${item.name}`} desc={`出图 ${cfg.image?.ratio || cfg.canvas?.ratio}`} />; })}<button className="choice-chip" onClick={onManageTemplates}><Plus size={14} />管理模板</button></div></OptionGroup>
         <OptionGroup title="AI 出图比例" hint={templateId ? "已跟随草稿模板" : "请选择画面比例"}><Choice active={ratio === "9:16"} onClick={() => setRatio("9:16")} title="9:16" desc="竖屏" /><Choice active={ratio === "4:3"} onClick={() => setRatio("4:3")} title="4:3" desc="标准" /><Choice active={ratio === "1:1"} onClick={() => setRatio("1:1")} title="1:1" desc="方形" /><Choice active={ratio === "16:9"} onClick={() => setRatio("16:9")} title="16:9" desc="横屏" /></OptionGroup>
         <p className="form-hint">选模板时自动同步图片比例。如需自定义，请去草稿模板编辑器调整图片区域比例。</p>
-        {materialSource === "ai" && <div className="reference-row"><div><b>主角参考图</b><small>可选 · 出现主角的分镜会以参考图保持人物一致{referenceImagePath ? ` · ${referenceImagePath.split(/[\\/]/).pop()}` : ""}</small></div><div className="reference-actions"><button className="reference-upload-empty" onClick={async () => { const selected = await window.storybound.selectImage(); if (selected) setReferenceImagePath(selected); }}><Upload size={15} />{referenceImagePath ? "更换参考图" : "上传主角参考图"}</button>{referenceImagePath && <button className="icon-btn" title="移除参考图" onClick={() => setReferenceImagePath("")}><X size={15} /></button>}</div></div>}
+        {materialSource === "ai" && <OptionGroup title="人物一致性" hint="系统九宫格只调用一次图片接口，再在本地裁成青年、中年、老年各三个角度">
+          <Choice active={characterConsistencyMode === "off"} onClick={() => { setCharacterConsistencyMode("off"); setReferenceImagePath(""); }} title="关闭" />
+          <Choice active={characterConsistencyMode === "upload"} onClick={() => setCharacterConsistencyMode("upload")} title="上传参考图" />
+          <Choice active={characterConsistencyMode === "auto"} onClick={() => { setCharacterConsistencyMode("auto"); setReferenceImagePath(""); }} title="系统九宫格人物卡" badge="省图" />
+        </OptionGroup>}
+        {materialSource === "ai" && characterConsistencyMode === "upload" && <div className="reference-row"><div><b>主角参考图</b><small>出现主角的分镜会以参考图保持人物一致{referenceImagePath ? ` · ${referenceImagePath.split(/[\\/]/).pop()}` : ""}</small></div><div className="reference-actions"><button className="reference-upload-empty" onClick={async () => { const selected = await window.storybound.selectImage(); if (selected) setReferenceImagePath(selected); }}><Upload size={15} />{referenceImagePath ? "更换参考图" : "上传主角参考图"}</button>{referenceImagePath && <button className="icon-btn" title="移除参考图" onClick={() => setReferenceImagePath("")}><X size={15} /></button>}</div></div>}
+        {materialSource === "ai" && characterConsistencyMode === "auto" && <p className="form-hint">系统会先根据主角档案生成一张 3×3 定妆图：青年、中年、老年各三个角度，再按分镜年龄自动引用对应人物。</p>}
       </CreateSection>
 
       {materialSource === "ai" && <CreateSection title="封面海报" desc="发布时上传的封面，独立于正片">
@@ -1107,6 +1117,48 @@ function DiagnosticsPage() {
       {result.logPath && <button onClick={() => window.storybound.showInFolder(result.logPath)}><FileText size={15} />定位运行日志</button>}
     </div>}
   </>;
+}
+
+function NonImageTests() {
+  type Target = "all" | "storage" | "subtitle" | "llm" | "tts" | "ffmpeg";
+  type Result = { id: string; label: string; ok: boolean; detail: string; elapsed_ms: number };
+  const [running, setRunning] = useState<Target | "">("");
+  const [results, setResults] = useState<Result[]>([]);
+  const [skipped, setSkipped] = useState<string[]>([]);
+  const tests: Array<{ id: Exclude<Target, "all">; title: string; desc: string }> = [
+    { id: "storage", title: "数据库与目录", desc: "检查数据库读取和应用目录写入" },
+    { id: "subtitle", title: "语义字幕", desc: "检查模型分段数据、去标点和真实时间轴" },
+    { id: "llm", title: "语言模型", desc: "发送最小请求，验证当前 LLM 配置" },
+    { id: "tts", title: "配音服务", desc: "生成一小段测试语音并验证音频时长" },
+    { id: "ffmpeg", title: "媒体处理", desc: "检查 FFmpeg 与后续音视频处理环境" }
+  ];
+  const run = async (target: Target) => {
+    setRunning(target);
+    try {
+      const response = await window.storybound.runNonImageTests(target);
+      setResults(current => target === "all"
+        ? response.results
+        : [...current.filter(item => item.id !== target), ...response.results]);
+      setSkipped(response.skipped);
+    } finally {
+      setRunning("");
+    }
+  };
+  return <section>
+    <PageHeader eyebrow="SYSTEM TESTS" title="功能测试" desc="测试文案、字幕、配音和媒体环境；不会调用任何图片接口，也不会消耗图片额度。"
+      actions={<button className="primary" disabled={Boolean(running)} onClick={() => run("all")}>{running === "all" ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}运行全部非图片测试</button>} />
+    <div className="diagnostics-list diagnostic-grid">
+      {tests.map(test => {
+        const result = results.find(item => item.id === test.id);
+        return <div key={test.id} className={result ? (result.ok ? "ok" : "bad") : ""}>
+          <span>{result ? (result.ok ? "✓" : "×") : "○"}</span>
+          <div><b>{test.title}</b><small>{result?.detail || test.desc}{result ? ` · ${result.elapsed_ms}ms` : ""}</small></div>
+          <button disabled={Boolean(running)} onClick={() => run(test.id)}>{running === test.id ? "测试中…" : "单独测试"}</button>
+        </div>;
+      })}
+    </div>
+    <div className="info-box">明确跳过：{(skipped.length ? skipped : ["图片生成", "参考图编辑", "动态图片/视频接口"]).join("、")}。</div>
+  </section>;
 }
 
 function VoiceLab() {

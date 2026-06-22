@@ -1558,14 +1558,20 @@ async function generateNetworkImage({ app, config, prompt, destination, ratio })
 async function generateSceneImage(args) {
   if (args.materialSource === "network") return generateNetworkImage(args);
   const provider = args.config.image_provider || "placeholder";
-  if (provider === "runninghub") return generateRunningHubImage(args);
-  if (args.referenceImagePath && fs.existsSync(args.referenceImagePath) && provider !== "placeholder") {
+  const referencePaths = normalizeReferenceImagePaths(args.referenceImagePath);
+  if (provider === "runninghub") {
+    return generateRunningHubImage({
+      ...args,
+      referenceImagePath: referencePaths[0] || ""
+    });
+  }
+  if (referencePaths.length && provider !== "placeholder") {
     return generateReferenceImage({ ...args, provider });
   }
-  if (args.referenceImagePath && fs.existsSync(args.referenceImagePath) && provider === "placeholder") {
+  if (referencePaths.length && provider === "placeholder") {
     const { width, height } = imageSize(args.ratio);
     await spawnAsync(ffmpegPath(args.app, args.config), [
-      "-y", "-i", args.referenceImagePath,
+      "-y", "-i", referencePaths[0],
       "-vf", `scale=${width}:${height}:force_original_aspect_ratio=increase,crop=${width}:${height}`,
       "-frames:v", "1", args.destination
     ]);

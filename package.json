@@ -24,6 +24,8 @@
     "test:image-response": "node scripts/image-response-format-test.cjs",
     "test:image-poll-url": "node scripts/image-poll-url-test.cjs",
     "test:motion": "node scripts/motion-render-test.cjs",
+    "test:caption": "node scripts/caption-punctuation-test.cjs",
+    "test:character-db": "electron scripts/character-consistency-db-test.cjs",
     "test:prompts": "node scripts/prompt-template-integration-test.cjs"
   },
   "dependencies": {

@@ -264,6 +264,17 @@ export function installBrowserMock() {
     saveConfig: async (next) => (config = next),
     testConfig: async () => ({ ok: true, message: "浏览器预览连接正常" }),
     runDiagnostics: async () => ({ checks: [{ name: "浏览器预览", ok: true }], logPath: "", dataPath: "" }),
+    runNonImageTests: async target => ({
+      results: [{
+        id: target === "all" || !target ? "subtitle" : target,
+        label: "浏览器模拟测试",
+        ok: true,
+        detail: "浏览器模式未调用本地服务",
+        elapsed_ms: 0
+      }],
+      skipped: ["图片生成", "参考图编辑", "动态图片/视频接口"],
+      finished_at: Date.now()
+    }),
     getTemplates: async () => [...draftTemplates],
     saveDraftTemplate: async input => {
       const item = { id: input.id || crypto.randomUUID(), is_default: 0, ...input } as DraftTemplate;

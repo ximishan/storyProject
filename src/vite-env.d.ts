@@ -18,6 +18,11 @@ interface StoryboundApi {
   saveConfig(config: AppConfig): Promise<AppConfig>;
   testConfig(kind: string, config: AppConfig): Promise<{ ok: boolean; message: string; provider?: string; dataUrl?: string }>;
   runDiagnostics(): Promise<{ checks: Array<{ name: string; ok: boolean }>; logPath: string; dataPath: string }>;
+  runNonImageTests(target?: "all" | "storage" | "subtitle" | "llm" | "tts" | "ffmpeg"): Promise<{
+    results: Array<{ id: string; label: string; ok: boolean; detail: string; elapsed_ms: number }>;
+    skipped: string[];
+    finished_at: number;
+  }>;
   getTemplates(): Promise<DraftTemplate[]>;
   saveDraftTemplate(input: Partial<DraftTemplate> & { name: string; config: string }): Promise<DraftTemplate>;
   deleteDraftTemplate(id: string): Promise<void>;
@@ -99,6 +104,7 @@ interface TaskRecord {
   target_length?: number;
   template_id?: string;
   reference_image_path?: string;
+  character_consistency_mode?: string;
   cover_image_mode?: string;
   cover_template_id?: string;
   cover_path?: string;
@@ -144,6 +150,7 @@ interface CreateTaskInput {
   targetLength?: number;
   templateId?: string;
   referenceImagePath?: string;
+  characterConsistencyMode?: "off" | "upload" | "auto";
   coverImageMode?: string;
   coverTemplateId?: string;
   pauseMode?: string;

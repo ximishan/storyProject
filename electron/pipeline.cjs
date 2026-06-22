@@ -2,7 +2,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const {
   generateSceneImage, generateRunningHubVideo, synthesizeSpeech,
-  mediaDuration, resolveResource
+  mediaDuration, resolveResource, spawnAsync, ffmpegPath
 } = require("./services.cjs");
 const { renderVideo } = require("./media.cjs");
 const { generateJianyingDraft } = require("./draft.cjs");
@@ -108,6 +108,113 @@ function subtitleText(script) {
     ? script.subtitle.map(item => String(item || "").trim()).filter(Boolean)
     : [];
   return subtitle.length ? subtitle.join("\n") : String(script?.summary || "");
+}
+
+function characterCardPrompt(script) {
+  const card = script?.metadata?.character_card || {};
+  return String(card.stable_prompt || card.identity || "").trim();
+}
+
+function sceneAgeStage(scene) {
+  const text = `${scene?.narration || ""} ${scene?.era_and_location || ""} ${scene?.image_prompt || ""}`;
+  if (/老年|晚年|暮年|白发|年迈|六十|七十|八十|九十|去世|临终/.test(text)) return "old";
+  if (/青年|年轻|少年|求学|大学|二十|三十|初入|刚刚/.test(text)) return "young";
+  return "middle";
+}
+
+function generatedReferencePaths(script, scene) {
+  const selected = script?.runtime?.character_reference_groups?.[sceneAgeStage(scene)];
+  return Array.isArray(selected) ? selected.filter(item => usableAsset(item, 256)).join(";") : "";
+}
+
+async function ensureCharacterReferenceGrid({ app, task, config, outputDir, script, emit, persist }) {
+  if (task.character_consistency_mode !== "auto" || task.reference_image_path) return;
+  const stablePrompt = characterCardPrompt(script);
+  if (!stablePrompt) return;
+
+  const characterDir = path.join(outputDir, "character-reference");
+  const gridPath = path.join(characterDir, "character-grid.png");
+  fs.mkdirSync(characterDir, { recursive: true });
+  const groups = { young: [], middle: [], old: [] };
+  for (const [row, stage] of ["young", "middle", "old"].entries()) {
+    for (let column = 0; column < 3; column += 1) {
+      groups[stage].push(path.join(characterDir, `${stage}-${column + 1}.png`));
+    }
+  }
+  if (Object.values(groups).flat().every(item => usableAsset(item, 256))) {
+    persist({ character_reference_grid: gridPath, character_reference_groups: groups });
+    return;
+  }
+
+  if (!usableAsset(gridPath, 512)) {
+    emit(4, "正在生成主角九宫格定妆参考图（仅调用一次图片接口）");
+    const prompt = `${stablePrompt}。生成一张严格3×3九宫格人物设定图，同一个人物贯穿全部九格，骨相、五官、身份特征完全一致。第一行青年，第二行中年，第三行老年；每行依次为正面、左侧45度、右侧45度半身肖像。年龄只按行变化，每行发型与服装统一，纯净中性背景，均匀棚拍光线，五官清晰无遮挡，无文字，无水印，无额外人物。`;
+    await generateSceneImage({
+      app, config, prompt, destination: gridPath, ratio: "1:1", index: "character-grid",
+      materialSource: "ai", referenceImagePath: "", requestId: `storybound-${task.id}-character-grid`
+    });
+  }
+
+  emit(4, "正在本地裁切青年、中年、老年人物参考图");
+  for (const [row, stage] of ["young", "middle", "old"].entries()) {
+    for (let column = 0; column < 3; column += 1) {
+      const destination = groups[stage][column];
+      if (usableAsset(destination, 256)) continue;
+      await spawnAsync(ffmpegPath(app, config), [
+        "-y", "-i", gridPath,
+        "-vf", `crop=iw/3:ih/3:${column}*iw/3:${row}*ih/3`,
+        "-frames:v", "1", destination
+      ]);
+    }
+  }
+  persist({ character_reference_grid: gridPath, character_reference_groups: groups });
+}
+
+function sceneVoiceSegments(scene) {
+  const values = Array.isArray(scene.caption_segments)
+    ? scene.caption_segments.map(item => String(item || "").trim()).filter(Boolean)
+    : [];
+  return values.length ? values : [String(scene.narration || "").trim()].filter(Boolean);
+}
+
+async function synthesizeSegmentedScene({ app, config, scene, task, audioDir, destination }) {
+  const segments = sceneVoiceSegments(scene);
+  if (segments.length === 1) {
+    await synthesizeSpeech({
+      app, config, text: segments[0], destination,
+      speed: Number(task.tts_speed || 1),
+      speaker: task.task_type === "podcast" ? scene.speaker_id : task.speaker
+    });
+    const duration = await mediaDuration(app, config, destination);
+    scene.caption_timings = [{ text: segments[0], start: 0, end: duration }];
+    return duration;
+  }
+
+  const segmentDir = path.join(audioDir, `scene-${scene.index}-segments`);
+  fs.mkdirSync(segmentDir, { recursive: true });
+  const extension = path.extname(destination) || ".wav";
+  const files = [];
+  const timings = [];
+  let cursor = 0;
+  for (let index = 0; index < segments.length; index += 1) {
+    const segmentPath = path.join(segmentDir, `${String(index + 1).padStart(3, "0")}${extension}`);
+    await synthesizeSpeech({
+      app, config, text: segments[index], destination: segmentPath,
+      speed: Number(task.tts_speed || 1),
+      speaker: task.task_type === "podcast" ? scene.speaker_id : task.speaker
+    });
+    const duration = await mediaDuration(app, config, segmentPath);
+    timings.push({ text: segments[index], start: cursor, end: cursor + duration });
+    cursor += duration;
+    files.push(segmentPath);
+  }
+  const concatList = path.join(segmentDir, "concat.txt");
+  atomicWriteFile(concatList, files.map(file => `file '${file.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`).join("\n"), "utf8");
+  await spawnAsync(ffmpegPath(app, config), [
+    "-y", "-f", "concat", "-safe", "0", "-i", concatList, "-c", "copy", destination
+  ]);
+  scene.caption_timings = timings;
+  return await mediaDuration(app, config, destination);
 }
 
 function writePublishAssets(outputDir, script) {
@@ -226,6 +333,7 @@ async function completePipeline({ app, task, config, outputDir, script, emit, ch
     });
     return snapshot;
   };
+  await ensureCharacterReferenceGrid({ app, task, config, outputDir, script, emit, persist });
   persist({ current_stage: "images", current_step: 4, detail: "检查图片断点" });
 
   const singlePodcastImage = task.task_type === "podcast" && task.podcast_image_mode === "single";
@@ -282,7 +390,9 @@ async function completePipeline({ app, task, config, outputDir, script, emit, ch
           ratio: task.ratio,
           index: scene.index,
           materialSource: task.material_source,
-          referenceImagePath: scene.use_reference ? (task.reference_image_path || "") : "",
+          referenceImagePath: scene.use_reference
+            ? (task.reference_image_path || generatedReferencePaths({ ...script, runtime }, scene))
+            : "",
           resumeTaskId: scene.image_remote_task_id || "",
           requestId,
           onRemoteTask: remote => {
@@ -365,13 +475,8 @@ async function completePipeline({ app, task, config, outputDir, script, emit, ch
       const audioExt = config.tts?.provider === "system" ? "wav" : "mp3";
       const audioPath = path.join(audioDir, `${scene.index}.${audioExt}`);
       try {
-        await retryOperation(async () => synthesizeSpeech({
-          app,
-          config,
-          text: scene.narration,
-          destination: audioPath,
-          speed: Number(task.tts_speed || 1),
-          speaker: task.task_type === "podcast" ? scene.speaker_id : task.speaker
+        await retryOperation(async () => synthesizeSegmentedScene({
+          app, config, scene, task, audioDir, destination: audioPath
         }), {
           attempts: 3,
           onRetry: (error, attempt, delay) => {
@@ -630,7 +735,10 @@ async function regenerateScene({ app, task, config, outputDir, script, sceneInde
       app, config,
       prompt: requestSafety.prompt,
       destination: imagePath, ratio: task.ratio, index: scene.index,
-      materialSource: task.material_source, referenceImagePath: scene.use_reference ? (task.reference_image_path || "") : "",
+      materialSource: task.material_source,
+      referenceImagePath: scene.use_reference
+        ? (task.reference_image_path || generatedReferencePaths(script, scene))
+        : "",
       resumeTaskId: resumeImageTaskId,
       requestId: `storybound-${task.id}-image-${scene.index}-${Date.now()}`,
       onRemoteTask: remote => {
@@ -666,7 +774,11 @@ async function regenerateScene({ app, task, config, outputDir, script, sceneInde
     const extension = config.tts?.provider === "system" ? "wav" : "mp3";
     const audioPath = path.join(outputDir, "audio", `${scene.index}.${extension}`);
     scene.audio_status = "running";
-    await synthesizeSpeech({ app, config, text: scene.narration, destination: audioPath, speed: Number(task.tts_speed || 1), speaker: task.task_type === "podcast" ? scene.speaker_id : task.speaker });
+    await synthesizeSegmentedScene({
+      app, config, scene, task,
+      audioDir: path.join(outputDir, "audio"),
+      destination: audioPath
+    });
     scene.audio_path = audioPath;
     scene.duration = await mediaDuration(app, config, audioPath);
     scene.audio_status = "completed";

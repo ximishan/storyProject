@@ -62,6 +62,7 @@ const SCENE_BASE_PROMPT = `你是专业短视频分镜师和图片提示词工�
     {
       "index": 1,
       "narration": "本镜对应的原始旁白，不能漏字或重复",
+      "caption_segments": ["6到12字的完整语义字幕", "不得拆开词语"],
       "visual": "给人看的简洁画面说明",
       "desc_prompt": "只描述本镜主体、动作、环境、镜头、光线和关键细节的中文提示词",
       "use_reference": true,
@@ -132,7 +133,7 @@ function buildMechanicalScript(task, sourceText = task.input_text, template = {}
     : splitSourceText(sourceText, task.target_scenes).map((text, index) => ({ role: index % 2 ? "B" : "A", text }));
   if (!chunks.length) throw new Error("原始文案为空");
   const referenceKind = normalizeReferenceKind(template.reference_kind);
-  const hasReference = Boolean(task.reference_image_path);
+  const hasReference = Boolean(task.reference_image_path || task.character_consistency_mode === "auto");
   const scenes = chunks.map((item, index) => {
     const useReference = localReferenceDecision(item.text, referenceKind, hasReference);
     const rawImagePrompt = `${task.style}风格，${item.text}，主体明确，构图完整，适合${task.ratio}短视频画面，无文字无水印`;
@@ -723,9 +724,24 @@ function normalizeMetadata(raw, template) {
   };
 }
 
+function captionComparable(text) {
+  return String(text || "").replace(/·/gu, "\uE000").replace(/\p{P}|\s/gu, "").replace(/\uE000/gu, "·");
+}
+
+function normalizeCaptionSegments(narration, segments) {
+  const values = Array.isArray(segments)
+    ? segments.map(item => String(item || "").trim()).filter(Boolean)
+    : [];
+  if (!values.length) return [];
+  const cleaned = values.map(item =>
+    item.replace(/·/gu, "\uE000").replace(/^[\p{P}\s]+|[\p{P}\s]+$/gu, "").replace(/\uE000/gu, "·")
+  ).filter(Boolean);
+  return captionComparable(cleaned.join("")) === captionComparable(narration) ? cleaned : [];
+}
+
 function normalizeScene(scene, index, task, metadata, template, modules) {
   const referenceKind = normalizeReferenceKind(template.reference_kind);
-  const hasReference = Boolean(task.reference_image_path);
+  const hasReference = Boolean(task.reference_image_path || task.character_consistency_mode === "auto");
   const subjectPresence = ["character", "product", "both", "none"].includes(scene.subject_presence)
     ? scene.subject_presence : "none";
   const kindMatches = referenceKind === "auto"
@@ -741,6 +757,7 @@ function normalizeScene(scene, index, task, metadata, template, modules) {
   const normalized = {
     index: index + 1,
     narration: String(scene.narration || ""),
+    caption_segments: normalizeCaptionSegments(scene.narration, scene.caption_segments),
     visual: String(scene.visual || scene.desc_prompt || ""),
     desc_prompt: descSafety.prompt,
     desc_prompt_original: descSafety.adjusted ? rawDescPrompt : "",
@@ -748,7 +765,7 @@ function normalizeScene(scene, index, task, metadata, template, modules) {
     use_reference: useReference,
     reference_reason: hasReference
       ? String(scene.reference_reason || (useReference ? "本镜出现需要保持一致的主体" : "本镜不需要参考图"))
-      : "任务未上传参考图",
+      : task.character_consistency_mode === "auto" ? "任务将自动生成人物九宫格参考图" : "任务未上传参考图",
     subject_presence: subjectPresence,
     era_and_location: String(scene.era_and_location || ""),
     duration_hint: Number(scene.duration_hint) || Math.max(3, Math.min(12, String(scene.narration || "").length / 4.2)),
@@ -774,7 +791,8 @@ function buildMetadataUserPrompt(task, template, content, characterMode, referen
 }
 
 function buildSceneUserPrompt(task, template, content, metadata, modules, seedPools, referenceKind) {
-  const referenceRule = template.reference_decision_prompt || "只有镜头中清晰出现主角/产品且保持身份外观一致有价值时，use_reference 才能为 true；环境、空镜、器物特写和资料画面设为 false。";
+  const captionRule = "字幕语义分段硬规则：每个场景必须输出 caption_segments。优先按 narration 原有标点切分；每段建议 6-12 个汉字，必须是完整词语、完整短语或完整语义，禁止按固定字数切断姓名、动词或名词。显示时删除普通标点，但姓名间隔点“·”必须保留。所有分段拼接并去掉普通标点后，必须与 narration 正文完全一致。";
+  const referenceRule = `${captionRule}\n${template.reference_decision_prompt || "只有镜头中清晰出现主角/产品且保持身份外观一致有价值时，use_reference 才能为 true；环境、空镜、器物特写和资料画面设为 false。"}`;
   return `内容类型：${task.track}\n视频形态：${task.task_type === "podcast" ? "双人播客；每个镜头必须输出 speaker_role(A/B)" : "单人旁白"}\n目标分镜数：${task.target_scenes || "根据旁白长度自动决定"}\n画面比例：${task.ratio}\n视觉风格：${task.style}\n参考图类型：${referenceKind}\n是否已上传参考图：${task.reference_image_path ? "是" : "否"}\n参考图判断标准：${referenceRule}\n分镜骨架模块：${JSON.stringify(modules)}\n图片种子池：${JSON.stringify(seedPools)}\n\n图片合规硬规则：\n涉及医疗救治、受伤、暴力或死亡的旁白，只能使用克制的替代画面。优先表现包扎后的状态、人物神情、环境、器械、布帘遮挡、中景或远景，不得描述开放性创口、流体细节、缝合过程、尸体细节或极近景微距。\n\n请严格执行 system 中的赛道分镜规则，最终输出格式只遵守 system 统一 scenes JSON 协议。\n\n元数据：\n${JSON.stringify(metadata, null, 2)}\n\n必须完整覆盖的旁白：\n${content.narration}`;
 }
 

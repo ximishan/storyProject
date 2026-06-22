@@ -5,8 +5,8 @@ const { openDatabase, createTask } = require("./database.cjs");
 const {
   runPipeline, preparePipeline, completePipeline, regenerateScene, renderPrepared, taskOutputDir
 } = require("./pipeline.cjs");
-const { generateSceneImage, synthesizeSpeech, testConnection, spawnAsync, listSystemVoices } = require("./services.cjs");
-const { renderMusicVideo } = require("./media.cjs");
+const { generateSceneImage, synthesizeSpeech, testConnection, spawnAsync, listSystemVoices, ffmpegPath, mediaDuration } = require("./services.cjs");
+const { renderMusicVideo, _captionTest } = require("./media.cjs");
 const { generateMusicDraft } = require("./draft.cjs");
 const crypto = require("node:crypto");
 const { atomicWriteJson } = require("./checkpoint.cjs");
@@ -256,6 +256,7 @@ ipcMain.handle("tasks:duplicate", (_event, id) => {
     narrativePov: task.narrative_pov, keepPromotion: task.keep_promotion,
     materialSource: task.material_source, targetLength: task.target_length,
     templateId: task.template_id, referenceImagePath: task.reference_image_path,
+    characterConsistencyMode: task.character_consistency_mode,
     coverImageMode: task.cover_image_mode, coverTemplateId: task.cover_template_id, pauseMode: task.pause_mode,
     sourceMode: task.source_mode, sourceQuery: task.source_query, sourceRequirements: task.source_requirements, bgmId: task.bgm_id,
     speaker: task.speaker, taskType: task.task_type, scriptFormat: task.script_format,
@@ -441,6 +442,63 @@ ipcMain.handle("diagnostics:run", async () => {
     logPath: path.join(app.getPath("userData"), "renderer.log"),
     dataPath: app.getPath("userData")
   };
+});
+ipcMain.handle("tests:runNonImage", async (_event, target = "all") => {
+  const config = readConfig();
+  const targets = target === "all" ? ["storage", "subtitle", "llm", "tts", "ffmpeg"] : [target];
+  const results = [];
+  const run = async (id, label, action) => {
+    if (!targets.includes(id)) return;
+    const started = Date.now();
+    try {
+      const detail = await action();
+      results.push({ id, label, ok: true, detail: String(detail || "通过"), elapsed_ms: Date.now() - started });
+    } catch (error) {
+      results.push({ id, label, ok: false, detail: String(error?.message || error), elapsed_ms: Date.now() - started });
+    }
+  };
+  await run("storage", "数据库与目录", async () => {
+    db.prepare("SELECT 1 AS ok").get();
+    const testDir = path.join(app.getPath("userData"), "non-image-tests");
+    fs.mkdirSync(testDir, { recursive: true });
+    const probe = path.join(testDir, "write-probe.txt");
+    fs.writeFileSync(probe, "ok", "utf8");
+    fs.rmSync(probe, { force: true });
+    return "数据库可读，应用数据目录可写";
+  });
+  await run("subtitle", "语义字幕", async () => {
+    const schedule = _captionTest.sceneCaptionSchedule({
+      duration: 3,
+      caption_segments: ["让所有人都不理解的决定", "带着一支医疗队"],
+      caption_timings: [
+        { text: "让所有人都不理解的决定", start: 0, end: 1.8 },
+        { text: "带着一支医疗队", start: 1.8, end: 3 }
+      ]
+    }, 12);
+    if (schedule.length !== 2 || schedule[1].start !== 1.8) throw new Error("字幕分段或真实时间轴未生效");
+    return "语义分段、去标点和真实时间轴正常";
+  });
+  await run("llm", "语言模型", async () => {
+    const result = await testConnection(config, "llm", app);
+    if (!result?.ok) throw new Error(result?.message || "LLM 测试失败");
+    return result.message;
+  });
+  await run("tts", "配音服务", async () => {
+    const testDir = path.join(app.getPath("userData"), "non-image-tests");
+    fs.mkdirSync(testDir, { recursive: true });
+    const extension = config.tts?.provider === "system" ? "wav" : "mp3";
+    const destination = path.join(testDir, `tts-test.${extension}`);
+    await synthesizeSpeech({ app, config, text: "这是一段非图片功能测试语音", speed: 1, destination });
+    const duration = await mediaDuration(app, config, destination);
+    if (!(duration > 0)) throw new Error("生成的测试音频无有效时长");
+    return `配音生成成功，时长 ${duration.toFixed(2)} 秒`;
+  });
+  await run("ffmpeg", "FFmpeg 与媒体处理", async () => {
+    const result = await spawnAsync(ffmpegPath(app, config), ["-version"]);
+    const firstLine = String(result.stdout || result.stderr || "").split(/\r?\n/)[0];
+    return firstLine || "FFmpeg 可用";
+  });
+  return { results, skipped: ["图片生成", "参考图编辑", "动态图片/视频接口"], finished_at: Date.now() };
 });
 ipcMain.handle("path:open", async (_event, target) => {
   if (!target || !fs.existsSync(target)) throw new Error("文件或目录不存在");
@@ -1035,4 +1093,3 @@ async function startPersistedQueue(ids) {
 
 ipcMain.handle("queue:run", async (_event, ids) => startPersistedQueue(ids));
 ipcMain.handle("queue:resume", async () => startPersistedQueue([]));
-

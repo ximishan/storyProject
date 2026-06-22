@@ -148,6 +148,7 @@ function migrateTasks(db) {
     ,["target_length", "INTEGER"]
     ,["template_id", "TEXT DEFAULT 'default-portrait-9-16'"]
     ,["reference_image_path", "TEXT DEFAULT ''"]
+    ,["character_consistency_mode", "TEXT DEFAULT 'off'"]
     ,["cover_image_mode", "TEXT DEFAULT 'off'"]
     ,["cover_template_id", "TEXT DEFAULT 'cinematic-poster'"]
     ,["cover_path", "TEXT DEFAULT ''"]
@@ -296,17 +297,18 @@ function createTask(db, input) {
     INSERT INTO tasks (
       id,title,input_text,track,style,ratio,target_scenes,tts_speed,prompt_template_id,
       rewrite_intensity,narrative_pov,keep_promotion,material_source,target_length,template_id,
-      reference_image_path,cover_image_mode,cover_template_id,pause_mode,source_mode,source_query,source_requirements,bgm_id,
+      reference_image_path,character_consistency_mode,cover_image_mode,cover_template_id,pause_mode,source_mode,source_query,source_requirements,bgm_id,
       speaker,task_type,script_format,podcast_image_mode,podcast_speakers,processing_mode,pause_points,
       video_intro,video_intro_duration,research_web,research_ai,research_ima
     )
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `).run(
     id, input.title, input.inputText, input.track, input.style, input.ratio,
     input.targetScenes ? Number(input.targetScenes) : null, Number(input.ttsSpeed || 1), input.promptTemplateId || "",
     input.rewriteIntensity || "standard", input.narrativePov || "original", input.keepPromotion ? 1 : 0,
     input.materialSource || "ai", input.targetLength ? Number(input.targetLength) : null,
     input.templateId || "default-portrait-9-16", input.referenceImagePath || "",
+    input.characterConsistencyMode || (input.referenceImagePath ? "upload" : "off"),
     coverImageMode, input.coverTemplateId || "cinematic-poster",
     input.pauseMode || "none", input.sourceMode || "paste", input.sourceQuery || "", input.sourceRequirements || "",
     input.bgmId || "builtin", input.speaker || "",

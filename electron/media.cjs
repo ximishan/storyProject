@@ -37,6 +37,16 @@ function stripCaptionTrailingPunctuation(text, { keepQuestionExclamation = true 
   return `${source}${closing}`.trim();
 }
 
+function stripCaptionDisplayPunctuation(text) {
+  return String(text || "")
+    // 姓名中的间隔点属于正文，例如“诺尔曼·白求恩”，不能按普通标点删除。
+    .replace(/·/gu, "\uE000")
+    .replace(/\p{P}+/gu, "")
+    .replace(/\uE000/gu, "·")
+    .replace(/\s+/g, "")
+    .trim();
+}
+
 function protectedCaptionRanges(text) {
   const source = String(text || "");
   const ranges = [];
@@ -74,11 +84,47 @@ function captionCutIndex(text, start, preferredEnd, hardEnd) {
     else if (rightEnd <= hardEnd) cut = rightEnd;
   }
 
+  // 优先在新分句或新动作之前切换字幕，避免“理解的决定带着一支医疗”这类粘连。
+  const semanticStarts = /(?:让|但|却|而|于是|随后|然后|后来|最终|带着|拿着|走进|走到|来到|开始|继续|转身|回到|奔向|钻进|钻入)/gu;
+  const semanticCandidates = [];
+  semanticStarts.lastIndex = start;
+  let semanticMatch;
+  while ((semanticMatch = semanticStarts.exec(source))) {
+    const candidate = semanticMatch.index;
+    if (candidate <= start + 3) continue;
+    if (candidate > hardEnd) break;
+    if (ranges.some(range => candidate > range.start && candidate < range.end)) continue;
+    semanticCandidates.push(candidate);
+    if (!semanticMatch[0].length) semanticStarts.lastIndex += 1;
+  }
+  if (semanticCandidates.length) {
+    cut = semanticCandidates.reduce((best, candidate) =>
+      Math.abs(preferredEnd - candidate) < Math.abs(preferredEnd - best) ? candidate : best
+    );
+  }
+
   // 在不破坏数字单位、人名等完整短语的前提下，优先在自然停顿位置换行。
   const minNatural = start + Math.max(4, Math.floor((preferredEnd - start) * 0.58));
   for (let index = cut - 1; index >= minNatural; index -= 1) {
     if (/[，、,；;：:\s]/u.test(source[index])) {
       const candidate = index + 1;
+      const splitsProtected = ranges.some(range => candidate > range.start && candidate < range.end);
+      if (!splitsProtected) {
+        cut = candidate;
+        break;
+      }
+    }
+  }
+
+  // 没有标点时，优先在常见方位/时间短语之后断开。
+  // 例如“跑到中国的战场上钻破庙”应切成“跑到中国的战场上 / 钻破庙”，
+  // 避免按固定字数把后一个动词短语的开头粘到上一条字幕。
+  if (cut === Math.min(length, Math.max(start + 1, preferredEnd))) {
+    const minimumTail = 2;
+    for (let index = cut - 1; index >= minNatural; index -= 1) {
+      const candidate = index + 1;
+      if (length - candidate < minimumTail) continue;
+      if (!/[上里内外前后时下处旁]/u.test(source[index])) continue;
       const splitsProtected = ranges.some(range => candidate > range.start && candidate < range.end);
       if (!splitsProtected) {
         cut = candidate;
@@ -168,7 +214,7 @@ function splitPunctuatedCaptionPieces(text) {
   return pieces.filter(Boolean);
 }
 
-function splitCaptionChunks(text, maxCharsPerLine = 14, maxLines = 2) {
+function splitCaptionChunks(text, maxCharsPerLine = 14, maxLines = 1) {
   const source = String(text || "").replace(/\s+/g, "").trim();
   if (!source) return [];
   const lineChars = Math.max(6, Number(maxCharsPerLine) || 14);
@@ -178,7 +224,10 @@ function splitCaptionChunks(text, maxCharsPerLine = 14, maxLines = 2) {
   let current = "";
 
   const pushChunk = value => {
-    const cleaned = stripCaptionTrailingPunctuation(value, { keepQuestionExclamation: true });
+    // 标点仍参与上面的智能断句，但成片字幕只显示正文，避免口播字幕显得零碎杂乱。
+    const cleaned = stripCaptionDisplayPunctuation(
+      stripCaptionTrailingPunctuation(value, { keepQuestionExclamation: false })
+    );
     if (cleaned) chunks.push(cleaned);
   };
 
@@ -199,7 +248,9 @@ function splitCaptionChunks(text, maxCharsPerLine = 14, maxLines = 2) {
         pushChunk(current);
         current = "";
       }
-      const segments = smartSplitCaptionText(piece, chunkLimit, { maxOverflow: 6 });
+      const segments = smartSplitCaptionText(piece, chunkLimit, {
+        maxOverflow: Number(maxLines) === 1 ? 0 : 6
+      });
       for (let index = 0; index < segments.length; index += 1) {
         const segment = segments[index];
         const isLast = index === segments.length - 1;
@@ -226,7 +277,7 @@ function splitCaptionChunks(text, maxCharsPerLine = 14, maxLines = 2) {
   return chunks.filter(Boolean);
 }
 
-function captionSchedule(text, duration, maxCharsPerLine = 14, maxLines = 2) {
+function captionSchedule(text, duration, maxCharsPerLine = 14, maxLines = 1) {
   const chunks = splitCaptionChunks(text, maxCharsPerLine, maxLines);
   const total = Math.max(0, Number(duration || 0));
   if (!chunks.length || total <= 0) return [];
@@ -247,14 +298,41 @@ function captionSchedule(text, duration, maxCharsPerLine = 14, maxLines = 2) {
   }).filter(item => item.end > item.start);
 }
 
+function sceneCaptionSchedule(scene, maxChars = 14) {
+  const duration = Number(scene?.duration || 0);
+  const timings = Array.isArray(scene?.caption_timings) ? scene.caption_timings : [];
+  if (timings.length) {
+    return timings.map(item => ({
+      text: stripCaptionDisplayPunctuation(item.text),
+      start: Math.max(0, Number(item.start || 0)),
+      end: Math.min(duration, Number(item.end || 0))
+    })).filter(item => item.text && item.end > item.start);
+  }
+  const segments = Array.isArray(scene?.caption_segments)
+    ? scene.caption_segments.map(item => stripCaptionDisplayPunctuation(item)).filter(Boolean)
+    : [];
+  if (segments.length && duration > 0) {
+    const weights = segments.map(item => Math.max(1, item.length));
+    const totalWeight = weights.reduce((sum, item) => sum + item, 0);
+    let cursor = 0;
+    return segments.map((text, index) => {
+      const start = cursor;
+      const end = index === segments.length - 1 ? duration : cursor + duration * weights[index] / totalWeight;
+      cursor = end;
+      return { text, start, end };
+    });
+  }
+  const prefix = scene?.speaker_name ? `${scene.speaker_name}：` : "";
+  return captionSchedule(`${prefix}${String(scene?.narration || "").trim()}`, duration, Number(maxChars || 14), 1);
+}
+
 function writeSrt(scenes, destination, maxChars = 14) {
   let timelineCursor = 0;
   let blockIndex = 1;
   const blocks = [];
   for (const scene of scenes) {
     const duration = Number(scene.duration || 0);
-    const prefix = scene.speaker_name ? `${scene.speaker_name}：` : "";
-    const schedule = captionSchedule(`${prefix}${String(scene.narration || "").trim()}`, duration, Number(maxChars || 14), 2);
+    const schedule = sceneCaptionSchedule(scene, Number(maxChars || 14));
     for (const item of schedule) {
       blocks.push(`${blockIndex++}\n${srtTime(timelineCursor + item.start)} --> ${srtTime(timelineCursor + item.end)}\n${wrapCaption(item.text, Number(maxChars || 14))}\n`);
     }
@@ -402,8 +480,7 @@ function writeAssOverlay({ scenes, destination, width, height, template = {}, ti
     let sceneCursor = 0;
     for (const scene of scenes) {
       const duration = Number(scene.duration || 0);
-      const text = `${scene.speaker_name ? `${scene.speaker_name}：` : ""}${String(scene.narration || "").trim()}`;
-      const schedule = captionSchedule(text, duration, Number(caption.maxCharsPerLine || 14), 2);
+      const schedule = sceneCaptionSchedule(scene, Number(caption.maxCharsPerLine || 14));
       for (const item of schedule) {
         addEvent(5, sceneCursor + item.start, sceneCursor + item.end, "Caption", item.text, caption, Number(caption.maxCharsPerLine || 14));
       }
@@ -765,4 +842,9 @@ async function renderMusicVideo({ app, config, audioPath, images, lyrics, output
   return { finalVideo, subtitlePath, totalDuration, eachDuration };
 }
 
-module.exports = { writeSrt, renderVideo, renderMusicVideo };
+module.exports = {
+  writeSrt,
+  renderVideo,
+  renderMusicVideo,
+  _captionTest: { splitCaptionChunks, captionSchedule, sceneCaptionSchedule, stripCaptionDisplayPunctuation }
+};
