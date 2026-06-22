@@ -21,12 +21,151 @@ function assTime(seconds) {
   return `${h}:${m}:${s}.${cs}`;
 }
 
+function stripCaptionTrailingPunctuation(text, { keepQuestionExclamation = true } = {}) {
+  let source = String(text || "").trim();
+  if (!source) return "";
+
+  // 先临时取出末尾引号/括号，这样“你好。”会变成“你好”，而不是留下句号。
+  const closingMatch = source.match(/[”’"'）)\]】》〉〕］」』]+$/u);
+  const closing = closingMatch ? closingMatch[0] : "";
+  if (closing) source = source.slice(0, -closing.length).trimEnd();
+
+  const trailing = keepQuestionExclamation
+    ? /[，。；：、,.;:]+$/u
+    : /[，。！？；：、,.!?;:]+$/u;
+  source = source.replace(trailing, "").trimEnd();
+  return `${source}${closing}`.trim();
+}
+
+function protectedCaptionRanges(text) {
+  const source = String(text || "");
+  const ranges = [];
+  const patterns = [
+    /\d{2,4}年(?:\d{1,2}月(?:\d{1,2}日)?)?/gu,
+    /\d{1,2}[:：]\d{2}(?::\d{2})?/gu,
+    /\d+(?:[.,]\d+)?(?:万|亿|千|百)?(?:多|余|来)?(?:周年|个月|小时|分钟|公里|千米|厘米|毫米|公斤|千克|万元|亿元|年前|年后|年代|世纪|左右|以上|以下|岁|年|月|日|天|分|秒|米|斤|克|吨|元|块|美元|个|次|名|位|人|家|本|章|集|期|层|楼|号|点|时|%|％)?/gu,
+    /[A-Za-z]+(?:[-_.][A-Za-z0-9]+)+/gu,
+    /…{2,}|\.{3,}/gu,
+    /[\u3400-\u9FFF]{1,10}·[\u3400-\u9FFF]{1,10}/gu
+  ];
+  for (const pattern of patterns) {
+    pattern.lastIndex = 0;
+    let match;
+    while ((match = pattern.exec(source))) {
+      if (match[0].length > 1) ranges.push({ start: match.index, end: match.index + match[0].length });
+      if (!match[0].length) pattern.lastIndex += 1;
+    }
+  }
+  return ranges.sort((a, b) => a.start - b.start || b.end - a.end);
+}
+
+function captionCutIndex(text, start, preferredEnd, hardEnd) {
+  const source = String(text || "");
+  const length = source.length;
+  let cut = Math.min(length, Math.max(start + 1, preferredEnd));
+  if (cut >= length) return length;
+
+  const ranges = protectedCaptionRanges(source);
+  const protectedRange = ranges.find(range => cut > range.start && cut < range.end);
+  if (protectedRange) {
+    const leftLength = protectedRange.start - start;
+    const rightEnd = Math.min(length, protectedRange.end);
+    if (leftLength >= Math.max(4, Math.floor((preferredEnd - start) * 0.55))) cut = protectedRange.start;
+    else if (rightEnd <= hardEnd) cut = rightEnd;
+  }
+
+  // 在不破坏数字单位、人名等完整短语的前提下，优先在自然停顿位置换行。
+  const minNatural = start + Math.max(4, Math.floor((preferredEnd - start) * 0.58));
+  for (let index = cut - 1; index >= minNatural; index -= 1) {
+    if (/[，、,；;：:\s]/u.test(source[index])) {
+      const candidate = index + 1;
+      const splitsProtected = ranges.some(range => candidate > range.start && candidate < range.end);
+      if (!splitsProtected) {
+        cut = candidate;
+        break;
+      }
+    }
+  }
+  return Math.max(start + 1, cut);
+}
+
+function smartSplitCaptionText(text, maxChars, { maxOverflow = 4 } = {}) {
+  const source = String(text || "").trim();
+  const limit = Math.max(1, Number(maxChars) || 1);
+  if (!source || source.length <= limit) return source ? [source] : [];
+
+  const pieces = [];
+  let cursor = 0;
+  while (cursor < source.length) {
+    const remaining = source.length - cursor;
+    if (remaining <= limit) {
+      pieces.push(source.slice(cursor));
+      break;
+    }
+    const preferredEnd = cursor + limit;
+    const hardEnd = Math.min(source.length, preferredEnd + Math.max(0, Number(maxOverflow) || 0));
+    const cut = captionCutIndex(source, cursor, preferredEnd, hardEnd);
+    pieces.push(source.slice(cursor, cut));
+    cursor = cut;
+  }
+  return pieces.filter(Boolean);
+}
+
+function wrapCaptionLine(text, maxChars) {
+  const source = String(text || "").trim();
+  const limit = Math.max(1, Number(maxChars) || 14);
+  if (!source || source.length <= limit) return source ? [source] : [];
+
+  // 两行以内时优先做均衡换行，避免第二行只剩“多岁”或“……”这样的孤行。
+  if (source.length <= limit * 2) {
+    const ideal = Math.ceil(source.length / 2);
+    const cut = captionCutIndex(source, 0, ideal, Math.min(source.length, limit));
+    if (cut > 0 && cut < source.length && source.length - cut <= limit + 2) {
+      return [source.slice(0, cut), source.slice(cut)];
+    }
+  }
+  return smartSplitCaptionText(source, limit);
+}
+
 function wrapCaption(text, maxChars) {
   const source = String(text || "").trim();
   if (!maxChars || source.length <= maxChars) return source;
-  const lines = [];
-  for (let index = 0; index < source.length; index += maxChars) lines.push(source.slice(index, index + maxChars));
-  return lines.join("\n");
+  return source
+    .split(/\r?\n/)
+    .flatMap(line => wrapCaptionLine(line, Number(maxChars) || 14))
+    .join("\n");
+}
+
+function splitPunctuatedCaptionPieces(text) {
+  const source = String(text || "");
+  const punctuation = new Set(Array.from("，。！？；：、,.!?;:"));
+  const closing = new Set(Array.from("”’\"'）)】》〉〕］」』"));
+  const pieces = [];
+  let current = "";
+
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index];
+    current += char;
+    if (!punctuation.has(char)) continue;
+
+    // 小数、千位分隔等数字内部标点不属于字幕断句符号。
+    const previous = source[index - 1] || "";
+    const next = source[index + 1] || "";
+    if ((char === "." || char === ",") && /\d/u.test(previous) && /\d/u.test(next)) continue;
+
+    while (index + 1 < source.length && punctuation.has(source[index + 1])) {
+      index += 1;
+      current += source[index];
+    }
+    while (index + 1 < source.length && closing.has(source[index + 1])) {
+      index += 1;
+      current += source[index];
+    }
+    pieces.push(current);
+    current = "";
+  }
+  if (current) pieces.push(current);
+  return pieces.filter(Boolean);
 }
 
 function splitCaptionChunks(text, maxCharsPerLine = 14, maxLines = 2) {
@@ -34,29 +173,56 @@ function splitCaptionChunks(text, maxCharsPerLine = 14, maxLines = 2) {
   if (!source) return [];
   const lineChars = Math.max(6, Number(maxCharsPerLine) || 14);
   const chunkLimit = Math.max(lineChars, lineChars * Math.max(1, Number(maxLines) || 2));
-  const sentences = source.match(/[^，。！？；：,.!?;:]+[，。！？；：,.!?;:]?/g) || [source];
+  const pieces = splitPunctuatedCaptionPieces(source);
   const chunks = [];
   let current = "";
-  const pushPiece = piece => {
-    let rest = String(piece || "").trim();
-    while (rest.length > chunkLimit) {
+
+  const pushChunk = value => {
+    const cleaned = stripCaptionTrailingPunctuation(value, { keepQuestionExclamation: true });
+    if (cleaned) chunks.push(cleaned);
+  };
+
+  const appendPiece = rawPiece => {
+    let piece = String(rawPiece || "").trim();
+    if (!piece) return;
+    const delimiterMatch = piece.match(/[，。！？；：、,.!?;:]+$/u);
+    const delimiter = delimiterMatch ? delimiterMatch[0] : "";
+    const strongBoundary = /[。！？!?；;]/u.test(delimiter);
+
+    if (current && current.length + piece.length > chunkLimit) {
+      pushChunk(current);
+      current = "";
+    }
+
+    if (piece.length > chunkLimit) {
       if (current) {
-        chunks.push(current);
+        pushChunk(current);
         current = "";
       }
-      chunks.push(rest.slice(0, chunkLimit));
-      rest = rest.slice(chunkLimit);
+      const segments = smartSplitCaptionText(piece, chunkLimit, { maxOverflow: 6 });
+      for (let index = 0; index < segments.length; index += 1) {
+        const segment = segments[index];
+        const isLast = index === segments.length - 1;
+        if (isLast && !strongBoundary) current = segment;
+        else pushChunk(segment);
+      }
+    } else {
+      current += piece;
     }
-    if (!rest) return;
-    if (!current) current = rest;
-    else if ((current + rest).length <= chunkLimit) current += rest;
-    else {
-      chunks.push(current);
-      current = rest;
+
+    // 句号、问号、感叹号和分号属于明确语义边界，不再与下一句拼成同一字幕。
+    if (strongBoundary && current) {
+      pushChunk(current);
+      current = "";
+    } else if (delimiter && current.length >= lineChars) {
+      // 较长分句在逗号处直接切成下一条字幕，避免单条字幕被挤成三行。
+      pushChunk(current);
+      current = "";
     }
   };
-  for (const sentence of sentences) pushPiece(sentence);
-  if (current) chunks.push(current);
+
+  for (const piece of pieces) appendPiece(piece);
+  if (current) pushChunk(current);
   return chunks.filter(Boolean);
 }
 
@@ -64,14 +230,18 @@ function captionSchedule(text, duration, maxCharsPerLine = 14, maxLines = 2) {
   const chunks = splitCaptionChunks(text, maxCharsPerLine, maxLines);
   const total = Math.max(0, Number(duration || 0));
   if (!chunks.length || total <= 0) return [];
-  const totalWeight = chunks.reduce((sum, item) => sum + Math.max(1, item.length), 0);
+
+  const weights = chunks.map(item => Math.max(1, String(item || "").replace(/[，。！？；：、,.!?;:\s]/gu, "").length));
+  const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
+  // 时长充足时保证每条至少 0.55 秒；时长不足时按字数比例压缩，绝不丢掉最后一条字幕。
+  const minimum = total >= chunks.length * 0.55 ? 0.55 : 0;
+  const weightedPool = Math.max(0, total - minimum * chunks.length);
+  const durations = weights.map(weight => minimum + weightedPool * weight / Math.max(1, totalWeight));
+
   let cursor = 0;
   return chunks.map((item, index) => {
-    const remaining = Math.max(0, total - cursor);
-    const raw = index === chunks.length - 1 ? remaining : total * Math.max(1, item.length) / totalWeight;
-    const segmentDuration = index === chunks.length - 1 ? remaining : Math.max(0.55, raw);
     const start = cursor;
-    const end = index === chunks.length - 1 ? total : Math.min(total, cursor + segmentDuration);
+    const end = index === chunks.length - 1 ? total : Math.min(total, cursor + durations[index]);
     cursor = end;
     return { text: item, start, end };
   }).filter(item => item.end > item.start);
