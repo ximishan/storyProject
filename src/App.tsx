@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AudioLines, BookOpenText, Boxes, CheckCircle2, ChevronRight, CircleHelp, Clapperboard,
   Copy, ExternalLink, Eye, FileText, FolderOpen, History, Image,
@@ -7,7 +7,8 @@ import {
   Video, Volume2, WandSparkles, X
 } from "lucide-react";
 import systemPromptTemplatesData from "../shared/system-prompt-templates.json";
-import { DEFAULT_VOLC_VOICE_ID, VOLC_VOICES, type VolcVoiceOption } from "./volcVoices";
+import packageInfo from "../package.json";
+import { DEFAULT_VOLC_VOICE_ID, VOLC_VOICE_CATEGORIES, VOLC_VOICES, type VolcVoiceOption } from "./volcVoices";
 
 type Page = "tasks" | "history" | "create" | "playground" | "voice" | "music" | "tests" | "templates" | "styles" | "drafts" | "settings";
 type SettingsTab = "llm" | "image" | "tts" | "output" | "diagnostics";
@@ -16,7 +17,7 @@ const nav = [
   { page: "create" as Page, label: "开始创作", icon: WandSparkles },
   { page: "tasks" as Page, label: "任务队列", icon: LayoutList },
   { page: "history" as Page, label: "历史任务", icon: History },
-  { page: "playground" as Page, label: "图片实验室", icon: Image },
+  { page: "playground" as Page, label: "画图实验室", icon: Image },
   { page: "voice" as Page, label: "配音实验室", icon: Mic2 },
   { page: "music" as Page, label: "音乐 MV", icon: Music },
   { page: "tests" as Page, label: "功能测试", icon: CheckCircle2 },
@@ -38,6 +39,21 @@ const tracks = [
 ];
 
 const systemPromptTemplates = systemPromptTemplatesData as PromptTemplateRecord[];
+
+const STYLE_PREVIEW_ASSETS: Record<string, string> = {
+  "black-white": "./style-previews/black-white-D1QqPH8b.webp",
+  realistic: "./style-previews/realistic-Atk_pZhY.webp",
+  "oil-painting": "./style-previews/oil-painting-8NyuzxAO.webp",
+  cinematic: "./style-previews/cinematic-BdXqwPs4.webp",
+  "ancient-cinematic": "./style-previews/ancient-cinematic-COp7S7MP.webp",
+  "retro-film": "./style-previews/vintage-film-CrPRxEWS.webp",
+  watercolor: "./style-previews/watercolor-DPPl-c7w.webp",
+  magazine: "./style-previews/illustration-Dx-tzI7d.webp",
+  "pixar-3d": "./style-previews/pixar-3d-DqhR0fI-.webp",
+  "ink-wash": "./style-previews/ink-wash-n6PE-maw.webp",
+  "folk-illustration": "./style-previews/folk-tale-gongbi-D-GnOj_N.webp",
+  ghibli: "./style-previews/ghibli-CLd8wrdG.webp"
+};
 
 export default function App() {
   const [page, setPage] = useState<Page>("tasks");
@@ -71,7 +87,7 @@ export default function App() {
           <Settings size={18} /><span>设置</span>
         </button>
         <button><CircleHelp size={18} /><span>使用帮助</span></button>
-        <div className="version">Storybound Rebuild · v0.8.3</div>
+        <div className="version">Storybound Rebuild · v{packageInfo.version}</div>
       </div>
       </aside>
       <main className="main">
@@ -192,7 +208,7 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
   const [imageUrls, setImageUrls] = useState<Record<number, string>>({});
   const [showRenderOptions, setShowRenderOptions] = useState(false);
   const [renderOptions, setRenderOptions] = useState<RenderTaskOptions>({
-    animation: "左拉镜",
+    animation: "缩放",
     motionStrength: 0.5,
     forceStaticImages: true,
     burnCaption: true,
@@ -429,6 +445,145 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
   </div>;
 }
 
+
+const VOICE_FAVORITES_KEY = "storybound.voiceFavorites.v2";
+const DEFAULT_VOICE_FAVORITES = [
+  "zh_male_dongfanghaoran_moon_bigtts",
+  "zh_male_yuanboxiaoshu_moon_bigtts",
+  "zh_female_wenrouxiaoya_moon_bigtts",
+  "zh_female_shuangkuaisisi_moon_bigtts"
+];
+
+function readVoiceFavorites() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(VOICE_FAVORITES_KEY) || "null");
+    return Array.isArray(parsed) ? parsed.filter(item => typeof item === "string").slice(0, 5) : [...DEFAULT_VOICE_FAVORITES];
+  } catch {
+    return [...DEFAULT_VOICE_FAVORITES];
+  }
+}
+
+function VolcVoicePicker({ open, value, speed, configured, onClose, onPick }: {
+  open: boolean;
+  value: string;
+  speed: number;
+  configured: boolean;
+  onClose: () => void;
+  onPick: (voice: VolcVoiceOption) => void;
+}) {
+  const selectedVoice = VOLC_VOICES.find(item => item.id === value);
+  const [version, setVersion] = useState<"1.0" | "2.0">(selectedVoice?.version || "2.0");
+  const [category, setCategory] = useState(selectedVoice?.category || "narration");
+  const [query, setQuery] = useState("");
+  const [favorites, setFavorites] = useState<string[]>(readVoiceFavorites);
+  const [loadingId, setLoadingId] = useState("");
+  const [playingId, setPlayingId] = useState("");
+  const [message, setMessage] = useState("");
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  const stopAudio = () => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.src = "";
+    }
+    setPlayingId("");
+  };
+
+  useEffect(() => {
+    if (!open) return;
+    const voice = VOLC_VOICES.find(item => item.id === value);
+    setVersion(voice?.version || "2.0");
+    setCategory(voice?.category || "narration");
+    setQuery("");
+    setMessage("");
+    return stopAudio;
+  }, [open, value]);
+
+  useEffect(() => {
+    try { localStorage.setItem(VOICE_FAVORITES_KEY, JSON.stringify(favorites)); } catch {}
+  }, [favorites]);
+
+  const categories = useMemo(() => [
+    { id: "favorites", name: "我的收藏", hint: `已收藏 ${favorites.filter(id => VOLC_VOICES.some(item => item.id === id && item.version === version)).length} 个` },
+    ...VOLC_VOICE_CATEGORIES.filter(cat => VOLC_VOICES.some(item => item.version === version && item.category === cat.id))
+  ], [favorites, version]);
+
+  const visibleVoices = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return VOLC_VOICES.filter(item => {
+      if (item.version !== version) return false;
+      if (category === "favorites") {
+        if (!favorites.includes(item.id)) return false;
+      } else if (item.category !== category) return false;
+      return !needle || item.name.toLowerCase().includes(needle) || item.tag.toLowerCase().includes(needle) || item.id.toLowerCase().includes(needle);
+    });
+  }, [version, category, query, favorites]);
+
+  const toggleFavorite = (id: string) => {
+    setFavorites(current => current.includes(id)
+      ? current.filter(item => item !== id)
+      : current.length >= 5 ? current : [...current, id]);
+  };
+
+  const previewVoice = async (voice: VolcVoiceOption) => {
+    setMessage("");
+    if (playingId === voice.id) {
+      stopAudio();
+      return;
+    }
+    if (!configured) {
+      setMessage("请先在“设置 → TTS 配音 → 火山引擎”填写 App ID 和 Access Token");
+      return;
+    }
+    stopAudio();
+    setLoadingId(voice.id);
+    try {
+      const result = await window.storybound.previewVolcVoice({ speaker: voice.id, speed, text: "他来到江南一个小村庄" });
+      const audio = new Audio(result.dataUrl);
+      audioRef.current = audio;
+      audio.addEventListener("ended", () => setPlayingId(""), { once: true });
+      audio.addEventListener("error", () => { setPlayingId(""); setMessage("试听音频播放失败"); }, { once: true });
+      await audio.play();
+      setPlayingId(voice.id);
+      setMessage(result.cached ? "已从本地试听缓存播放" : "试听已生成并保存到本地，下次可直接播放");
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    } finally {
+      setLoadingId("");
+    }
+  };
+
+  if (!open) return null;
+  return <div className="voice-picker-overlay" onMouseDown={event => event.target === event.currentTarget && onClose()}>
+    <div className="voice-picker-modal" role="dialog" aria-modal="true" aria-label="选择火山音色">
+      <header className="voice-picker-head"><div><b>选择音色</b><small>共 {VOLC_VOICES.length} 个火山音色</small></div><button onClick={() => { stopAudio(); onClose(); }}><X size={16} /></button></header>
+      <div className="voice-picker-version-row">
+        {(["2.0", "1.0"] as const).map(item => <button key={item} data-active={version === item || undefined} onClick={() => { setVersion(item); setCategory("narration"); stopAudio(); }}><b>语音合成 {item}</b><small>{item === "2.0" ? "新版 · 情感更自然" : "经典版 · 音色更多"}</small></button>)}
+      </div>
+      {!configured && <div className="voice-picker-banner">试听需要先配置火山 TTS 凭证。未配置时仍可选择音色，但不能生成试听。</div>}
+      <div className="voice-picker-toolbar"><Search size={14} /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="按名字、标签或音色 ID 搜索" /><span>首次试听调用接口，之后读取本地缓存</span></div>
+      <div className="voice-picker-body">
+        <aside className="voice-picker-categories">{categories.map(item => <button key={item.id} data-active={category === item.id || undefined} onClick={() => { setCategory(item.id); stopAudio(); }}><b>{item.name}</b><small>{item.hint}</small></button>)}</aside>
+        <main className="voice-picker-list">{visibleVoices.length ? visibleVoices.map(voice => {
+          const selected = voice.id === value;
+          const favorite = favorites.includes(voice.id);
+          const loading = loadingId === voice.id;
+          const playing = playingId === voice.id;
+          return <article key={voice.id} data-selected={selected || undefined}>
+            <div className="voice-picker-info"><b><Volume2 size={13} />{voice.name}<em>{voice.version}</em></b><span>{voice.tag}</span><small>{voice.id}</small></div>
+            <div className="voice-picker-actions">
+              <button className="voice-favorite-btn" title={favorite ? "取消收藏" : "收藏音色"} onClick={() => toggleFavorite(voice.id)}>{favorite ? "★" : "☆"}</button>
+              <button disabled={loading} onClick={() => previewVoice(voice)}>{loading ? <LoaderCircle size={13} className="spin" /> : playing ? <X size={13} /> : <Play size={13} />}{loading ? "合成中" : playing ? "停止" : "试听"}</button>
+              <button className={selected ? "primary" : ""} onClick={() => { onPick(voice); stopAudio(); onClose(); }}>{selected ? "已选" : "选用"}</button>
+            </div>
+          </article>;
+        }) : <div className="voice-picker-empty">没有匹配的音色</div>}</main>
+      </div>
+      <footer className="voice-picker-footer"><span>{message || "试听文本：他来到江南一个小村庄"}</span><button onClick={() => { stopAudio(); onClose(); }}>关闭</button></footer>
+    </div>
+  </div>;
+}
+
 function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: {
   onCreated: (started: boolean) => void | Promise<void>;
   onNotice: (message: string) => void;
@@ -451,13 +606,14 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
     ["pixar-3d", "皮克斯 3D", "动画质感"], ["ink-wash", "中国水墨", "文人意境"],
     ["folk-illustration", "民间故事工笔风", "工笔叙事"], ["ghibli", "吉卜力", "治愈日漫"]
   ];
-  const voices = VOLC_VOICES;
   const [style, setStyle] = useState(trackStyles["character-story"]);
   const [ratio, setRatio] = useState("9:16");
   const [targetScenes, setTargetScenes] = useState(0);
   const [targetLength, setTargetLength] = useState(0);
   const [ttsSpeed, setTtsSpeed] = useState(1);
   const [speaker, setSpeaker] = useState(DEFAULT_VOLC_VOICE_ID);
+  const [voicePickerOpen, setVoicePickerOpen] = useState(false);
+  const [volcPreviewConfigured, setVolcPreviewConfigured] = useState(false);
   const [ttsProvider, setTtsProvider] = useState("system");
   const [systemVoices, setSystemVoices] = useState<SystemVoice[]>([]);
   const [taskType, setTaskType] = useState("story");
@@ -472,6 +628,7 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
   const [videoIntroDuration, setVideoIntroDuration] = useState(0);
   const [templateId, setTemplateId] = useState("default-portrait-9-16");
   const [referenceImagePath, setReferenceImagePath] = useState("");
+  const [productReferenceImagePath, setProductReferenceImagePath] = useState("");
   const [characterConsistencyMode, setCharacterConsistencyMode] = useState<"off" | "upload" | "auto">("off");
   const [coverImageMode, setCoverImageMode] = useState("off");
   const [coverTemplateId, setCoverTemplateId] = useState("cinematic-poster");
@@ -505,6 +662,7 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
     window.storybound.getConfig().then(config => {
       const provider = config.tts?.provider || "system";
       setTtsProvider(provider);
+      setVolcPreviewConfigured(Boolean(config.tts?.volcengine?.app_id?.trim() && config.tts?.volcengine?.access_key?.trim()));
       setSpeaker(provider === "system" ? (config.tts?.system?.voice || "") : (config.tts?.volcengine?.speaker || DEFAULT_VOLC_VOICE_ID));
     });
     window.storybound.listSystemVoices().then(setSystemVoices).catch(() => setSystemVoices([]));
@@ -523,6 +681,12 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
     setRatio(config.image?.ratio || config.canvas?.ratio || "9:16");
     if (config.audio?.defaultBgmId) setBgmId(config.audio.defaultBgmId);
   };
+
+  const effectivePromptTemplateId = promptTemplateId || track;
+  const selectedPromptTemplate = systemPromptTemplates.find(item => item.id === effectivePromptTemplateId)
+    || promptTemplates.find(item => item.id === effectivePromptTemplateId);
+  const selectedReferenceKind = String(selectedPromptTemplate?.reference_kind || "character");
+  const productReferenceMode = selectedReferenceKind === "product";
 
   const normalizedProcessingMode = processingMode === "semi" ? "semi_auto" : processingMode;
   const disabledPauseSteps = normalizedProcessingMode === "direct" ? [0, 1, 2]
@@ -571,8 +735,9 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
         narrativePov: normalizedProcessingMode === "auto" ? narrativePov : "original",
         keepPromotion: normalizedProcessingMode === "auto" ? keepPromotion : true,
         materialSource, templateId,
-        referenceImagePath: materialSource === "ai" ? referenceImagePath : "",
-        characterConsistencyMode: materialSource === "ai" ? characterConsistencyMode : "off",
+        referenceImagePath: materialSource === "ai" && !productReferenceMode ? referenceImagePath : "",
+        productReferenceImagePath: materialSource === "ai" && productReferenceMode ? productReferenceImagePath : "",
+        characterConsistencyMode: materialSource === "ai" && !productReferenceMode ? characterConsistencyMode : "off",
         coverImageMode: effectiveCoverMode, coverTemplateId,
         pauseMode: effectivePause,
         sourceMode, sourceQuery, sourceRequirements, bgmId, speaker,
@@ -665,17 +830,18 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
           {videoIntro !== 0 && <OptionGroup title="时长" hint="固定时长范围 6–30 秒；跟随配音时接口会自动限制到可用范围"><Choice active={videoIntroDuration === 0} onClick={() => setVideoIntroDuration(0)} title="跟配音一致" /><Choice active={videoIntroDuration > 0} onClick={() => setVideoIntroDuration(videoIntroDuration || 6)} title="固定秒数" />{videoIntroDuration > 0 && <span className="dynamic-count"><input className="inline-number" type="number" min={6} max={30} value={videoIntroDuration} onChange={e => setVideoIntroDuration(Math.min(30, Math.max(6, Number(e.target.value))))} /> 秒</span>}</OptionGroup>}
           <p className="form-hint">动态视频失败时会自动保留原图片继续出片，不会让整条任务报废。</p>
         </>}
-        {materialSource === "ai" && <OptionGroup title="画面风格"><div className="style-chip-grid">{visualStyles.map(([id, name, desc]) => <Choice key={id} active={style === id} onClick={() => setStyle(id)} title={name} desc={desc} />)}{customStyles.map(item => <Choice key={item.id} active={style === item.id} onClick={() => setStyle(item.id)} title={item.name} desc={item.tag} />)}<button className="choice-chip" onClick={onManageStyles}><Plus size={14} />自定义</button></div></OptionGroup>}
+        {materialSource === "ai" && <OptionGroup title="画面风格"><div className="style-chip-grid">{visualStyles.map(([id, name, desc]) => <StyleChoice key={id} id={id} active={style === id} onClick={() => setStyle(id)} title={name} desc={desc} previewSrc={STYLE_PREVIEW_ASSETS[id]} />)}{customStyles.map(item => <Choice key={item.id} active={style === item.id} onClick={() => setStyle(item.id)} title={item.name} desc={item.tag} />)}<button className="choice-chip" onClick={onManageStyles}><Plus size={14} />自定义</button></div></OptionGroup>}
         <OptionGroup title="草稿模板"><div className="template-choice-grid">{draftTemplates.map(item => { const cfg = JSON.parse(item.config); return <Choice key={item.id} active={templateId === item.id} onClick={() => chooseTemplate(item.id)} title={`${item.is_default ? "★ " : ""}${item.name}`} desc={`出图 ${cfg.image?.ratio || cfg.canvas?.ratio}`} />; })}<button className="choice-chip" onClick={onManageTemplates}><Plus size={14} />管理模板</button></div></OptionGroup>
-        <OptionGroup title="AI 出图比例" hint={templateId ? "已跟随草稿模板" : "请选择画面比例"}><Choice active={ratio === "9:16"} onClick={() => setRatio("9:16")} title="9:16" desc="竖屏" /><Choice active={ratio === "4:3"} onClick={() => setRatio("4:3")} title="4:3" desc="标准" /><Choice active={ratio === "1:1"} onClick={() => setRatio("1:1")} title="1:1" desc="方形" /><Choice active={ratio === "16:9"} onClick={() => setRatio("16:9")} title="16:9" desc="横屏" /></OptionGroup>
+        <OptionGroup title="AI 出图比例" hint={templateId ? "已跟随草稿模板" : "请选择画面比例"}><Choice disabled={Boolean(templateId)} active={ratio === "9:16"} onClick={() => setRatio("9:16")} title="9:16" desc="竖屏" /><Choice disabled={Boolean(templateId)} active={ratio === "4:3"} onClick={() => setRatio("4:3")} title="4:3" desc="标准" /><Choice disabled={Boolean(templateId)} active={ratio === "1:1"} onClick={() => setRatio("1:1")} title="1:1" desc="方形" /><Choice disabled={Boolean(templateId)} active={ratio === "16:9"} onClick={() => setRatio("16:9")} title="16:9" desc="横屏" /></OptionGroup>
         <p className="form-hint">选模板时自动同步图片比例。如需自定义，请去草稿模板编辑器调整图片区域比例。</p>
-        {materialSource === "ai" && <OptionGroup title="人物一致性" hint="系统九宫格只调用一次图片接口，再在本地裁成青年、中年、老年各三个角度">
+        {materialSource === "ai" && !productReferenceMode && <OptionGroup title="人物一致性" hint="系统九宫格只调用一次图片接口，再在本地裁成青年、中年、老年各三个角度">
           <Choice active={characterConsistencyMode === "off"} onClick={() => { setCharacterConsistencyMode("off"); setReferenceImagePath(""); }} title="关闭" />
           <Choice active={characterConsistencyMode === "upload"} onClick={() => setCharacterConsistencyMode("upload")} title="上传参考图" />
           <Choice active={characterConsistencyMode === "auto"} onClick={() => { setCharacterConsistencyMode("auto"); setReferenceImagePath(""); }} title="系统九宫格人物卡" badge="省图" />
         </OptionGroup>}
-        {materialSource === "ai" && characterConsistencyMode === "upload" && <div className="reference-row"><div><b>主角参考图</b><small>出现主角的分镜会以参考图保持人物一致{referenceImagePath ? ` · ${referenceImagePath.split(/[\\/]/).pop()}` : ""}</small></div><div className="reference-actions"><button className="reference-upload-empty" onClick={async () => { const selected = await window.storybound.selectImage(); if (selected) setReferenceImagePath(selected); }}><Upload size={15} />{referenceImagePath ? "更换参考图" : "上传主角参考图"}</button>{referenceImagePath && <button className="icon-btn" title="移除参考图" onClick={() => setReferenceImagePath("")}><X size={15} /></button>}</div></div>}
-        {materialSource === "ai" && characterConsistencyMode === "auto" && <p className="form-hint">系统会先根据主角档案生成一张 3×3 定妆图：青年、中年、老年各三个角度，再按分镜年龄自动引用对应人物。</p>}
+        {materialSource === "ai" && !productReferenceMode && characterConsistencyMode === "upload" && <div className="reference-row"><div><b>主角参考图</b><small>出现主角的分镜会以参考图保持人物一致{referenceImagePath ? ` · ${referenceImagePath.split(/[\\/]/).pop()}` : ""}</small></div><div className="reference-actions"><button className="reference-upload-empty" onClick={async () => { const selected = await window.storybound.selectImage(); if (selected) setReferenceImagePath(selected); }}><Upload size={15} />{referenceImagePath ? "更换参考图" : "上传主角参考图"}</button>{referenceImagePath && <button className="icon-btn" title="移除参考图" onClick={() => setReferenceImagePath("")}><X size={15} /></button>}</div></div>}
+        {materialSource === "ai" && !productReferenceMode && characterConsistencyMode === "auto" && <p className="form-hint">系统会先根据主角档案生成一张 3×3 定妆图：青年、中年、老年各三个角度，再按分镜年龄自动引用对应人物。</p>}
+        {materialSource === "ai" && productReferenceMode && <div className="reference-row product-reference-row"><div><b>产品参考图 <span>· 可选</span></b><small>上传后，只在产品、菜品或关键物件清晰出现的分镜中使用，保持外观与包装一致{productReferenceImagePath ? ` · ${productReferenceImagePath.split(/[\\/]/).pop()}` : ""}</small></div><div className="reference-actions"><button className="reference-upload-empty" onClick={async () => { const selected = await window.storybound.selectImage(); if (selected) setProductReferenceImagePath(selected); }}><Upload size={15} />{productReferenceImagePath ? "更换产品参考图" : "上传产品参考图"}</button>{productReferenceImagePath && <button className="icon-btn" title="移除产品参考图" onClick={() => setProductReferenceImagePath("")}><X size={15} /></button>}</div></div>}
       </CreateSection>
 
       {materialSource === "ai" && <CreateSection title="封面海报" desc="发布时上传的封面，独立于正片">
@@ -690,7 +856,12 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
             <Choice active={!speaker} onClick={() => setSpeaker("")} title="系统默认音色" desc="免费 · 无需 Key" />
             {systemVoices.filter(item => item.enabled).slice(0, 8).map(item => <Choice key={item.id} active={speaker === item.id} onClick={() => setSpeaker(item.id)} title={item.name} desc={item.culture || "本机音色"} />)}
             {!systemVoices.length && <p className="form-hint">没有读取到系统音色时会使用 Windows 默认声音；可在“设置 → TTS 配音”中测试。</p>}
-          </> : voices.map(item => <Choice key={item.id} active={speaker === item.id} onClick={() => setSpeaker(item.id)} title={item.name} desc={item.desc} badge={item.version} />)}
+          </> : <div className="selected-voice-row">
+            {(() => { const selected = VOLC_VOICES.find(item => item.id === speaker) || VOLC_VOICES.find(item => item.id === DEFAULT_VOLC_VOICE_ID)!; return <>
+              <div className="selected-voice-card"><Volume2 size={17} /><div><b>{selected.name}<em>{selected.version}</em></b><small>{selected.tag} · {selected.id}</small></div></div>
+              <button type="button" className="voice-open-picker" onClick={() => setVoicePickerOpen(true)}><Search size={14} />选择音色 / 试听</button>
+            </>; })()}
+          </div>}
         </OptionGroup>
           <OptionGroup title="配音语速"><Choice active={ttsSpeed === .85} onClick={() => setTtsSpeed(.85)} title="慢速" desc="0.85×" /><Choice active={ttsSpeed === 1} onClick={() => setTtsSpeed(1)} title="默认" desc="1.0×" /><Choice active={ttsSpeed === 1.15} onClick={() => setTtsSpeed(1.15)} title="快速" desc="1.15×" /><Choice active={ttsSpeed === 1.3} onClick={() => setTtsSpeed(1.3)} title="更快" desc="1.3×" /></OptionGroup></>}
         <OptionGroup title="背景音乐">{bgmItems.map(item => <Choice key={item.id} active={bgmId === item.id} onClick={() => setBgmId(item.id)} title={item.id === "builtin" ? "🎵 内置 BGM" : item.name} />)}<button className="choice-chip" onClick={async () => { const added = await window.storybound.addBgm(); if (added) { setBgmItems(await window.storybound.listBgm()); setBgmId(added.id); } }}><Plus size={14} />添加</button></OptionGroup>
@@ -710,6 +881,7 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
       </div>
       <div className="create-submit-bar"><div><b>自定义 / 其他</b><small>{canStart ? "当前语言模型 · 可开始生成" : canSave ? `还需 ${Math.max(0, 50 - text.trim().length)} 字才能开始生成` : "请输入至少 50 字文案"}</small></div><button disabled={!canSave || saving} onClick={() => submit(false)}>{draftJustSaved ? <CheckCircle2 size={15} /> : <Save size={15} />}{draftJustSaved ? "已保存" : "保存为草稿"}</button><button className="primary" disabled={!canStart || saving} onClick={() => submit(true)}>{saving ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />}开始生成 <kbd>Ctrl+Enter</kbd></button></div>
     </div>
+    <VolcVoicePicker open={voicePickerOpen} value={speaker} speed={ttsSpeed} configured={volcPreviewConfigured} onClose={() => setVoicePickerOpen(false)} onPick={voice => setSpeaker(voice.id)} />
   </section>;
 }
 
@@ -725,8 +897,22 @@ function OptionGroup({ title, hint, children }: { title: string; hint?: string; 
   return <div className="option-group"><div className="option-label"><b>{title}</b>{hint && <small>{hint}</small>}</div><div className="choice-row">{children}</div></div>;
 }
 
-function Choice({ active, onClick, title, desc, badge }: { active: boolean; onClick: () => void; title: string; desc?: string; badge?: string }) {
-  return <button type="button" className="choice-chip" data-active={active || undefined} onClick={onClick}><b>{title}</b>{badge && <em>{badge}</em>}{desc && <small>· {desc}</small>}</button>;
+function StyleChoice({ id, active, onClick, title, desc, previewSrc }: {
+  id: string; active: boolean; onClick: () => void; title: string; desc?: string; previewSrc?: string;
+}) {
+  return <span className="style-choice-wrap" data-style-id={id}>
+    <button type="button" className="choice-chip style-choice-chip" data-active={active || undefined} onClick={onClick}>
+      <b>{title}</b>{desc && <small>· {desc}</small>}
+    </button>
+    {previewSrc && <span className="style-hover-card" role="tooltip">
+      <img src={previewSrc} alt={`${title}风格预览`} loading="lazy" />
+      <b>{title}</b>
+    </span>}
+  </span>;
+}
+
+function Choice({ active, onClick, title, desc, badge, disabled = false }: { active: boolean; onClick: () => void; title: string; desc?: string; badge?: string; disabled?: boolean }) {
+  return <button type="button" className="choice-chip" data-active={active || undefined} disabled={disabled} onClick={onClick}><b>{title}</b>{badge && <em>{badge}</em>}{desc && <small>· {desc}</small>}</button>;
 }
 
 function SettingsPage({ config, onSave }: { config: AppConfig; onSave: (config: AppConfig) => void }) {
@@ -965,10 +1151,10 @@ function ImageSettings({ draft, setDraft }: { draft: AppConfig; setDraft: (next:
 }
 
 function TtsSettings({ draft, setDraft }: { draft: AppConfig; setDraft: (next: AppConfig) => void }) {
-  const voices = VOLC_VOICES;
   const [presets, setPresets] = useState<VoicePreset[]>([]);
   const [systemVoices, setSystemVoices] = useState<SystemVoice[]>([]);
   const [showMore, setShowMore] = useState(false);
+  const [voicePickerOpen, setVoicePickerOpen] = useState(false);
   const [showKey, setShowKey] = useState(false);
   const [presetName, setPresetName] = useState("");
   const [testing, setTesting] = useState(false);
@@ -991,21 +1177,13 @@ function TtsSettings({ draft, setDraft }: { draft: AppConfig; setDraft: (next: A
   const updateVolc = (patch: Partial<AppConfig["tts"]["volcengine"]>) =>
     setDraft({ ...draft, tts: { ...draft.tts, provider: "volcengine", volcengine: { ...section, ...patch } } });
   const chooseVersion = (version: string) => {
-    const firstVoice = voices.find(item => item.version === version);
+    const firstVoice = VOLC_VOICES.find(item => item.version === version);
     updateVolc({
       engine_version: version,
       resource_id: version === "1.0" ? "seed-tts-1.0" : "seed-tts-2.0",
       speaker: firstVoice?.id || section.speaker
     });
     setTestMessage(""); setTestAudio("");
-  };
-  const visibleVoices = voices.filter(item => item.version === section.engine_version);
-  const playOfficialPreview = (voice: VolcVoiceOption) => {
-    if (!voice.previewUrl) return;
-    setTesting(false);
-    setTestMessage(`${voice.name} · 官方公开样音（不需要 Key，不消耗合成额度）`);
-    setTestAudio(voice.previewUrl);
-    setTestAudioKey(value => value + 1);
   };
   const runTest = async () => {
     setTesting(true); setTestMessage(""); setTestAudio("");
@@ -1052,19 +1230,13 @@ function TtsSettings({ draft, setDraft }: { draft: AppConfig; setDraft: (next: A
           <div className="tts-version-row">
             <button className={section.engine_version === "2.0" ? "selected" : ""} onClick={() => chooseVersion("2.0")}><strong>语音合成 2.0</strong><small>情感更自然</small></button>
             <button className={section.engine_version === "1.0" ? "selected" : ""} onClick={() => chooseVersion("1.0")}><strong>语音合成 1.0</strong><small>经典音色</small></button>
-            <button className="more-voices" onClick={() => setShowMore(value => !value)}>更多音色…</button>
+            <button className="more-voices" onClick={() => setShowMore(value => !value)}>自定义音色…</button>
           </div>
-          <div className="tts-voice-grid">{visibleVoices.map(item =>
-            <article key={item.id} className={`tts-voice-card ${section.speaker === item.id ? "selected" : ""}`}>
-              <button className="tts-voice-select" onClick={() => updateVolc({ speaker: item.id })}>
-                <strong>{item.name}</strong><small>{item.desc}</small><em>{item.version}</em>
-              </button>
-              {item.previewUrl
-                ? <button className="tts-official-preview" title={`播放${item.name}官方公开样音`} onClick={() => playOfficialPreview(item)}><Play size={13} />{item.previewLabel || "官方样音"}</button>
-                : <span className="tts-preview-unavailable">暂无公开样音</span>}
-            </article>)}
-          </div>
-          <p>“官方样音”直接播放火山引擎官网公开试听文件，不需要 App ID 或 Token；正式合成仍使用你自己的接口配置。</p>
+          {(() => { const selected = VOLC_VOICES.find(item => item.id === section.speaker); return <div className="settings-selected-voice">
+            <div><Volume2 size={18} /><span><b>{selected?.name || "自定义音色"}<em>{selected?.version || section.engine_version}</em></b><small>{selected?.tag || section.speaker}</small></span></div>
+            <button onClick={() => setVoicePickerOpen(true)}><Search size={14} />打开音色库并试听</button>
+          </div>; })()}
+          <p>首次试听会调用你的火山 TTS 接口；生成后保存在本地缓存，后续可直接播放。</p>
         </div>
         {showMore && <div className="tts-more-panel">
           <label>自定义音色 ID<input value={section.speaker} onChange={e => updateVolc({ speaker: e.target.value })} placeholder="从火山引擎控制台复制 Speaker ID" /></label>
@@ -1089,6 +1261,7 @@ function TtsSettings({ draft, setDraft }: { draft: AppConfig; setDraft: (next: A
       </div>
       {testAudio && <div className="tts-preview-audio"><audio key={testAudioKey} controls autoPlay src={testAudio} /></div>}
     </div>
+    <VolcVoicePicker open={voicePickerOpen} value={section.speaker} speed={1} configured={Boolean(section.app_id?.trim() && section.access_key?.trim())} onClose={() => setVoicePickerOpen(false)} onPick={voice => updateVolc({ speaker: voice.id, engine_version: voice.version, resource_id: voice.version === "1.0" ? "seed-tts-1.0" : "seed-tts-2.0" })} />
   </>;
 }
 

@@ -1377,7 +1377,7 @@ async function generateReferenceImage({ provider, config, prompt, destination, r
     const form = new FormData();
     form.append("model", section.model || "gpt-image-2");
     form.append("prompt", `${requestPrompt}
-保持参考图中的人物身份、发型、服装与整体构图逻辑一致；人物采用演员化演绎，不要求复刻真实人物的精确面容。`);
+保持参考图中核心主体的身份与外观一致：人物需保持发型、服装和年龄特征，产品或物件需保持造型、颜色、包装与关键标识关系；人物采用演员化演绎，不要求复刻真实人物的精确面容。`);
     form.append("size", mappedImageSize(section, ratio));
     if (section.quality) form.append("quality", section.quality);
     const responseFormat = section.edit_response_format || "b64_json";
@@ -1794,6 +1794,6 @@ async function mediaDuration(app, config, file) {
 
 module.exports = {
   spawnAsync, resolveResource, ffmpegPath, generateSceneImage,
-  synthesizeSpeech, mediaDuration, imageSize, downloadFile, testConnection, generateRunningHubVideo,
+  synthesizeSpeech, requestVolcengineSpeech, mediaDuration, imageSize, downloadFile, testConnection, generateRunningHubVideo,
   listSystemVoices
 };

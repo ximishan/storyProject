@@ -13,6 +13,7 @@ const {
   retryOperation, fingerprint
 } = require("./checkpoint.cjs");
 const { buildPolicySafeImagePrompt } = require("./image-prompt-safety.cjs");
+const { sceneReferencePaths } = require("./reference-routing.cjs");
 
 function podcastSpeakerPair(id) {
   if (id === "liufei-xiaolei") {
@@ -390,9 +391,11 @@ async function completePipeline({ app, task, config, outputDir, script, emit, ch
           ratio: task.ratio,
           index: scene.index,
           materialSource: task.material_source,
-          referenceImagePath: scene.use_reference
-            ? (task.reference_image_path || generatedReferencePaths({ ...script, runtime }, scene))
-            : "",
+          referenceImagePath: sceneReferencePaths({
+            task,
+            scene,
+            generatedCharacterPaths: generatedReferencePaths({ ...script, runtime }, scene)
+          }),
           resumeTaskId: scene.image_remote_task_id || "",
           requestId,
           onRemoteTask: remote => {
@@ -736,9 +739,11 @@ async function regenerateScene({ app, task, config, outputDir, script, sceneInde
       prompt: requestSafety.prompt,
       destination: imagePath, ratio: task.ratio, index: scene.index,
       materialSource: task.material_source,
-      referenceImagePath: scene.use_reference
-        ? (task.reference_image_path || generatedReferencePaths(script, scene))
-        : "",
+      referenceImagePath: sceneReferencePaths({
+        task,
+        scene,
+        generatedCharacterPaths: generatedReferencePaths(script, scene)
+      }),
       resumeTaskId: resumeImageTaskId,
       requestId: `storybound-${task.id}-image-${scene.index}-${Date.now()}`,
       onRemoteTask: remote => {
@@ -804,7 +809,7 @@ async function renderPrepared({ app, task, config, outputDir, script, emit, opti
   }
 
   const renderOptions = {
-    animation: String(options.animation || task.draft_template?.image?.animation || "左拉镜"),
+    animation: String(options.animation || "缩放"),
     motionStrength: Math.max(0.25, Math.min(3, Number(options.motionStrength ?? task.draft_template?.image?.motionStrength ?? 1))),
     forceStaticImages: options.forceStaticImages !== false,
     burnCaption: options.burnCaption !== false,

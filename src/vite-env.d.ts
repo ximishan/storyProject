@@ -55,6 +55,7 @@ interface StoryboundApi {
   selectDirectory(title?: string): Promise<string>;
   clearHistory(): Promise<number>;
   researchSource(query: string, requirements?: string, options?: { web?: boolean; ai?: boolean; ima?: boolean }): Promise<{ title: string; text: string; sources: string[] }>;
+  previewVolcVoice(input: { speaker: string; speed?: number; text?: string }): Promise<{ path: string; dataUrl: string; cached: boolean; speaker: string }>;
   synthesizeVoice(input: { text: string; speed: number }): Promise<{ path: string; dataUrl: string; provider: string }>;
   generateMusicMv(input: { title: string; audioPath: string; images: string[]; lyrics: string; ratio: string }): Promise<{ outputDir: string; videoPath: string; draftDir: string }>;
   runTask(id: string): Promise<void>;
@@ -104,6 +105,7 @@ interface TaskRecord {
   target_length?: number;
   template_id?: string;
   reference_image_path?: string;
+  product_reference_image_path?: string;
   character_consistency_mode?: string;
   cover_image_mode?: string;
   cover_template_id?: string;
@@ -150,6 +152,7 @@ interface CreateTaskInput {
   targetLength?: number;
   templateId?: string;
   referenceImagePath?: string;
+  productReferenceImagePath?: string;
   characterConsistencyMode?: "off" | "upload" | "auto";
   coverImageMode?: string;
   coverTemplateId?: string;

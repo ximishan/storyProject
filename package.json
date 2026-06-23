@@ -1,6 +1,6 @@
 {
   "name": "storybound-rebuild",
-  "version": "0.8.9",
+  "version": "0.9.1",
   "private": true,
   "description": "A maintainable Storybound-compatible AI video creation desktop app",
   "main": "electron/main.cjs",
@@ -26,7 +26,11 @@
     "test:motion": "node scripts/motion-render-test.cjs",
     "test:caption": "node scripts/caption-punctuation-test.cjs",
     "test:character-db": "electron scripts/character-consistency-db-test.cjs",
-    "test:prompts": "node scripts/prompt-template-integration-test.cjs"
+    "test:prompts": "node scripts/prompt-template-integration-test.cjs",
+    "test:references": "node scripts/reference-routing-parity-test.cjs",
+    "test:style-previews": "node scripts/style-preview-assets-test.cjs",
+    "test:parity": "node scripts/parity-audit-test.cjs",
+    "test:voice-preview-parity": "node scripts/voice-preview-parity-test.cjs"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.4.1",

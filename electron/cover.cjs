@@ -1,6 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawnAsync, ffmpegPath, imageSize, generateSceneImage } = require("./services.cjs");
+const { coverReferencePaths } = require("./reference-routing.cjs");
 
 function assEscape(text) {
   return String(text || "").replace(/[{}]/g, "").replace(/\n/g, "\\N");
@@ -20,7 +21,7 @@ async function generateCover({ app, config, task, outputDir, script, sourceImage
       app, config,
       prompt: `${template?.prompt || "电影海报构图"}，${script.summary || script.title}`,
       destination: baseImage, ratio: "3:4", index: 0,
-      referenceImagePath: task.reference_image_path || ""
+      referenceImagePath: coverReferencePaths(task, script?.metadata?.reference_kind || "auto")
     });
   }
   const output = path.join(coverDir, "cover.jpg");

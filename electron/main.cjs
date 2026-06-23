@@ -5,7 +5,7 @@ const { openDatabase, createTask } = require("./database.cjs");
 const {
   runPipeline, preparePipeline, completePipeline, regenerateScene, renderPrepared, taskOutputDir
 } = require("./pipeline.cjs");
-const { generateSceneImage, synthesizeSpeech, testConnection, spawnAsync, listSystemVoices, ffmpegPath, mediaDuration } = require("./services.cjs");
+const { generateSceneImage, synthesizeSpeech, requestVolcengineSpeech, testConnection, spawnAsync, listSystemVoices, ffmpegPath, mediaDuration } = require("./services.cjs");
 const { renderMusicVideo, _captionTest } = require("./media.cjs");
 const { generateMusicDraft } = require("./draft.cjs");
 const crypto = require("node:crypto");
@@ -256,6 +256,7 @@ ipcMain.handle("tasks:duplicate", (_event, id) => {
     narrativePov: task.narrative_pov, keepPromotion: task.keep_promotion,
     materialSource: task.material_source, targetLength: task.target_length,
     templateId: task.template_id, referenceImagePath: task.reference_image_path,
+    productReferenceImagePath: task.product_reference_image_path,
     characterConsistencyMode: task.character_consistency_mode,
     coverImageMode: task.cover_image_mode, coverTemplateId: task.cover_template_id, pauseMode: task.pause_mode,
     sourceMode: task.source_mode, sourceQuery: task.source_query, sourceRequirements: task.source_requirements, bgmId: task.bgm_id,
@@ -716,6 +717,32 @@ ipcMain.handle("source:research", async (_event, query, requirements = "", optio
   if (!articles.length) throw new Error("未找到可用资料");
   return { title: query, text: `${query}\n${requirements}\n\n${articles.join("\n\n")}`, sources: articles.map(item => item.split("\n")[0]) };
 });
+ipcMain.handle("voice:preview", async (_event, input = {}) => {
+  const config = readConfig();
+  const speaker = String(input.speaker || "").trim();
+  if (!speaker) throw new Error("请选择要试听的火山音色");
+  const text = String(input.text || "他来到江南一个小村庄").trim().slice(0, 80) || "他来到江南一个小村庄";
+  const speed = Math.max(0.5, Math.min(2, Number(input.speed || 1)));
+  const cacheDir = path.join(app.getPath("userData"), "voice-preview-cache", "v2");
+  fs.mkdirSync(cacheDir, { recursive: true });
+  const cacheKey = crypto.createHash("sha256").update(`${speaker}|${speed}|${text}`).digest("hex");
+  const destination = path.join(cacheDir, `${cacheKey}.mp3`);
+  let cached = fs.existsSync(destination) && fs.statSync(destination).size > 256;
+  if (!cached) {
+    const audio = await requestVolcengineSpeech(config, text, speed, speaker);
+    if (!audio.length) throw new Error("试听音频生成失败");
+    fs.writeFileSync(destination, audio);
+    cached = false;
+  }
+  const audio = fs.readFileSync(destination);
+  return {
+    path: destination,
+    cached,
+    speaker,
+    dataUrl: `data:audio/mpeg;base64,${audio.toString("base64")}`
+  };
+});
+
 ipcMain.handle("voice:synthesize", async (_event, input) => {
   const config = readConfig();
   const outputDir = path.join(app.getPath("userData"), "voice-lab");

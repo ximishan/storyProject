@@ -1,0 +1,89 @@
+{
+  "source": "Storybound_1.7.0_x64-setup(4).exe",
+  "assets": [
+    {
+      "file": "ancient-cinematic-COp7S7MP.webp",
+      "sha256": "63c56792b471b16c48287ee7eaa2a0a0a2b99dc46c40b4724834cc70033eb13b",
+      "width": 400,
+      "height": 711,
+      "bytes": 44364
+    },
+    {
+      "file": "black-white-D1QqPH8b.webp",
+      "sha256": "862fcd343c8d0f8b4407fc7e9285c739b64bb4d49879b5c99aa3a79a3370ee0f",
+      "width": 400,
+      "height": 711,
+      "bytes": 17150
+    },
+    {
+      "file": "cinematic-BdXqwPs4.webp",
+      "sha256": "99cfcebb2d30ff4ca9b143eb427550ad0526b3ecb8e3887ef4db83f80f77ee6b",
+      "width": 400,
+      "height": 711,
+      "bytes": 14410
+    },
+    {
+      "file": "folk-tale-gongbi-D-GnOj_N.webp",
+      "sha256": "09430e8801a4fb0e1a6bde4190668c27a22e80cdf1265cde028231061bdcacdf",
+      "width": 400,
+      "height": 711,
+      "bytes": 59266
+    },
+    {
+      "file": "ghibli-CLd8wrdG.webp",
+      "sha256": "785fae3e57e076f0735a46c9466acda0d553ad0e7a9b3d34cd14df4937ff6175",
+      "width": 400,
+      "height": 711,
+      "bytes": 68230
+    },
+    {
+      "file": "illustration-Dx-tzI7d.webp",
+      "sha256": "a8d4bfd6b366beba16438a1199519754cfeaa4dc2c80719fd071274812b0de41",
+      "width": 400,
+      "height": 711,
+      "bytes": 13500
+    },
+    {
+      "file": "ink-wash-n6PE-maw.webp",
+      "sha256": "42ac53c4b7d62cb11de402f72f5b8bcdbddc50d29c12f4369ced70f8f7e94bd5",
+      "width": 400,
+      "height": 711,
+      "bytes": 29368
+    },
+    {
+      "file": "oil-painting-8NyuzxAO.webp",
+      "sha256": "20b265957c35fdd65460df6649222a3b61965956d67d96d5b75e609c834a336c",
+      "width": 400,
+      "height": 711,
+      "bytes": 43054
+    },
+    {
+      "file": "pixar-3d-DqhR0fI-.webp",
+      "sha256": "d0f42858731b6b4a306b510bc0454413bef36d5e71a1ef82abe2c34ea01e7ed5",
+      "width": 400,
+      "height": 711,
+      "bytes": 33208
+    },
+    {
+      "file": "realistic-Atk_pZhY.webp",
+      "sha256": "587cb3548292114a4efd6f9ea7da278179dfdbb41089b3cd1899a3ff91e516bf",
+      "width": 400,
+      "height": 711,
+      "bytes": 26992
+    },
+    {
+      "file": "vintage-film-CrPRxEWS.webp",
+      "sha256": "8ff70ef954f0a434c5dc3304f7f8f6e89a9e96850099636dcd0aa5a28dce6aef",
+      "width": 400,
+      "height": 711,
+      "bytes": 29540
+    },
+    {
+      "file": "watercolor-DPPl-c7w.webp",
+      "sha256": "97ec3d1c61a18371ecd3b05006cb17f938169932569812ea729ea0e93a332866",
+      "width": 400,
+      "height": 711,
+      "bytes": 42124
+    }
+  ]
+}

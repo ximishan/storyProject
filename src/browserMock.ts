@@ -158,6 +158,8 @@ export function installBrowserMock() {
         target_length: input.targetLength,
         template_id: input.templateId,
         reference_image_path: input.referenceImagePath,
+        product_reference_image_path: input.productReferenceImagePath,
+        character_consistency_mode: input.characterConsistencyMode,
         cover_image_mode: input.coverImageMode,
         cover_template_id: input.coverTemplateId,
         pause_mode: input.pauseMode,
@@ -334,6 +336,12 @@ export function installBrowserMock() {
     selectDirectory: async () => "C:\\demo\\output",
     clearHistory: async () => 0,
     researchSource: async (query, requirements, options) => ({ title: query, text: `${query} 的资料整理稿。\n${requirements || ""}\n数据源：${options?.web ? "全网" : ""}${options?.ai ? " AI知识" : ""}`, sources: ["浏览器预览资料"] }),
+    previewVolcVoice: async input => ({
+      path: "voice-preview.mp3",
+      cached: true,
+      speaker: input.speaker,
+      dataUrl: "data:audio/mpeg;base64,"
+    }),
     synthesizeVoice: async input => ({
       path: "voice.wav",
       provider: "browser-preview",

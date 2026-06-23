@@ -52,6 +52,7 @@ contextBridge.exposeInMainWorld("storybound", {
   selectDirectory: (title) => ipcRenderer.invoke("files:selectDirectory", title),
   clearHistory: () => ipcRenderer.invoke("history:clear"),
   researchSource: (query, requirements, options) => ipcRenderer.invoke("source:research", query, requirements, options),
+  previewVolcVoice: (input) => ipcRenderer.invoke("voice:preview", input),
   synthesizeVoice: (input) => ipcRenderer.invoke("voice:synthesize", input),
   generateMusicMv: (input) => ipcRenderer.invoke("music:generate", input),
   onTaskEvent: (callback) => {

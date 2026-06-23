@@ -4,6 +4,7 @@ let ProxyAgent = null;
 try { ({ ProxyAgent } = require("undici")); } catch {}
 const { atomicWriteJson, atomicWriteFile, readJsonSafe, fingerprint } = require("./checkpoint.cjs");
 const { buildPolicySafeImagePrompt } = require("./image-prompt-safety.cjs");
+const { taskReferenceAvailable } = require("./reference-routing.cjs");
 
 const systemPromptTemplates = Object.fromEntries(
   require("../shared/system-prompt-templates.json").map(item => [item.id, item])
@@ -111,12 +112,17 @@ function podcastSpeakerRoleLine(line) {
   return match ? { role: match[1].toUpperCase(), text: match[2].trim() } : null;
 }
 
-function localReferenceDecision(text, referenceKind, hasReference) {
-  if (!hasReference || referenceKind === "none") return false;
+function localSubjectPresence(text, referenceKind) {
   const value = String(text || "");
-  if (referenceKind === "product") return /产品|商品|包装|瓶|盒|菜|食物|器物|物件|手机|设备|衣服/.test(value);
-  if (referenceKind === "character") return /他|她|我|主角|男人|女人|男孩|女孩|老人|孩子|人物|先生|女士|父亲|母亲|丈夫|妻子/.test(value);
-  return true;
+  const hasProduct = /产品|商品|包装|瓶|盒|菜|食物|器物|物件|手机|设备|衣服/.test(value);
+  const hasCharacter = /他|她|我|主角|男人|女人|男孩|女孩|老人|孩子|人物|先生|女士|父亲|母亲|丈夫|妻子/.test(value);
+  if (referenceKind === "product") return hasProduct ? "product" : "none";
+  if (referenceKind === "character") return hasCharacter ? "character" : "none";
+  if (referenceKind === "none") return "none";
+  if (hasProduct && hasCharacter) return "both";
+  if (hasProduct) return "product";
+  if (hasCharacter) return "character";
+  return "none";
 }
 
 function buildMechanicalScript(task, sourceText = task.input_text, template = {}) {
@@ -133,9 +139,9 @@ function buildMechanicalScript(task, sourceText = task.input_text, template = {}
     : splitSourceText(sourceText, task.target_scenes).map((text, index) => ({ role: index % 2 ? "B" : "A", text }));
   if (!chunks.length) throw new Error("原始文案为空");
   const referenceKind = normalizeReferenceKind(template.reference_kind);
-  const hasReference = Boolean(task.reference_image_path || task.character_consistency_mode === "auto");
   const scenes = chunks.map((item, index) => {
-    const useReference = localReferenceDecision(item.text, referenceKind, hasReference);
+    const subjectPresence = localSubjectPresence(item.text, referenceKind);
+    const useReference = subjectPresence !== "none" && taskReferenceAvailable(task, subjectPresence);
     const rawImagePrompt = `${task.style}风格，${item.text}，主体明确，构图完整，适合${task.ratio}短视频画面，无文字无水印`;
     const promptSafety = buildPolicySafeImagePrompt(rawImagePrompt, "preflight");
     return {
@@ -150,7 +156,7 @@ function buildMechanicalScript(task, sourceText = task.input_text, template = {}
       image_prompt_safety_reasons: promptSafety.reasons,
       use_reference: useReference,
       reference_reason: useReference ? "直接出片模式使用本地关键词规则判断" : "本镜未识别到需要保持一致的主体",
-      subject_presence: useReference ? referenceKind : "none",
+      subject_presence: useReference ? subjectPresence : "none",
       era_and_location: "",
       duration_hint: Math.max(3, Math.min(12, item.text.length / 4.2)),
       ...(task.task_type === "podcast" ? { speaker_role: item.role } : {})
@@ -725,23 +731,28 @@ function normalizeMetadata(raw, template) {
 }
 
 function captionComparable(text) {
-  return String(text || "").replace(/·/gu, "\uE000").replace(/\p{P}|\s/gu, "").replace(/\uE000/gu, "·");
+  return String(text || "").replace(/\u00B7/gu, "\uE000").replace(/\p{P}|\s/gu, "").replace(/\uE000/gu, "\u00B7");
+}
+
+function splitStrongCaptionBoundaries(text) {
+  const source = String(text || "").trim();
+  if (!source) return [];
+  const parts = source.match(/[^。！？!?；;]+[。！？!?；;]*/gu) || [source];
+  return parts.map(item => item.trim()).filter(Boolean);
 }
 
 function normalizeCaptionSegments(narration, segments) {
   const values = Array.isArray(segments)
-    ? segments.map(item => String(item || "").trim()).filter(Boolean)
+    ? segments.flatMap(item => splitStrongCaptionBoundaries(item))
     : [];
   if (!values.length) return [];
-  const cleaned = values.map(item =>
-    item.replace(/·/gu, "\uE000").replace(/^[\p{P}\s]+|[\p{P}\s]+$/gu, "").replace(/\uE000/gu, "·")
-  ).filter(Boolean);
-  return captionComparable(cleaned.join("")) === captionComparable(narration) ? cleaned : [];
+  // 保留句末标点供 TTS 表达疑问、感叹和停顿；字幕显示层会单独隐藏普通标点。
+  return captionComparable(values.join("")) === captionComparable(narration) ? values : [];
 }
 
 function normalizeScene(scene, index, task, metadata, template, modules) {
   const referenceKind = normalizeReferenceKind(template.reference_kind);
-  const hasReference = Boolean(task.reference_image_path || task.character_consistency_mode === "auto");
+  const hasReference = taskReferenceAvailable(task, referenceKind);
   const subjectPresence = ["character", "product", "both", "none"].includes(scene.subject_presence)
     ? scene.subject_presence : "none";
   const kindMatches = referenceKind === "auto"
@@ -787,13 +798,13 @@ function buildRewriteUserPrompt(task, template) {
 }
 
 function buildMetadataUserPrompt(task, template, content, characterMode, referenceKind) {
-  return `内容类型：${task.track}\n主角档案模式：${characterMode}（follow=跟随赛道，force=强制提取，skip=强制跳过）\n本赛道是否需要主角档案：${template.needs_character_card ? "是" : "否"}\n参考图类型：${referenceKind}\n是否已上传参考图：${task.reference_image_path ? "是" : "否"}\n\n请严格执行 system 中的封面、发布与视觉元数据规则，并同时完整填写 publish 与视觉元数据字段。\n\n工作标题：${content.title}\n工作摘要：${content.summary}\n旁白：\n${content.narration}`;
+  return `内容类型：${task.track}\n主角档案模式：${characterMode}（follow=跟随赛道，force=强制提取，skip=强制跳过）\n本赛道是否需要主角档案：${template.needs_character_card ? "是" : "否"}\n参考图类型：${referenceKind}\n是否已有可用参考图：${taskReferenceAvailable(task, referenceKind) ? "是" : "否"}\n\n请严格执行 system 中的封面、发布与视觉元数据规则，并同时完整填写 publish 与视觉元数据字段。\n\n工作标题：${content.title}\n工作摘要：${content.summary}\n旁白：\n${content.narration}`;
 }
 
 function buildSceneUserPrompt(task, template, content, metadata, modules, seedPools, referenceKind) {
   const captionRule = "字幕语义分段硬规则：每个场景必须输出 caption_segments。优先按 narration 原有标点切分；每段建议 6-12 个汉字，必须是完整词语、完整短语或完整语义，禁止按固定字数切断姓名、动词或名词。显示时删除普通标点，但姓名间隔点“·”必须保留。所有分段拼接并去掉普通标点后，必须与 narration 正文完全一致。";
   const referenceRule = `${captionRule}\n${template.reference_decision_prompt || "只有镜头中清晰出现主角/产品且保持身份外观一致有价值时，use_reference 才能为 true；环境、空镜、器物特写和资料画面设为 false。"}`;
-  return `内容类型：${task.track}\n视频形态：${task.task_type === "podcast" ? "双人播客；每个镜头必须输出 speaker_role(A/B)" : "单人旁白"}\n目标分镜数：${task.target_scenes || "根据旁白长度自动决定"}\n画面比例：${task.ratio}\n视觉风格：${task.style}\n参考图类型：${referenceKind}\n是否已上传参考图：${task.reference_image_path ? "是" : "否"}\n参考图判断标准：${referenceRule}\n分镜骨架模块：${JSON.stringify(modules)}\n图片种子池：${JSON.stringify(seedPools)}\n\n图片合规硬规则：\n涉及医疗救治、受伤、暴力或死亡的旁白，只能使用克制的替代画面。优先表现包扎后的状态、人物神情、环境、器械、布帘遮挡、中景或远景，不得描述开放性创口、流体细节、缝合过程、尸体细节或极近景微距。\n\n请严格执行 system 中的赛道分镜规则，最终输出格式只遵守 system 统一 scenes JSON 协议。\n\n元数据：\n${JSON.stringify(metadata, null, 2)}\n\n必须完整覆盖的旁白：\n${content.narration}`;
+  return `内容类型：${task.track}\n视频形态：${task.task_type === "podcast" ? "双人播客；每个镜头必须输出 speaker_role(A/B)" : "单人旁白"}\n目标分镜数：${task.target_scenes || "根据旁白长度自动决定"}\n画面比例：${task.ratio}\n视觉风格：${task.style}\n参考图类型：${referenceKind}\n是否已有可用参考图：${taskReferenceAvailable(task, referenceKind) ? "是" : "否"}\n参考图判断标准：${referenceRule}\n分镜骨架模块：${JSON.stringify(modules)}\n图片种子池：${JSON.stringify(seedPools)}\n\n图片合规硬规则：\n涉及医疗救治、受伤、暴力或死亡的旁白，只能使用克制的替代画面。优先表现包扎后的状态、人物神情、环境、器械、布帘遮挡、中景或远景，不得描述开放性创口、流体细节、缝合过程、尸体细节或极近景微距。\n\n请严格执行 system 中的赛道分镜规则，最终输出格式只遵守 system 统一 scenes JSON 协议。\n\n元数据：\n${JSON.stringify(metadata, null, 2)}\n\n必须完整覆盖的旁白：\n${content.narration}`;
 }
 
 function llmIdentity(config) {
@@ -911,7 +922,7 @@ async function planVideoScript({ config, task, outputDir, onStage = () => {} }) 
     character_mode: characterMode,
     needs_character_card: Boolean(template.needs_character_card),
     reference_kind: referenceKind,
-    reference_available: Boolean(task.reference_image_path),
+    reference_available: taskReferenceAvailable(task, referenceKind),
     template_prompt: template.step1_metadata_system_prompt || ""
   };
   let rawMetadata = readStageCache(debugDir, "02-metadata", metadataInput);
@@ -942,7 +953,7 @@ async function planVideoScript({ config, task, outputDir, onStage = () => {} }) 
     style: task.style,
     task_type: task.task_type,
     reference_kind: referenceKind,
-    reference_available: Boolean(task.reference_image_path),
+    reference_available: taskReferenceAvailable(task, referenceKind),
     reference_decision_prompt: template.reference_decision_prompt || "",
     image_prompt_template: template.image_prompt_template || "",
     modules,
@@ -982,7 +993,7 @@ async function planVideoScript({ config, task, outputDir, onStage = () => {} }) 
       template_name: template.name || "",
       character_card_mode: characterMode,
       reference_kind: referenceKind,
-      reference_available: Boolean(task.reference_image_path),
+      reference_available: taskReferenceAvailable(task, referenceKind),
       step3_skeleton_modules: modules,
       image_seed_pools: seedPools,
       reference_decision_prompt: template.reference_decision_prompt || ""
@@ -999,6 +1010,7 @@ module.exports = {
   cleanJsonText,
   resolveTemplate,
   normalizeProcessingMode,
+  normalizeCaptionSegments,
   applyImagePromptTemplate,
   testModelConnection
 };

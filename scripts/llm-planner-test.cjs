@@ -3,9 +3,14 @@ const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
-const { planVideoScript } = require("../electron/llm-planner.cjs");
+const { planVideoScript, normalizeCaptionSegments } = require("../electron/llm-planner.cjs");
 
 (async () => {
+  assert.deepEqual(
+    normalizeCaptionSegments("值得吗？后悔吗？", ["值得吗？后悔吗？"]),
+    ["值得吗？", "后悔吗？"],
+    "同一模型分段中的连续问句必须按问号强制拆开"
+  );
   const calls = [];
   const replies = [
     {
