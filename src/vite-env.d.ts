@@ -10,6 +10,7 @@ interface StoryboundApi {
   resumeQueue(): Promise<{ running: boolean; count?: number; empty?: boolean }>;
   prepareTask(id: string): Promise<TaskRecord>;
   continueTask(id: string): Promise<TaskRecord>;
+  repairMissingImages(id: string): Promise<TaskRecord>;
   updatePipeline(id: string, pipeline: PipelineData): Promise<TaskRecord>;
   regenerateScene(id: string, sceneIndex: number, kind: "image" | "audio"): Promise<TaskRecord>;
   replaceSceneImage(id: string, sceneIndex: number): Promise<TaskRecord>;
@@ -40,7 +41,7 @@ interface StoryboundApi {
   showInFolder(target: string): Promise<void>;
   pathToDataUrl(target: string): Promise<string>;
   writeClipboard(text: string): Promise<boolean>;
-  generateImage(input: { prompt: string; style: string; ratio: string; resolution?: string; referenceImagePath?: string }): Promise<{ path: string; dataUrl: string; provider: string }>;
+  generateImage(input: { prompt: string; styleId?: string; style?: string; ratio: string; resolution?: string; referenceImagePath?: string }): Promise<{ path: string; dataUrl: string; provider: string }>;
   listPlaygroundJobs(): Promise<PlaygroundJob[]>;
   listStyles(): Promise<StyleRecord[]>;
   saveStyle(input: Partial<StyleRecord> & { name: string }): Promise<StyleRecord>;
@@ -78,7 +79,7 @@ interface RenderTaskOptions {
   titleDuration: number;
 }
 
-type TaskStatus = "pending" | "running" | "interrupted" | "review" | "completed" | "failed" | "cancelled";
+type TaskStatus = "pending" | "running" | "cancelling" | "interrupted" | "review" | "completed" | "failed" | "cancelled";
 
 interface TaskRecord {
   id: string;
@@ -96,6 +97,7 @@ interface TaskRecord {
   draft_dir?: string;
   pipeline_data?: string;
   target_scenes?: number;
+  tts_provider?: "system" | "volcengine";
   tts_speed?: number;
   prompt_template_id?: string;
   rewrite_intensity?: string;
@@ -143,6 +145,7 @@ interface CreateTaskInput {
   style: string;
   ratio: string;
   targetScenes?: number;
+  ttsProvider?: "system" | "volcengine";
   ttsSpeed?: number;
   promptTemplateId?: string;
   rewriteIntensity?: string;
@@ -354,6 +357,7 @@ interface AppConfig {
     concurrency: number;
     proxy_url: string;
     custom_models: string[];
+    negative_prompt_field?: string;
   };
   custom_image: {
     display_name: string;
@@ -373,11 +377,26 @@ interface AppConfig {
     status_field: string;
     image_field: string;
     success_values: string;
+    negative_prompt_field?: string;
     extra_body_json: string;
     ratio_mapping_json: string;
     ratio: string;
     resolution: string;
     concurrency: number;
+    proxy_url: string;
+  };
+  apimart: {
+    display_name: string;
+    base_url: string;
+    api_key: string;
+    model: string;
+    ratio: string;
+    resolution: string;
+    concurrency: number;
+    official_fallback: boolean;
+    policy_fallback: boolean;
+    poll_interval_ms: number;
+    poll_timeout_seconds: number;
     proxy_url: string;
   };
   runninghub: {

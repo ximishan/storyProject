@@ -19,7 +19,8 @@ async function generateCover({ app, config, task, outputDir, script, sourceImage
   } else {
     await generateSceneImage({
       app, config,
-      prompt: `${template?.prompt || "电影海报构图"}，${script.summary || script.title}`,
+      prompt: `${template?.prompt || "海报构图"}，${script.summary || script.title}`,
+      styleConfig: task.style_config,
       destination: baseImage, ratio: "3:4", index: 0,
       referenceImagePath: coverReferencePaths(task, script?.metadata?.reference_kind || "auto")
     });

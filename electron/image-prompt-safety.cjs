@@ -64,17 +64,18 @@ function extractFirst(text, patterns, fallback = "") {
   return fallback;
 }
 
-function extractContext(text) {
+// Safety works only on the scene-content layer. Visual style is never inferred here.
+function extractSceneContext(text) {
   const era = extractFirst(text, [/(?:18|19|20)\d{2}年(?:\d{1,2}月)?/, /(?:民国|抗战|二战|古代|近代)[^，。；]{0,12}/]);
   const location = extractFirst(text, [/(?:中国)?华北前线/, /(?:中国)?(?:东北|华北|华东|华中|西北|西南|华南)[^，。；]{0,10}/, /[^，。；]{0,12}(?:医院|医疗站|诊所|营地|战地)/]);
-  const style = extractFirst(text, [/(?:黑白|彩色)?(?:历史)?纪实摄影/, /真实胶片颗粒/, /电影感/, /油画风格/, /插画风格/, /纪录片风格/], "历史纪实摄影");
   const ratio = extractFirst(text, [/(?:9:16|16:9|1:1|4:3|3:4|2:3|3:2)(?:竖构图|横构图|构图)?/], "9:16竖构图");
-  const light = extractFirst(text, [/煤油灯[^，。；]{0,28}/, /自然光[^，。；]{0,20}/, /侧光[^，。；]{0,20}/, /柔和光线[^，。；]{0,20}/], "柔和侧光");
-  return { era, location, style, ratio, light };
+  const light = extractFirst(text, [/煤油灯[^，。；]{0,28}/, /自然光[^，。；]{0,20}/, /侧光[^，。；]{0,20}/, /柔和光线[^，。；]{0,20}/], "柔和光线");
+  return { era, location, ratio, light };
 }
 
 function joinPrompt(parts) {
   return parts
+    .flatMap(item => Array.isArray(item) ? item : [item])
     .map(item => normalizePromptText(item))
     .filter(Boolean)
     .join("，")
@@ -84,20 +85,18 @@ function joinPrompt(parts) {
 }
 
 function medicalSafePrompt(text, level) {
-  const context = extractContext(text);
+  const context = extractSceneContext(text);
   const scene = level === "ultra"
-    ? "一位医生的演员化历史形象站在简朴医疗站内，医护人员安静整理医疗器械，人物神情专注而疲惫"
+    ? "一位医生站在简朴医疗站内，医护人员安静整理医疗器械，人物神情专注而疲惫"
     : level === "minimal"
-      ? "一位医生的演员化历史形象站在简朴医疗站内，低头查看已经妥善包扎好的左手食指，身后医护人员安静整理医疗器械，人物神情专注而疲惫"
-      : "一位外国医生的演员化历史形象站在简朴医疗站内，低头查看已经用干净纱布妥善包扎好的左手食指，身后医护人员整理医疗器械，患者区域由布帘和景深自然遮挡，人物神情专注而疲惫";
+      ? "一位医生站在简朴医疗站内，低头查看已经妥善包扎好的手指，身后医护人员安静整理医疗器械，人物神情专注而疲惫"
+      : "一位医生站在简朴医疗站内，低头查看已经用干净纱布妥善包扎好的手指，身后医护人员整理医疗器械，患者区域由布帘自然遮挡，人物神情专注而疲惫";
   return joinPrompt([
     context.era,
     context.location,
-    context.style,
     scene,
     context.light,
-    "中近景叙事镜头",
-    "真实胶片颗粒",
+    "中近景叙事构图",
     "情绪克制",
     "适合大众观看",
     context.ratio,
@@ -106,19 +105,18 @@ function medicalSafePrompt(text, level) {
 }
 
 function violenceSafePrompt(text, level) {
-  const context = extractContext(text);
+  const context = extractSceneContext(text);
   const scene = level === "ultra"
-    ? "安静的历史环境，远处人物有序行走，镜头聚焦建筑、道路与时代氛围"
+    ? "安静的历史环境，远处人物有序行走，画面聚焦建筑、道路与时代氛围"
     : level === "minimal"
-      ? "几名人物的演员化历史形象在远处穿行，镜头聚焦环境、神情与时代氛围"
-      : "历史事件发生后的安静环境，人物采用演员化演绎，远处人群有序行动，镜头聚焦环境、神情、尘土与光影";
+      ? "几名人物在远处穿行，画面聚焦环境、神情与时代氛围"
+      : "历史事件发生后的安静环境，远处人群有序行动，画面聚焦环境、神情、尘土与光影";
   return joinPrompt([
     context.era,
     context.location,
-    context.style,
     scene,
     context.light,
-    "中远景叙事镜头",
+    "中远景叙事构图",
     "情绪克制",
     "适合大众观看",
     context.ratio,
@@ -127,14 +125,13 @@ function violenceSafePrompt(text, level) {
 }
 
 function lossSafePrompt(text) {
-  const context = extractContext(text);
+  const context = extractSceneContext(text);
   return joinPrompt([
     context.era,
     context.location,
-    context.style,
     "安静的纪念场景，空椅、旧照片、桌面物件与窗边光线传达人物离去后的情绪",
     context.light,
-    "中景叙事镜头",
+    "中景叙事构图",
     "情绪克制",
     "适合大众观看",
     context.ratio,
@@ -143,14 +140,13 @@ function lossSafePrompt(text) {
 }
 
 function genericSafePrompt(text) {
-  const context = extractContext(text);
+  const context = extractSceneContext(text);
   return joinPrompt([
     context.era,
     context.location,
-    context.style,
-    "人物采用演员化历史形象，镜头聚焦人物神情、环境与具有叙事作用的物件",
+    "人物置身于与故事相符的环境中，画面聚焦人物神情、环境与具有叙事作用的物件",
     context.light,
-    "中景叙事镜头",
+    "中景叙事构图",
     "情绪克制",
     "适合大众观看",
     context.ratio,
@@ -162,9 +158,9 @@ function scrubResidualRisk(prompt) {
   let text = normalizePromptText(prompt);
   const replacements = [
     [/简陋手术室|手术室/gi, "简朴医疗站"],
-    [/极近景特写|极近景|微距特写|超近景|伤口特写|创口特写/gi, "中近景叙事镜头"],
-    [/白求恩|诺尔曼·白求恩/gi, "一位外国医生的演员化历史形象"],
-    [/左手食指[^，。；]*(?:割口|伤口|创口|流血|渗出|滴落)[^，。；]*/gi, "左手食指已经用干净纱布妥善包扎，人物低头查看手指"],
+    [/极近景特写|极近景|微距特写|超近景|伤口特写|创口特写/gi, "中近景叙事构图"],
+    [/白求恩|诺尔曼·白求恩/gi, "一位外国医生的历史形象"],
+    [/左手食指[^，。；]*(?:割口|伤口|创口|流血|渗出|滴落)[^，。；]*/gi, "手指已经用干净纱布妥善包扎，人物低头查看手指"],
     [/(?:暗红色|鲜红色)?(?:血液|鲜血|血迹)[^，。；]*(?:滴落|渗出|流淌)?/gi, "画面情绪保持克制"],
     [/(?:正在|为|对)[^，。；]{0,36}(?:伤员|患者)[^，。；]{0,18}(?:伤口|创口|患处)[^，。；]{0,18}(?:缝合|清创|处理)[^，。；]*/gi, "在医疗台旁专注救治，患者区域由医护人员和布帘自然遮挡"],
     [/伤口进行缝合操作|创口进行缝合操作|缝合伤口|清创过程|切开皮肤|剖开身体|解剖过程|取出子弹/gi, "专注救治"],
@@ -184,6 +180,7 @@ function buildPolicySafeImagePrompt(prompt, level = "safe") {
   if (!analysis.risky && level === "preflight") {
     return { prompt: analysis.text, adjusted: false, reasons: [], category: analysis.category, level };
   }
+
   let safePrompt;
   if (analysis.category === "medical") safePrompt = medicalSafePrompt(analysis.text, level);
   else if (analysis.category === "violence") safePrompt = violenceSafePrompt(analysis.text, level);
@@ -194,8 +191,8 @@ function buildPolicySafeImagePrompt(prompt, level = "safe") {
   const remaining = analyzeImagePromptRisk(safePrompt);
   if (remaining.risky) {
     safePrompt = analysis.category === "medical"
-      ? medicalSafePrompt("历史纪实摄影，9:16竖构图", "minimal")
-      : genericSafePrompt("历史纪实摄影，9:16竖构图");
+      ? medicalSafePrompt("9:16竖构图", "minimal")
+      : genericSafePrompt("9:16竖构图");
   }
   return {
     prompt: safePrompt,

@@ -1,5 +1,6 @@
 const Database = require("better-sqlite3");
 const crypto = require("node:crypto");
+const { canonicalStyleId, resolveVisualStyle, styleSnapshot } = require("./visual-styles.cjs");
 
 const schema = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -9,7 +10,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   status TEXT DEFAULT 'pending',
   current_step INTEGER DEFAULT 0,
   track TEXT DEFAULT 'character-story',
-  style TEXT DEFAULT 'black-white',
+  style TEXT DEFAULT '',
   ratio TEXT DEFAULT '9:16',
   output_dir TEXT DEFAULT '',
   error_message TEXT DEFAULT '',
@@ -178,6 +179,8 @@ function migrateTasks(db) {
     ,["interrupted_at", "INTEGER DEFAULT 0"]
     ,["resume_count", "INTEGER DEFAULT 0"]
     ,["queue_batch_id", "TEXT DEFAULT ''"]
+    ,["style_snapshot_json", "TEXT DEFAULT ''"]
+    ,["style_registry_version", "TEXT DEFAULT ''"]
   ];
   for (const [name, sql] of additions) {
     if (!columns.has(name)) db.exec(`ALTER TABLE tasks ADD COLUMN ${name} ${sql}`);
@@ -189,6 +192,15 @@ function normalizeLegacyTaskValues(db) {
   db.prepare("UPDATE tasks SET processing_mode='semi_auto' WHERE processing_mode='semi'").run();
   db.prepare("UPDATE tasks SET cover_image_mode='titled' WHERE cover_image_mode='title'").run();
   db.prepare("UPDATE tasks SET cover_image_mode='plain' WHERE cover_image_mode='blank'").run();
+  // Earlier rebuilds used three IDs that do not exist in the original 1.7.0 registry.
+  db.prepare("UPDATE tasks SET style='vintage-film' WHERE style='retro-film'").run();
+  db.prepare("UPDATE tasks SET style='illustration' WHERE style='magazine'").run();
+  db.prepare("UPDATE tasks SET style='folk-tale-gongbi' WHERE style='folk-illustration'").run();
+  // 旧版本没有把 TTS provider 写入任务，火山音色任务会被数据库默认值误标为 system。
+  db.prepare("UPDATE tasks SET tts_provider='volcengine' WHERE speaker LIKE '%_bigtts%' AND COALESCE(tts_provider,'system')='system'").run();
+  db.prepare("UPDATE user_prompt_templates SET style_id='vintage-film' WHERE style_id IN ('retro-film','food-cinematic')").run();
+  db.prepare("UPDATE user_prompt_templates SET style_id='illustration' WHERE style_id='magazine'").run();
+  db.prepare("UPDATE user_prompt_templates SET style_id='folk-tale-gongbi' WHERE style_id='folk-illustration'").run();
 }
 
 function migratePromptTemplates(db) {
@@ -291,33 +303,41 @@ function seedCoverTemplates(db) {
 
 function createTask(db, input) {
   const id = crypto.randomUUID();
+  const rawStyle = String(input.style || "").trim();
+  if (!rawStyle) throw new Error("创建任务时没有收到画面风格。为避免静默回退成黑白摄影，请重新选择风格后再创建任务。");
+  const requestedStyle = canonicalStyleId(rawStyle);
+  const customStyle = db.prepare("SELECT * FROM custom_styles WHERE id=?").get(requestedStyle);
+  const resolvedStyle = resolveVisualStyle(requestedStyle, customStyle);
+  const resolvedStyleSnapshot = styleSnapshot(resolvedStyle);
   const processingMode = input.processingMode === "semi" ? "semi_auto" : (input.processingMode || "auto");
   const coverImageMode = input.coverImageMode === "title" ? "titled"
     : input.coverImageMode === "blank" ? "plain" : (input.coverImageMode || "off");
   db.prepare(`
     INSERT INTO tasks (
-      id,title,input_text,track,style,ratio,target_scenes,tts_speed,prompt_template_id,
+      id,title,input_text,track,style,ratio,target_scenes,tts_provider,tts_speed,prompt_template_id,
       rewrite_intensity,narrative_pov,keep_promotion,material_source,target_length,template_id,
       reference_image_path,product_reference_image_path,character_consistency_mode,cover_image_mode,cover_template_id,pause_mode,source_mode,source_query,source_requirements,bgm_id,
       speaker,task_type,script_format,podcast_image_mode,podcast_speakers,processing_mode,pause_points,
       video_intro,video_intro_duration,research_web,research_ai,research_ima
     )
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
   `).run(
-    id, input.title, input.inputText, input.track, input.style, input.ratio,
-    input.targetScenes ? Number(input.targetScenes) : null, Number(input.ttsSpeed || 1), input.promptTemplateId || "",
+    id, input.title, input.inputText, input.track, resolvedStyle.id, input.ratio,
+    input.targetScenes ? Number(input.targetScenes) : null, ["system", "volcengine"].includes(input.ttsProvider) ? input.ttsProvider : "system", Number(input.ttsSpeed || 1), input.promptTemplateId || "",
     input.rewriteIntensity || "standard", input.narrativePov || "original", input.keepPromotion ? 1 : 0,
     input.materialSource || "ai", input.targetLength ? Number(input.targetLength) : null,
     input.templateId || "default-portrait-9-16", input.referenceImagePath || "", input.productReferenceImagePath || "",
     input.characterConsistencyMode || (input.referenceImagePath ? "upload" : "off"),
     coverImageMode, input.coverTemplateId || "cinematic-poster",
-    input.pauseMode || "none", input.sourceMode || "paste", input.sourceQuery || "", input.sourceRequirements || "",
-    input.bgmId || "builtin", input.speaker || "",
+    input.pauseMode || "script", input.sourceMode || "paste", input.sourceQuery || "", input.sourceRequirements || "",
+    input.bgmId || "builtin", input.speaker ?? "",
     input.taskType || "story", input.scriptFormat || (input.taskType === "podcast" ? "dialogue" : "narration"),
     input.podcastImageMode || "multi", input.podcastSpeakers || "mizai-dayi", processingMode,
     JSON.stringify(input.pausePoints || []), Number(input.videoIntro || 0), Number(input.videoIntroDuration || 0),
     input.researchWeb === false ? 0 : 1, input.researchAi ? 1 : 0, input.researchIma ? 1 : 0
   );
+  db.prepare("UPDATE tasks SET style_snapshot_json=?,style_registry_version=? WHERE id=?")
+    .run(JSON.stringify(resolvedStyleSnapshot), resolvedStyle.registry_version || "", id);
   return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
 }
 

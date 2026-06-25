@@ -45,10 +45,15 @@ const { planVideoScript, normalizeCaptionSegments } = require("../electron/llm-p
     },
     {
       scenes: [
+        { index: 1, narration: "1938年，他离开车站。" },
+        { index: 2, narration: "雨中的老街空无一人。" }
+      ]
+    },
+    {
+      scenes: [
         {
           index: 1,
           narration: "1938年，他离开车站。",
-          caption_segments: ["1938年", "他离开车站"],
           visual: "青年提着皮箱走出车站",
           desc_prompt: "青年提着旧皮箱走出木质车站，中景",
           use_reference: true,
@@ -60,7 +65,6 @@ const { planVideoScript, normalizeCaptionSegments } = require("../electron/llm-p
         {
           index: 2,
           narration: "雨中的老街空无一人。",
-          caption_segments: ["雨中的老街", "空无一人"],
           visual: "雨夜老街空镜",
           desc_prompt: "空无一人的石板老街，雨水反光，远景",
           use_reference: false,
@@ -111,21 +115,22 @@ const { planVideoScript, normalizeCaptionSegments } = require("../electron/llm-p
       outputDir: workDir
     });
 
-    assert.equal(calls.length, 3, "应依次执行文案、元数据、分镜三次请求");
+    assert.equal(calls.length, 4, "应依次执行文案、元数据、旁白切分、分镜画面四次请求");
     assert.equal(calls[0].url, "/v1/chat/completions");
     assert.equal(result.metadata.planner_mode, "staged-llm");
     assert.equal(result.title, "雨夜归乡");
     assert.equal(result.subtitle.length, 2);
     assert.equal(result.tags[0], "#人物故事");
     assert.equal(result.scenes.length, 2);
-    assert.deepEqual(result.scenes[0].caption_segments, ["1938年", "他离开车站"]);
+    assert.deepEqual(result.scenes[0].caption_segments, []);
     assert.equal(result.scenes[0].use_reference, true);
     assert.equal(result.scenes[1].use_reference, false);
     assert.match(result.scenes[0].image_prompt, /清瘦长脸/);
     assert.match(result.scenes[0].image_prompt, /无文字/);
     assert.ok(fs.existsSync(path.join(workDir, "llm-debug", "01-rewrite-request.json")));
     assert.ok(fs.existsSync(path.join(workDir, "llm-debug", "02-metadata-parsed.json")));
-    assert.ok(fs.existsSync(path.join(workDir, "llm-debug", "03-scenes-parsed.json")));
+    assert.ok(fs.existsSync(path.join(workDir, "llm-debug", "03-scenes-plan-parsed.json")));
+    assert.ok(fs.existsSync(path.join(workDir, "llm-debug", "03-scenes-001-002-parsed.json")));
 
     const resumed = await planVideoScript({
       config: { llm: { protocol: "openai", api_key: "test-key", model: "test-model", base_url: `http://127.0.0.1:${port}/v1`, proxy_url: "" } },
@@ -147,7 +152,7 @@ const { planVideoScript, normalizeCaptionSegments } = require("../electron/llm-p
       },
       outputDir: workDir
     });
-    assert.equal(calls.length, 3, "恢复执行时应直接复用三个阶段检查点，不重复调用模型");
+    assert.equal(calls.length, 4, "恢复执行时应复用文案、元数据、旁白切分和分镜批次检查点，不重复调用模型");
     assert.deepEqual(resumed.scenes.map(item => item.image_prompt), result.scenes.map(item => item.image_prompt));
     assert.ok(fs.existsSync(path.join(workDir, "llm-debug", "01-rewrite-reused.json")));
     assert.ok(fs.existsSync(path.join(workDir, "llm-debug", "03-scenes-reused.json")));

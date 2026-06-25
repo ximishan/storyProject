@@ -277,53 +277,69 @@ function splitCaptionChunks(text, maxCharsPerLine = 14, maxLines = 1) {
   return chunks.filter(Boolean);
 }
 
-function captionSchedule(text, duration, maxCharsPerLine = 14, maxLines = 1) {
-  const chunks = splitCaptionChunks(text, maxCharsPerLine, maxLines);
+function scheduleCaptionChunks(chunks, duration) {
+  const normalized = Array.isArray(chunks)
+    ? chunks.map(item => stripCaptionDisplayPunctuation(item)).filter(Boolean)
+    : [];
   const total = Math.max(0, Number(duration || 0));
-  if (!chunks.length || total <= 0) return [];
+  if (!normalized.length || total <= 0) return [];
 
-  const weights = chunks.map(item => Math.max(1, String(item || "").replace(/[，。！？；：、,.!?;:\s]/gu, "").length));
+  const weights = normalized.map(item => Math.max(1, String(item || "").replace(/[，。！？；：、,.!?;:\s]/gu, "").length));
   const totalWeight = weights.reduce((sum, weight) => sum + weight, 0);
-  // 时长充足时保证每条至少 0.55 秒；时长不足时按字数比例压缩，绝不丢掉最后一条字幕。
-  const minimum = total >= chunks.length * 0.55 ? 0.55 : 0;
-  const weightedPool = Math.max(0, total - minimum * chunks.length);
+  // 字幕只分配现有语音的总时长，不参与 TTS 合成，也不会改变原音频。
+  // 时长充足时保证每条至少 0.45 秒，避免闪屏；不足时退回纯字数比例。
+  const minimum = total >= normalized.length * 0.45 ? 0.45 : 0;
+  const weightedPool = Math.max(0, total - minimum * normalized.length);
   const durations = weights.map(weight => minimum + weightedPool * weight / Math.max(1, totalWeight));
 
   let cursor = 0;
-  return chunks.map((item, index) => {
+  return normalized.map((item, index) => {
     const start = cursor;
-    const end = index === chunks.length - 1 ? total : Math.min(total, cursor + durations[index]);
+    const end = index === normalized.length - 1 ? total : Math.min(total, cursor + durations[index]);
     cursor = end;
     return { text: item, start, end };
   }).filter(item => item.end > item.start);
 }
 
+function captionSchedule(text, duration, maxCharsPerLine = 14, maxLines = 1) {
+  return scheduleCaptionChunks(
+    splitCaptionChunks(text, maxCharsPerLine, maxLines),
+    duration
+  );
+}
+
+function buildCaptionTimings(text, duration, maxCharsPerLine = 14) {
+  return captionSchedule(text, duration, maxCharsPerLine, 1);
+}
+
 function sceneCaptionSchedule(scene, maxChars = 14) {
   const duration = Number(scene?.duration || 0);
+  const safeMaxChars = Math.max(6, Number(maxChars || 14));
   const timings = Array.isArray(scene?.caption_timings) ? scene.caption_timings : [];
   if (timings.length) {
-    return timings.map(item => ({
-      text: stripCaptionDisplayPunctuation(item.text),
-      start: Math.max(0, Number(item.start || 0)),
-      end: Math.min(duration, Number(item.end || 0))
-    })).filter(item => item.text && item.end > item.start);
+    const output = [];
+    for (const item of timings) {
+      const start = Math.max(0, Number(item.start || 0));
+      const end = Math.min(duration, Number(item.end || 0));
+      if (end <= start) continue;
+      const local = captionSchedule(item.text, end - start, safeMaxChars, 1);
+      for (const part of local) {
+        output.push({ text: part.text, start: start + part.start, end: start + part.end });
+      }
+    }
+    return output.filter(item => item.text && item.end > item.start);
   }
-  const segments = Array.isArray(scene?.caption_segments)
-    ? scene.caption_segments.map(item => stripCaptionDisplayPunctuation(item)).filter(Boolean)
+
+  const rawSegments = Array.isArray(scene?.caption_segments)
+    ? scene.caption_segments.map(item => String(item || "").trim()).filter(Boolean)
     : [];
-  if (segments.length && duration > 0) {
-    const weights = segments.map(item => Math.max(1, item.length));
-    const totalWeight = weights.reduce((sum, item) => sum + item, 0);
-    let cursor = 0;
-    return segments.map((text, index) => {
-      const start = cursor;
-      const end = index === segments.length - 1 ? duration : cursor + duration * weights[index] / totalWeight;
-      cursor = end;
-      return { text, start, end };
-    });
+  if (rawSegments.length && duration > 0) {
+    const chunks = rawSegments.flatMap(item => splitCaptionChunks(item, safeMaxChars, 1));
+    return scheduleCaptionChunks(chunks, duration);
   }
+
   const prefix = scene?.speaker_name ? `${scene.speaker_name}：` : "";
-  return captionSchedule(`${prefix}${String(scene?.narration || "").trim()}`, duration, Number(maxChars || 14), 1);
+  return captionSchedule(`${prefix}${String(scene?.narration || "").trim()}`, duration, safeMaxChars, 1);
 }
 
 function writeSrt(scenes, destination, maxChars = 14) {
@@ -334,7 +350,8 @@ function writeSrt(scenes, destination, maxChars = 14) {
     const duration = Number(scene.duration || 0);
     const schedule = sceneCaptionSchedule(scene, Number(maxChars || 14));
     for (const item of schedule) {
-      blocks.push(`${blockIndex++}\n${srtTime(timelineCursor + item.start)} --> ${srtTime(timelineCursor + item.end)}\n${wrapCaption(item.text, Number(maxChars || 14))}\n`);
+      const singleLine = String(item.text || "").replace(/\r?\n/g, "").trim();
+      blocks.push(`${blockIndex++}\n${srtTime(timelineCursor + item.start)} --> ${srtTime(timelineCursor + item.end)}\n${singleLine}\n`);
     }
     timelineCursor += duration;
   }
@@ -460,11 +477,13 @@ function writeAssOverlay({ scenes, destination, width, height, template = {}, ti
     "Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text"
   ];
 
-  const addEvent = (layer, start, end, style, text, config, maxChars = 0) => {
+  const addEvent = (layer, start, end, style, text, config, maxChars = 0, singleLine = false) => {
     if (!text || end <= start) return;
     const position = layerPosition(config, width, height);
-    const wrapped = wrapCaption(String(text).trim(), maxChars).replace(/\n/g, "\\N");
-    lines.push(`Dialogue: ${layer},${assTime(start)},${assTime(end)},${style},,0,0,0,,{\\an${position.align}\\pos(${position.x},${position.y})}${assEscape(wrapped).replace(/\\\\N/g, "\\N")}`);
+    const prepared = singleLine
+      ? String(text).replace(/\r?\n/g, "").trim()
+      : wrapCaption(String(text).trim(), maxChars).replace(/\n/g, "\\N");
+    lines.push(`Dialogue: ${layer},${assTime(start)},${assTime(end)},${style},,0,0,0,,{\\an${position.align}\\pos(${position.x},${position.y})}${assEscape(prepared).replace(/\\\\N/g, "\\N")}`);
   };
 
   if (burnTitle && introDuration > 0) {
@@ -482,7 +501,7 @@ function writeAssOverlay({ scenes, destination, width, height, template = {}, ti
       const duration = Number(scene.duration || 0);
       const schedule = sceneCaptionSchedule(scene, Number(caption.maxCharsPerLine || 14));
       for (const item of schedule) {
-        addEvent(5, sceneCursor + item.start, sceneCursor + item.end, "Caption", item.text, caption, Number(caption.maxCharsPerLine || 14));
+        addEvent(5, sceneCursor + item.start, sceneCursor + item.end, "Caption", item.text, caption, Number(caption.maxCharsPerLine || 14), true);
       }
       sceneCursor += duration;
     }
@@ -846,5 +865,6 @@ module.exports = {
   writeSrt,
   renderVideo,
   renderMusicVideo,
-  _captionTest: { splitCaptionChunks, captionSchedule, sceneCaptionSchedule, stripCaptionDisplayPunctuation }
+  buildCaptionTimings,
+  _captionTest: { splitCaptionChunks, captionSchedule, buildCaptionTimings, sceneCaptionSchedule, stripCaptionDisplayPunctuation, writeAssOverlay }
 };

@@ -4,47 +4,141 @@ const crypto = require("node:crypto");
 const os = require("node:os");
 const { spawn } = require("node:child_process");
 let ProxyAgent = null;
-try { ({ ProxyAgent } = require("undici")); } catch {}
+let undiciFetch = null;
+try { ({ ProxyAgent, fetch: undiciFetch } = require("undici")); } catch {}
+const proxyAgentCache = new Map();
 const { testModelConnection } = require("./llm-planner.cjs");
-const { analyzeImagePromptRisk, buildPolicySafeImagePrompt } = require("./image-prompt-safety.cjs");
+const { buildImageRequestCandidate, buildImageRequestCandidates, imagePromptAudit } = require("./image-prompt-builder.cjs");
+const {
+  currentCancellationSignal, cancellationError, throwIfCancelled, cancellableSleep, TaskCancelledError, isCancellationError
+} = require("./cancellation.cjs");
 
 function spawnAsync(command, args, options = {}) {
+  const signal = options.signal || currentCancellationSignal();
+  const spawnOptions = { windowsHide: true, ...options };
+  delete spawnOptions.signal;
+  throwIfCancelled(signal);
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { windowsHide: true, ...options });
+    let settled = false;
+    let child;
+    const finish = callback => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener("abort", onAbort);
+      callback();
+    };
+    const onAbort = () => {
+      try { child?.kill("SIGTERM"); } catch {}
+      finish(() => reject(cancellationError(signal)));
+    };
+    try {
+      child = spawn(command, args, spawnOptions);
+    } catch (error) {
+      reject(error);
+      return;
+    }
     let stdout = "";
     let stderr = "";
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) { onAbort(); return; }
     child.stdout?.on("data", chunk => { stdout += chunk.toString(); });
     child.stderr?.on("data", chunk => { stderr += chunk.toString(); });
-    child.on("error", reject);
-    child.on("close", code => {
-      if (code === 0) resolve({ stdout, stderr });
+    child.on("error", error => finish(() => reject(signal?.aborted ? cancellationError(signal) : error)));
+    child.on("close", code => finish(() => {
+      if (signal?.aborted) reject(cancellationError(signal));
+      else if (code === 0) resolve({ stdout, stderr });
       else reject(new Error(stderr.trim() || stdout.trim() || `${path.basename(command)} 退出码 ${code}`));
-    });
+    }));
   });
 }
 
-function fetchWithProxy(url, options = {}, proxyUrl = "") {
-  if (proxyUrl && !ProxyAgent) throw new Error("已配置网络代理，但 undici 依赖不可用，请重新安装项目依赖");
-  return fetch(url, {
+function normalizeProxyUrl(value = "") {
+  let proxyUrl = String(value || "").trim();
+  if (!proxyUrl) return "";
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(proxyUrl)) proxyUrl = `http://${proxyUrl}`;
+  let parsed;
+  try {
+    parsed = new URL(proxyUrl);
+  } catch {
+    throw new Error(`代理地址格式错误：${proxyUrl}`);
+  }
+  if (!["http:", "https:"].includes(parsed.protocol)) {
+    throw new Error(`当前仅支持 HTTP/HTTPS 代理，收到：${parsed.protocol}`);
+  }
+  if (!parsed.hostname || !parsed.port) {
+    throw new Error(`代理地址必须包含主机和端口，例如 http://127.0.0.1:7897`);
+  }
+  return parsed.toString().replace(/\/$/, "");
+}
+
+function proxyDispatcher(proxyUrl = "") {
+  const normalized = normalizeProxyUrl(proxyUrl);
+  if (!normalized) return null;
+  if (!ProxyAgent || !undiciFetch) {
+    throw new Error("已配置网络代理，但 undici 的 fetch/ProxyAgent 不可用，请在项目目录执行 npm install");
+  }
+  let dispatcher = proxyAgentCache.get(normalized);
+  if (!dispatcher) {
+    dispatcher = new ProxyAgent(normalized);
+    proxyAgentCache.set(normalized, dispatcher);
+  }
+  return { normalized, dispatcher };
+}
+
+function decorateProxyError(error, proxyUrl, targetUrl) {
+  if (!proxyUrl) return error;
+  const code = error?.cause?.code || error?.code || "";
+  const detail = String(error?.cause?.message || error?.message || error || "网络请求失败");
+  const targetHost = (() => { try { return new URL(targetUrl).host; } catch { return String(targetUrl); } })();
+  const wrapped = new Error(`通过代理 ${proxyUrl} 访问 ${targetHost} 失败：${detail}`);
+  wrapped.code = code || "PROXY_REQUEST_FAILED";
+  wrapped.cause = error;
+  return wrapped;
+}
+
+async function fetchWithProxy(url, options = {}, proxyUrl = "") {
+  const signal = options.signal || currentCancellationSignal();
+  throwIfCancelled(signal);
+  const proxy = proxyDispatcher(proxyUrl);
+  const requestOptions = {
     ...options,
-    ...(proxyUrl ? { dispatcher: new ProxyAgent(proxyUrl) } : {})
-  });
+    ...(signal ? { signal } : {})
+  };
+  try {
+    // Electron 主进程中的 global fetch 可能走 Chromium/Node 自带实现，
+    // 对外部 undici ProxyAgent 的 dispatcher 支持并不稳定。
+    // 配置代理时必须同时使用同一份 undici.fetch，确保代理真正生效。
+    if (proxy) {
+      return await undiciFetch(url, { ...requestOptions, dispatcher: proxy.dispatcher });
+    }
+    return await globalThis.fetch(url, requestOptions);
+  } catch (error) {
+    if (signal?.aborted || error?.name === "AbortError") throw cancellationError(signal);
+    throw decorateProxyError(error, proxy?.normalized || "", url);
+  }
 }
 
 async function fetchWithTimeout(url, options = {}, proxyUrl = "", timeoutMs = 20000) {
+  const taskSignal = options.signal || currentCancellationSignal();
+  throwIfCancelled(taskSignal);
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), Math.max(3000, Number(timeoutMs || 20000)));
+  const timeout = Math.max(3000, Number(timeoutMs || 20000));
+  const onTaskAbort = () => controller.abort(cancellationError(taskSignal));
+  taskSignal?.addEventListener("abort", onTaskAbort, { once: true });
+  const timer = setTimeout(() => controller.abort(new Error("REQUEST_TIMEOUT")), timeout);
   try {
     return await fetchWithProxy(url, { ...options, signal: controller.signal }, proxyUrl);
   } catch (error) {
-    if (error?.name === "AbortError") {
-      const timeoutError = new Error(`请求超过 ${Math.round(Math.max(3000, Number(timeoutMs || 20000)) / 1000)} 秒未响应`);
+    if (taskSignal?.aborted) throw cancellationError(taskSignal);
+    if (controller.signal.aborted || error?.name === "AbortError") {
+      const timeoutError = new Error(`请求超过 ${Math.round(timeout / 1000)} 秒未响应`);
       timeoutError.code = "REQUEST_TIMEOUT";
       throw timeoutError;
     }
     throw error;
   } finally {
     clearTimeout(timer);
+    taskSignal?.removeEventListener("abort", onTaskAbort);
   }
 }
 
@@ -61,8 +155,8 @@ function ffmpegPath(app, config) {
   return fs.existsSync(bundled) ? bundled : "ffmpeg";
 }
 
-async function downloadFile(url, destination, headers = {}, proxyUrl = "") {
-  const response = await fetchWithProxy(url, { headers }, proxyUrl);
+async function downloadFile(url, destination, headers = {}, proxyUrl = "", timeoutMs = 120000) {
+  const response = await fetchWithTimeout(url, { headers }, proxyUrl, timeoutMs);
   if (!response.ok) throw new Error(`下载素材失败 (${response.status})`);
   fs.writeFileSync(destination, Buffer.from(await response.arrayBuffer()));
 }
@@ -70,7 +164,7 @@ async function downloadFile(url, destination, headers = {}, proxyUrl = "") {
 const getByPath = (source, fieldPath) => String(fieldPath || "").split(".")
   .filter(Boolean).reduce((value, key) => value?.[Number.isInteger(Number(key)) ? Number(key) : key], source);
 
-const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const sleep = ms => cancellableSleep(ms);
 
 function mappedImageSize(section, ratio) {
   try {
@@ -808,6 +902,29 @@ function writeImageSubmitDebug(destination, data) {
   } catch {}
 }
 
+function imageStyleAuditPath(destination) {
+  const imageDir = path.dirname(destination);
+  const outputDir = path.basename(imageDir).toLowerCase() === "images" ? path.dirname(imageDir) : imageDir;
+  const debugDir = path.join(outputDir, "image-debug");
+  fs.mkdirSync(debugDir, { recursive: true });
+  return path.join(debugDir, `${path.basename(destination, path.extname(destination))}-style-audit.json`);
+}
+
+function writeImageStyleAudit(destination, data) {
+  try {
+    fs.writeFileSync(imageStyleAuditPath(destination), JSON.stringify({
+      created_at: new Date().toISOString(),
+      ...redactImagePayloadForDebug(data)
+    }, null, 2), "utf8");
+  } catch {}
+}
+
+function negativePromptField(section, provider) {
+  const configured = String(section?.negative_prompt_field || "").trim();
+  if (configured) return configured;
+  return provider === "modelscope" ? "negative_prompt" : "";
+}
+
 function imageRequestHeaders(section, requestId = "") {
   const headers = { "content-type": "application/json", authorization: `Bearer ${section.api_key}` };
   if (requestId) {
@@ -871,7 +988,237 @@ async function pollCustomImageTask({ section, baseUrl, taskId, destination }) {
   throw new Error("图片任务等待超时");
 }
 
-async function generateOpenAiImage({ provider, config, prompt, destination, ratio, resumeTaskId = "", onRemoteTask = () => {}, onProgress = () => {}, requestId = "" }) {
+
+function apiMartBaseUrl(section = {}) {
+  const raw = String(section.base_url || "https://api.apimart.ai/v1").trim().replace(/\/+$/, "");
+  return raw
+    .replace(/\/images\/generations$/i, "")
+    .replace(/\/tasks\/[^/]+$/i, "");
+}
+
+function imageFileDataUri(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  const mime = ext === ".jpg" || ext === ".jpeg" ? "image/jpeg"
+    : ext === ".webp" ? "image/webp"
+      : ext === ".gif" ? "image/gif"
+        : ext === ".bmp" ? "image/bmp" : "image/png";
+  return `data:${mime};base64,${fs.readFileSync(filePath).toString("base64")}`;
+}
+
+async function pollApiMartImageTask({ section, taskId, destination, onProgress = () => {} }) {
+  const startedAt = Date.now();
+  const baseUrl = apiMartBaseUrl(section);
+  const statusUrl = `${baseUrl}/tasks/${encodeURIComponent(taskId)}`;
+  const timeoutMs = Math.max(30_000, Number(section.poll_timeout_seconds || 600) * 1000);
+  const intervalMs = Math.max(100, Number(section.poll_interval_ms || 3000));
+  const transientStatuses = new Set([404, 408, 409, 425, 429, 500, 502, 503, 504]);
+  let attempt = 0;
+  let lastStatus = "submitted";
+  let lastMessage = "";
+  while (Date.now() - startedAt < timeoutMs) {
+    attempt += 1;
+    if (attempt > 1) await sleep(intervalMs);
+    let response;
+    try {
+      response = await fetchWithTimeout(statusUrl, {
+        headers: { authorization: `Bearer ${section.api_key}` }
+      }, section.proxy_url || "", Math.max(10000, Number(section.request_timeout_seconds || 45) * 1000));
+    } catch (error) {
+      if (isCancellationError(error)) throw error;
+      lastMessage = String(error?.message || error);
+      onProgress({
+        state: "polling",
+        attempt,
+        elapsed_ms: Date.now() - startedAt,
+        http_status: 0,
+        remote_status: lastStatus,
+        message: `查询网络异常：${lastMessage}`,
+        task_id: taskId
+      });
+      continue;
+    }
+
+    if (!response.ok && transientStatuses.has(response.status)) {
+      lastMessage = `接口暂时返回 ${response.status}`;
+      onProgress({
+        state: "polling",
+        attempt,
+        elapsed_ms: Date.now() - startedAt,
+        http_status: response.status,
+        remote_status: lastStatus,
+        message: lastMessage,
+        task_id: taskId
+      });
+      continue;
+    }
+
+    const payload = await readJsonResponse(response, "查询 Apimart 图片任务");
+    const data = payload?.data || {};
+    const status = String(data.status || payload?.status || "").toLowerCase();
+    lastStatus = status || lastStatus;
+    lastMessage = String(data?.error?.message || data?.message || payload?.error?.message || "");
+    onProgress({
+      state: status === "completed" ? "completed" : "polling",
+      attempt,
+      elapsed_ms: Date.now() - startedAt,
+      http_status: response.status,
+      remote_status: status,
+      message: lastMessage,
+      task_id: taskId
+    });
+    if (status === "completed") {
+      const imageUrl = data?.result?.images?.[0]?.url?.[0]
+        || data?.result?.images?.[0]?.url
+        || data?.result?.images?.[0]?.image_url
+        || data?.result?.url;
+      if (!imageUrl || typeof imageUrl !== "string") {
+        const debugPath = writeImageResponseDebug(destination, {
+          provider: "apimart",
+          mode: "async_poll",
+          task_id: taskId,
+          status_url: statusUrl,
+          payload
+        });
+        throw new Error(`Apimart 任务已完成，但没有返回可下载图片地址。原始响应已保存：${debugPath}`);
+      }
+      let downloadError = null;
+      for (let downloadAttempt = 1; downloadAttempt <= 3; downloadAttempt += 1) {
+        try {
+          await downloadFile(imageUrl, destination, {}, section.proxy_url || "");
+          downloadError = null;
+          break;
+        } catch (error) {
+          if (isCancellationError(error)) throw error;
+          downloadError = error;
+          if (downloadAttempt < 3) await sleep(1500 * downloadAttempt);
+        }
+      }
+      if (downloadError) throw downloadError;
+      return {
+        path: destination,
+        provider: "Apimart",
+        taskId,
+        sourceUrl: imageUrl,
+        responseField: "data.result.images.0.url.0"
+      };
+    }
+    if (["failed", "error", "cancelled", "canceled", "rejected", "expired"].includes(status)) {
+      throw new Error(lastMessage || `Apimart 图片任务失败：${status || "unknown"}`);
+    }
+  }
+  throw new Error(`Apimart 图片任务等待超时，最后状态：${lastStatus}${lastMessage ? `，${lastMessage}` : ""}`);
+}
+
+async function generateApiMartImage({ config, prompt, styleConfig = null, destination, ratio, referenceImagePath = "", resumeTaskId = "", onRemoteTask = () => {}, onProgress = () => {}, requestId = "", shouldStopSubmitting = () => false }) {
+  const section = config.apimart || {};
+  if (!section.api_key) throw new Error("Apimart 尚未配置 API Key");
+  if (resumeTaskId) {
+    return pollApiMartImageTask({ section, taskId: String(resumeTaskId), destination, onProgress });
+  }
+  const endpoint = `${apiMartBaseUrl(section)}/images/generations`;
+  const references = normalizeReferenceImagePaths(referenceImagePath);
+  const originalPrompt = String(prompt || "");
+  const { risk, candidates } = buildImageRequestCandidates({
+    scenePrompt: originalPrompt,
+    styleConfig,
+    policyFallback: section.policy_fallback !== false
+  });
+  let selectedCandidate = candidates[0];
+  let promptUsed = selectedCandidate.prompt;
+  let policyAdjusted = Boolean(selectedCandidate.adjusted);
+  const errors = [];
+  let taskId = "";
+
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
+    const body = {
+      model: "gpt-image-2",
+      prompt: candidate.prompt,
+      n: 1,
+      size: ratio || section.ratio || "9:16",
+      resolution: section.resolution || "1k",
+      official_fallback: Boolean(section.official_fallback)
+    };
+    if (references.length) body.image_urls = references.slice(0, 16).map(imageFileDataUri);
+    writeImageStyleAudit(destination, {
+      ...imagePromptAudit(candidate, "apimart", candidate.level),
+      negative_prompt_field: "not-supported"
+    });
+    writeImageSubmitDebug(destination, {
+      provider: "apimart",
+      endpoint,
+      request_body: { ...body, image_urls: body.image_urls ? body.image_urls.map(() => "<base64-image>") : undefined },
+      async_mode: true
+    });
+    try {
+      if (shouldStopSubmitting()) throw new TaskCancelledError("已停止提交后续图片");
+      const response = await fetchWithTimeout(endpoint, {
+        method: "POST",
+        headers: imageRequestHeaders(section, requestId ? `${requestId}${index ? `-policy-${candidate.mode}` : ""}` : ""),
+        body: JSON.stringify(body)
+      }, section.proxy_url || "", Math.max(15000, Number(section.request_timeout_seconds || 60) * 1000));
+      const payload = await readJsonResponse(response, "Apimart 图片生成");
+      writeImageSubmitDebug(destination, {
+        provider: "apimart",
+        endpoint,
+        request_body: { ...body, image_urls: body.image_urls ? body.image_urls.map(() => "<base64-image>") : undefined },
+        async_mode: true,
+        response_status: response.status,
+        response_payload: redactImagePayloadForDebug(payload)
+      });
+      taskId = String(payload?.data?.[0]?.task_id || payload?.data?.task_id || payload?.task_id || "");
+      if (!taskId) {
+        const debugPath = writeImageResponseDebug(destination, {
+          provider: "apimart",
+          mode: "submit",
+          payload
+        });
+        throw new Error(`Apimart 未返回任务 ID。原始响应已保存：${debugPath}`);
+      }
+      selectedCandidate = candidate;
+      promptUsed = candidate.prompt;
+      policyAdjusted = Boolean(candidate.adjusted || index > 0);
+      break;
+    } catch (error) {
+      errors.push({
+        mode: candidate.mode,
+        prompt: candidate.prompt,
+        message: String(error?.message || error),
+        status: error?.status || 0,
+        code: error?.code || "",
+        type: error?.type || ""
+      });
+      if (!isContentPolicyError(error) || section.policy_fallback === false || index >= candidates.length - 1) throw error;
+    }
+  }
+
+  onRemoteTask({ taskId, provider: "Apimart" });
+  const result = await pollApiMartImageTask({ section, taskId, destination, onProgress });
+  if (policyAdjusted || errors.length) {
+    writeImagePolicyDebug(destination, {
+      provider: "apimart",
+      endpoint,
+      model: "gpt-image-2",
+      original_prompt: originalPrompt,
+      risk,
+      prompt_used: promptUsed,
+      attempts: errors,
+      resolved: true
+    });
+  }
+  return {
+    ...result,
+    policyAdjusted,
+    promptUsed,
+    safeScenePrompt: selectedCandidate.safeScenePrompt,
+    negativePromptUsed: selectedCandidate.negativePrompt,
+    styleId: selectedCandidate.styleId,
+    registryVersion: selectedCandidate.registryVersion,
+    fallbackLevel: selectedCandidate.level
+  };
+}
+
+async function generateOpenAiImage({ provider, config, prompt, styleConfig = null, destination, ratio, resumeTaskId = "", onRemoteTask = () => {}, onProgress = () => {}, requestId = "", shouldStopSubmitting = () => false }) {
   const section = provider === "modelscope" ? config.modelscope
     : provider === "custom_image" ? config.custom_image : config.gpt_image;
   const baseUrl = section.base_url || (provider === "modelscope"
@@ -893,17 +1240,25 @@ async function generateOpenAiImage({ provider, config, prompt, destination, rati
   const responseFormat = String(section.response_format || "auto").trim();
   const moderation = String(section.moderation || "none").trim();
 
-  const submit = async (requestPrompt, suffix = "") => {
+  const submit = async (candidate, suffix = "") => {
+    // Extra provider-specific fields are allowed, but cannot override the
+    // resolved style prompt or core request fields.
     const body = {
+      ...extraBody,
       model: section.model || "gpt-image-2",
-      prompt: requestPrompt,
+      prompt: candidate.prompt,
       n: 1,
       size: mappedImageSize(section, ratio),
       ...(section.quality ? { quality: section.quality } : {}),
       ...(responseFormat && responseFormat !== "auto" ? { response_format: responseFormat } : {}),
-      ...(moderation && moderation !== "none" ? { moderation } : {}),
-      ...extraBody
+      ...(moderation && moderation !== "none" ? { moderation } : {})
     };
+    const negativeField = negativePromptField(section, provider);
+    if (negativeField && candidate.negativePrompt) body[negativeField] = candidate.negativePrompt;
+    writeImageStyleAudit(destination, {
+      ...imagePromptAudit(candidate, provider, candidate.level),
+      negative_prompt_field: negativeField || "not-supported"
+    });
     writeImageSubmitDebug(destination, {
       provider,
       endpoint,
@@ -912,6 +1267,7 @@ async function generateOpenAiImage({ provider, config, prompt, destination, rati
       response_format_source: responseFormat || "auto",
       async_mode: Boolean(section.async_mode)
     });
+    if (shouldStopSubmitting()) throw new TaskCancelledError("已停止提交后续图片");
     const response = await fetchWithProxy(endpoint, {
       method: "POST",
       headers: imageRequestHeaders(section, requestId ? `${requestId}${suffix}` : ""),
@@ -932,25 +1288,22 @@ async function generateOpenAiImage({ provider, config, prompt, destination, rati
   };
 
   const originalPrompt = String(prompt || "");
-  const risk = analyzeImagePromptRisk(originalPrompt);
-  const first = buildPolicySafeImagePrompt(originalPrompt, "preflight");
-  const candidateModes = first.adjusted ? ["minimal", "ultra"] : ["safe", "ultra"];
-  const candidates = [{ mode: first.adjusted ? "preflight-safe" : "original", ...first }];
-  if (section.policy_fallback !== false) {
-    for (const mode of candidateModes) {
-      const candidate = buildPolicySafeImagePrompt(originalPrompt, mode);
-      if (!candidates.some(item => item.prompt === candidate.prompt)) candidates.push({ mode, ...candidate });
-    }
-  }
+  const { risk, candidates } = buildImageRequestCandidates({
+    scenePrompt: originalPrompt,
+    styleConfig,
+    policyFallback: section.policy_fallback !== false
+  });
 
   let payload;
-  let promptUsed = candidates[0].prompt;
-  let policyAdjusted = Boolean(candidates[0].adjusted);
+  let selectedCandidate = candidates[0];
+  let promptUsed = selectedCandidate.prompt;
+  let policyAdjusted = Boolean(selectedCandidate.adjusted);
   const errors = [];
   for (let index = 0; index < candidates.length; index += 1) {
     const candidate = candidates[index];
     try {
-      payload = await submit(candidate.prompt, index ? `-policy-${candidate.mode}` : (candidate.adjusted ? "-preflight-safe" : ""));
+      payload = await submit(candidate, index ? `-policy-${candidate.mode}` : (candidate.adjusted ? "-preflight-safe" : ""));
+      selectedCandidate = candidate;
       promptUsed = candidate.prompt;
       policyAdjusted = Boolean(candidate.adjusted || index > 0);
       break;
@@ -999,7 +1352,14 @@ async function generateOpenAiImage({ provider, config, prompt, destination, rati
         resolved: true
       });
     }
-    return { ...result, policyAdjusted, promptUsed };
+    return {
+      ...result, policyAdjusted, promptUsed,
+      safeScenePrompt: selectedCandidate.safeScenePrompt,
+      negativePromptUsed: selectedCandidate.negativePrompt,
+      styleId: selectedCandidate.styleId,
+      registryVersion: selectedCandidate.registryVersion,
+      fallbackLevel: selectedCandidate.level
+    };
   }
   const imageCandidate = findImageCandidate(payload, section.image_field, endpoint);
   const pollCandidate = findImagePollCandidate(payload, endpoint);
@@ -1027,7 +1387,15 @@ async function generateOpenAiImage({ provider, config, prompt, destination, rati
         resolved: true
       });
     }
-    return { ...result, policyAdjusted, promptUsed, responseField: result.responseField || pollCandidate.sourcePath || "poll_url" };
+    return {
+      ...result, policyAdjusted, promptUsed,
+      safeScenePrompt: selectedCandidate.safeScenePrompt,
+      negativePromptUsed: selectedCandidate.negativePrompt,
+      styleId: selectedCandidate.styleId,
+      registryVersion: selectedCandidate.registryVersion,
+      fallbackLevel: selectedCandidate.level,
+      responseField: result.responseField || pollCandidate.sourcePath || "poll_url"
+    };
   }
   if (!imageCandidate) {
     const debugPath = writeImageResponseDebug(destination, {
@@ -1058,7 +1426,16 @@ async function generateOpenAiImage({ provider, config, prompt, destination, rati
       resolved: true
     });
   }
-  return { path: destination, provider, policyAdjusted, promptUsed, sourceUrl: savedImage.sourceUrl || "", responseField: imageCandidate.sourcePath || "" };
+  return {
+    path: destination, provider, policyAdjusted, promptUsed,
+    safeScenePrompt: selectedCandidate.safeScenePrompt,
+    negativePromptUsed: selectedCandidate.negativePrompt,
+    styleId: selectedCandidate.styleId,
+    registryVersion: selectedCandidate.registryVersion,
+    fallbackLevel: selectedCandidate.level,
+    sourceUrl: savedImage.sourceUrl || "",
+    responseField: imageCandidate.sourcePath || ""
+  };
 }
 
 async function pollRunningHubWorkflowImage({ baseUrl, section, taskId, destination }) {
@@ -1081,11 +1458,11 @@ async function pollRunningHubWorkflowImage({ baseUrl, section, taskId, destinati
   throw new Error("RunningHub 任务等待超时");
 }
 
-async function generateRunningHubImage({ config, prompt, destination, ratio, referenceImagePath, resumeTaskId = "", onRemoteTask = () => {} }) {
+async function generateRunningHubImage({ config, prompt, negativePrompt = "", destination, ratio, referenceImagePath, resumeTaskId = "", onRemoteTask = () => {} }) {
   const section = config.runninghub;
   if (!section.api_key) throw new Error("RunningHub 尚未配置 API Key");
   if (!section.workflow_id) {
-    return generateRunningHubOfficialImage({ config, prompt, destination, ratio, referenceImagePath, resumeTaskId, onRemoteTask });
+    return generateRunningHubOfficialImage({ config, prompt, negativePrompt, destination, ratio, referenceImagePath, resumeTaskId, onRemoteTask });
   }
   const baseUrl = (section.base_url || "https://www.runninghub.cn").replace(/\/$/, "");
   if (resumeTaskId) {
@@ -1093,6 +1470,14 @@ async function generateRunningHubImage({ config, prompt, destination, ratio, ref
   }
   let nodeInfoList;
   try { nodeInfoList = JSON.parse(section.node_info_json || "[]"); } catch { throw new Error("RunningHub 节点参数 JSON 格式错误"); }
+  // Workflow users can opt into the verified style negative prompt with a
+  // {{negative_prompt}} placeholder. Unknown provider fields are never injected.
+  nodeInfoList = nodeInfoList.map(item => ({
+    ...item,
+    fieldValue: item.fieldValue === "{{prompt}}" ? prompt
+      : item.fieldValue === "{{negative_prompt}}" ? negativePrompt
+        : item.fieldValue
+  }));
   if (referenceImagePath && fs.existsSync(referenceImagePath)) {
     const form = new FormData();
     form.append("apiKey", section.api_key);
@@ -1256,7 +1641,7 @@ async function submitRunningHubVideoModel({
 }
 
 
-async function generateRunningHubOfficialImage({ config, prompt, destination, ratio, referenceImagePath, resumeTaskId = "", onRemoteTask = () => {} }) {
+async function generateRunningHubOfficialImage({ config, prompt, negativePrompt = "", destination, ratio, referenceImagePath, resumeTaskId = "", onRemoteTask = () => {} }) {
   const section = config.runninghub || {};
   const baseUrl = (section.base_url || "https://www.runninghub.cn").replace(/\/$/, "");
   const models = {
@@ -1362,7 +1747,7 @@ async function generateRunningHubVideo({
 }
 
 
-async function generateReferenceImage({ provider, config, prompt, destination, ratio, referenceImagePath, onProgress = () => {}, requestId = "" }) {
+async function generateReferenceImage({ provider, config, prompt, styleConfig = null, destination, ratio, referenceImagePath, onProgress = () => {}, requestId = "", shouldStopSubmitting = () => false }) {
   const section = provider === "modelscope" ? config.modelscope
     : provider === "custom_image" ? config.custom_image : config.gpt_image;
   if (!section?.api_key) throw new Error(`${provider} 尚未配置 API Key`);
@@ -1373,25 +1758,36 @@ async function generateReferenceImage({ provider, config, prompt, destination, r
   const extraBody = parseExtraBody(section);
   const moderation = String(section.moderation || "none").trim();
 
-  const submit = async (requestPrompt, suffix = "") => {
+  const submit = async (candidate, suffix = "") => {
     const form = new FormData();
     form.append("model", section.model || "gpt-image-2");
-    form.append("prompt", `${requestPrompt}
+    form.append("prompt", `${candidate.prompt}
 保持参考图中核心主体的身份与外观一致：人物需保持发型、服装和年龄特征，产品或物件需保持造型、颜色、包装与关键标识关系；人物采用演员化演绎，不要求复刻真实人物的精确面容。`);
     form.append("size", mappedImageSize(section, ratio));
     if (section.quality) form.append("quality", section.quality);
     const responseFormat = section.edit_response_format || "b64_json";
     if (responseFormat && responseFormat !== "auto") form.append("response_format", responseFormat);
     if (moderation && moderation !== "none") form.append("moderation", moderation);
+    const negativeField = negativePromptField(section, provider);
+    if (negativeField && candidate.negativePrompt) form.append(negativeField, candidate.negativePrompt);
     for (const imagePath of referencePaths) {
       form.append("image", new Blob([fs.readFileSync(imagePath)]), path.basename(imagePath));
     }
-    for (const [key, value] of Object.entries(extraBody)) appendFormField(form, key, value);
+    const reservedFormFields = new Set(["prompt", "image", "model", "size", "quality", "response_format", "moderation", negativeField].filter(Boolean));
+    for (const [key, value] of Object.entries(extraBody)) {
+      if (!reservedFormFields.has(key)) appendFormField(form, key, value);
+    }
     const headers = { authorization: `Bearer ${section.api_key}` };
     if (requestId) {
       headers["idempotency-key"] = `${requestId}${suffix}`;
       headers["x-idempotency-key"] = `${requestId}${suffix}`;
     }
+    writeImageStyleAudit(destination, {
+      ...imagePromptAudit(candidate, provider, candidate.level),
+      mode: "reference_edit",
+      negative_prompt_field: negativeField || "not-supported"
+    });
+    if (shouldStopSubmitting()) throw new TaskCancelledError("已停止提交后续图片");
     const response = await fetchWithProxy(endpoint, {
       method: "POST",
       headers,
@@ -1401,25 +1797,22 @@ async function generateReferenceImage({ provider, config, prompt, destination, r
   };
 
   const originalPrompt = String(prompt || "");
-  const risk = analyzeImagePromptRisk(originalPrompt);
-  const first = buildPolicySafeImagePrompt(originalPrompt, "preflight");
-  const candidateModes = first.adjusted ? ["minimal", "ultra"] : ["safe", "ultra"];
-  const candidates = [{ mode: first.adjusted ? "preflight-safe" : "original", ...first }];
-  if (section.policy_fallback !== false) {
-    for (const mode of candidateModes) {
-      const candidate = buildPolicySafeImagePrompt(originalPrompt, mode);
-      if (!candidates.some(item => item.prompt === candidate.prompt)) candidates.push({ mode, ...candidate });
-    }
-  }
+  const { risk, candidates } = buildImageRequestCandidates({
+    scenePrompt: originalPrompt,
+    styleConfig,
+    policyFallback: section.policy_fallback !== false
+  });
 
   let payload;
-  let promptUsed = candidates[0].prompt;
-  let policyAdjusted = Boolean(candidates[0].adjusted);
+  let selectedCandidate = candidates[0];
+  let promptUsed = selectedCandidate.prompt;
+  let policyAdjusted = Boolean(selectedCandidate.adjusted);
   const errors = [];
   for (let index = 0; index < candidates.length; index += 1) {
     const candidate = candidates[index];
     try {
-      payload = await submit(candidate.prompt, index ? `-policy-${candidate.mode}` : (candidate.adjusted ? "-preflight-safe" : ""));
+      payload = await submit(candidate, index ? `-policy-${candidate.mode}` : (candidate.adjusted ? "-preflight-safe" : ""));
+      selectedCandidate = candidate;
       promptUsed = candidate.prompt;
       policyAdjusted = Boolean(candidate.adjusted || index > 0);
       break;
@@ -1440,11 +1833,12 @@ async function generateReferenceImage({ provider, config, prompt, destination, r
           model: section.model || "gpt-image-2",
           mode: "reference_edit",
           original_prompt: originalPrompt,
+          selected_style_id: selectedCandidate.styleId || "",
           risk,
           attempts: errors,
           resolved: false
         });
-        const finalError = new Error(`参考图提示词被内容审核拒绝；程序已在发送前改写，并使用更保守画面重试仍未通过。调试文件：${imagePolicyDebugPath(destination)}`);
+        const finalError = new Error(`参考图提示词被内容审核拒绝；程序已在发送前只改写场景内容，并在每次重试时重新套用同一画面风格，仍未通过。调试文件：${imagePolicyDebugPath(destination)}`);
         finalError.code = "IMAGE_CONTENT_POLICY_REJECTED";
         finalError.status = error?.status || 400;
         throw finalError;
@@ -1470,13 +1864,24 @@ async function generateReferenceImage({ provider, config, prompt, destination, r
         model: section.model || "gpt-image-2",
         mode: "reference_edit",
         original_prompt: originalPrompt,
+        selected_style_id: selectedCandidate.styleId || "",
         risk,
         prompt_used: promptUsed,
         attempts: errors,
         resolved: true
       });
     }
-    return { ...result, policyAdjusted, promptUsed, responseField: result.responseField || pollCandidate.sourcePath || "poll_url" };
+    return {
+      ...result,
+      policyAdjusted,
+      promptUsed,
+      safeScenePrompt: selectedCandidate.safeScenePrompt,
+      negativePromptUsed: selectedCandidate.negativePrompt,
+      styleId: selectedCandidate.styleId,
+      registryVersion: selectedCandidate.registryVersion,
+      fallbackLevel: selectedCandidate.level,
+      responseField: result.responseField || pollCandidate.sourcePath || "poll_url"
+    };
   }
   if (!imageCandidate) {
     const debugPath = writeImageResponseDebug(destination, {
@@ -1498,13 +1903,26 @@ async function generateReferenceImage({ provider, config, prompt, destination, r
       model: section.model || "gpt-image-2",
       mode: "reference_edit",
       original_prompt: originalPrompt,
+      selected_style_id: selectedCandidate.styleId || "",
       risk,
       prompt_used: promptUsed,
       attempts: errors,
       resolved: true
     });
   }
-  return { path: destination, provider, policyAdjusted, promptUsed, sourceUrl: savedImage.sourceUrl || "", responseField: imageCandidate.sourcePath || "" };
+  return {
+    path: destination,
+    provider,
+    policyAdjusted,
+    promptUsed,
+    safeScenePrompt: selectedCandidate.safeScenePrompt,
+    negativePromptUsed: selectedCandidate.negativePrompt,
+    styleId: selectedCandidate.styleId,
+    registryVersion: selectedCandidate.registryVersion,
+    fallbackLevel: selectedCandidate.level,
+    sourceUrl: savedImage.sourceUrl || "",
+    responseField: imageCandidate.sourcePath || ""
+  };
 }
 
 async function generateNetworkImage({ app, config, prompt, destination, ratio }) {
@@ -1522,7 +1940,7 @@ async function generateNetworkImage({ app, config, prompt, destination, ratio })
     endpoint.searchParams.set("iiurlwidth", "1920");
     endpoint.searchParams.set("format", "json");
     endpoint.searchParams.set("origin", "*");
-    const response = await fetch(endpoint, { headers: { "user-agent": "Storybound-Rebuild/0.4" } });
+    const response = await fetchWithProxy(endpoint, { headers: { "user-agent": "Storybound-Rebuild/0.4" } });
     if (response.ok) {
       const payload = await response.json();
       const pages = Object.values(payload.query?.pages || {});
@@ -1559,12 +1977,42 @@ async function generateSceneImage(args) {
   if (args.materialSource === "network") return generateNetworkImage(args);
   const provider = args.config.image_provider || "placeholder";
   const referencePaths = normalizeReferenceImagePaths(args.referenceImagePath);
-  if (provider === "runninghub") {
-    return generateRunningHubImage({
+
+  if (provider === "apimart") {
+    return generateApiMartImage({
       ...args,
-      referenceImagePath: referencePaths[0] || ""
+      referenceImagePath: referencePaths
     });
   }
+
+  if (provider === "runninghub") {
+    const candidate = buildImageRequestCandidate({
+      scenePrompt: args.prompt,
+      styleConfig: args.styleConfig,
+      level: "preflight"
+    });
+    writeImageStyleAudit(args.destination, {
+      ...imagePromptAudit(candidate, provider, candidate.level),
+      negative_prompt_field: args.config.runninghub?.workflow_id ? "{{negative_prompt}}" : "not-supported"
+    });
+    const result = await generateRunningHubImage({
+      ...args,
+      prompt: candidate.prompt,
+      negativePrompt: candidate.negativePrompt,
+      referenceImagePath: referencePaths[0] || ""
+    });
+    return {
+      ...result,
+      policyAdjusted: candidate.adjusted,
+      promptUsed: candidate.prompt,
+      safeScenePrompt: candidate.safeScenePrompt,
+      negativePromptUsed: candidate.negativePrompt,
+      styleId: candidate.styleId,
+      registryVersion: candidate.registryVersion,
+      fallbackLevel: candidate.level
+    };
+  }
+
   if (referencePaths.length && provider !== "placeholder") {
     return generateReferenceImage({ ...args, provider });
   }
@@ -1577,7 +2025,26 @@ async function generateSceneImage(args) {
     ]);
     return { path: args.destination, provider: "reference-local" };
   }
-  if (provider === "placeholder") return createPlaceholderImage(args);
+
+  if (provider === "placeholder") {
+    const candidate = buildImageRequestCandidate({
+      scenePrompt: args.prompt,
+      styleConfig: args.styleConfig,
+      level: "preflight"
+    });
+    writeImageStyleAudit(args.destination, imagePromptAudit(candidate, provider, candidate.level));
+    const result = await createPlaceholderImage({ ...args, prompt: candidate.prompt });
+    return {
+      ...result,
+      policyAdjusted: candidate.adjusted,
+      promptUsed: candidate.prompt,
+      safeScenePrompt: candidate.safeScenePrompt,
+      negativePromptUsed: candidate.negativePrompt,
+      styleId: candidate.styleId,
+      registryVersion: candidate.registryVersion,
+      fallbackLevel: candidate.level
+    };
+  }
   if (["gpt_image", "modelscope", "custom_image"].includes(provider)) {
     return generateOpenAiImage({ ...args, provider });
   }
@@ -1634,6 +2101,31 @@ async function testConnection(config, kind, app) {
       };
     }
     const section = config[config.image_provider] || config.gpt_image;
+    if (config.image_provider === "apimart") {
+      if (!section.api_key || !section.base_url) return { ok: false, message: "请填写 Apimart API Key" };
+      const destination = path.join(os.tmpdir(), `storybound-apimart-test-${crypto.randomUUID()}.png`);
+      const startedAt = Date.now();
+      const routeLabel = section.proxy_url ? `代理 ${normalizeProxyUrl(section.proxy_url)}` : "直连";
+      try {
+        await generateApiMartImage({
+          config,
+          prompt: "一个简洁的蓝色圆形图标，纯色背景，无文字",
+          destination,
+          ratio: "1:1"
+        });
+        return {
+          ok: true,
+          message: `Apimart 生图成功 · ${routeLabel} · ${Math.max(1, Math.round((Date.now() - startedAt) / 1000))}秒`
+        };
+      } catch (error) {
+        return {
+          ok: false,
+          message: `Apimart 测试失败 · ${routeLabel}：${error?.message || error}`
+        };
+      } finally {
+        if (fs.existsSync(destination)) fs.unlinkSync(destination);
+      }
+    }
     if (config.image_provider === "custom_image") {
       if (!section.api_key || !section.base_url || !section.model) return { ok: false, message: "请填写 Base URL、API Key 和模型" };
       if (section.async_mode) return { ok: true, message: "异步外部接口配置结构完整" };
@@ -1659,16 +2151,26 @@ async function testConnection(config, kind, app) {
   return { ok: true, message: "配置结构正常" };
 }
 
-async function synthesizeSystemVoice({ app, config, text, destination, speed, speaker }) {
+function resolveSystemVoiceName(args = {}) {
+  const configuredVoice = String(args.config?.tts?.system?.voice || "").trim();
+  const hasTaskVoiceOverride = Object.prototype.hasOwnProperty.call(args, "speaker");
+  const requestedVoice = String(args.speaker || "").trim();
+  if (!hasTaskVoiceOverride) return configuredVoice;
+  if (!requestedVoice || requestedVoice.includes("_bigtts")) return "";
+  return requestedVoice;
+}
+
+async function synthesizeSystemVoice(args) {
+  const { app, config, text, destination, speed } = args;
   if (process.platform !== "win32") throw new Error("本机系统语音仅支持 Windows");
   const textPath = `${destination}.txt`;
   fs.writeFileSync(textPath, text, "utf8");
   const resourceScript = resolveResource(app, "sapi.ps1");
   const script = fs.existsSync(resourceScript) ? resourceScript : path.join(__dirname, "sapi.ps1");
   const rate = Math.max(-10, Math.min(10, Math.round((Number(speed || 1) - 1) * 5)));
-  const configuredVoice = String(config?.tts?.system?.voice || "").trim();
-  const requestedVoice = String(speaker || "").trim();
-  const voiceName = requestedVoice && !requestedVoice.includes("_bigtts") ? requestedVoice : configuredVoice;
+  // 任务明确传入空字符串时表示“Windows 系统默认音色”，不能再次回退到设置页指定音色。
+  // 未传 speaker（例如设置页试听）时，才使用设置页保存的默认音色。
+  const voiceName = resolveSystemVoiceName(args);
   const volume = Math.max(0, Math.min(100, Number(config?.tts?.system?.volume ?? 100)));
   try {
     const args = [
@@ -1730,7 +2232,7 @@ async function requestVolcengineSpeech(config, text, speed, speakerOverride = ""
   const preferredResource = inferredResource || section.resource_id
     || (section.engine_version === "1.0" ? "seed-tts-1.0" : "seed-tts-2.0");
   const requestWithResource = async resourceId => {
-    const response = await fetch(section.base_url || "https://openspeech.bytedance.com/api/v3/tts/unidirectional", {
+    const response = await fetchWithProxy(section.base_url || "https://openspeech.bytedance.com/api/v3/tts/unidirectional", {
       method: "POST",
       headers: {
         "content-type": "application/json",
@@ -1751,7 +2253,7 @@ async function requestVolcengineSpeech(config, text, speed, speakerOverride = ""
           }
         }
       })
-    });
+    }, "");
     const responseText = await response.text();
     if (!response.ok) {
       let message = responseText;
@@ -1779,7 +2281,7 @@ async function synthesizeVolcengine({ config, text, destination, speed, speaker 
 }
 
 async function synthesizeSpeech(args) {
-  const provider = args.config.tts?.provider || "system";
+  const provider = args.provider || args.config.tts?.provider || "system";
   if (provider === "system") return synthesizeSystemVoice(args);
   if (provider === "volcengine") return synthesizeVolcengine(args);
   throw new Error(`未知语音服务：${provider}`);
@@ -1795,5 +2297,6 @@ async function mediaDuration(app, config, file) {
 module.exports = {
   spawnAsync, resolveResource, ffmpegPath, generateSceneImage,
   synthesizeSpeech, requestVolcengineSpeech, mediaDuration, imageSize, downloadFile, testConnection, generateRunningHubVideo,
-  listSystemVoices
+  listSystemVoices,
+  _voiceTest: { resolveSystemVoiceName }
 };

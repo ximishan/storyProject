@@ -1,0 +1,16 @@
+const fs = require("node:fs");
+const path = require("node:path");
+const assert = require("node:assert/strict");
+const app = fs.readFileSync(path.join(__dirname, "../src/App.tsx"), "utf8");
+const db = fs.readFileSync(path.join(__dirname, "../electron/database.cjs"), "utf8");
+const pipeline = fs.readFileSync(path.join(__dirname, "../electron/pipeline.cjs"), "utf8");
+const services = fs.readFileSync(path.join(__dirname, "../electron/services.cjs"), "utf8");
+assert.match(app, /storybound\.lastVoiceSelection\.v2/);
+assert.match(app, /latestTask\?\.tts_provider/);
+assert.match(app, /speaker, ttsProvider/);
+assert.match(db, /target_scenes,tts_provider,tts_speed/);
+assert.match(pipeline, /provider: taskVoiceProvider\(task, config\)/);
+assert.match(services, /args\.provider \|\| args\.config\.tts\?\.provider/);
+assert.match(services, /hasTaskVoiceOverride/);
+assert.match(db, /UPDATE tasks SET tts_provider='volcengine'/);
+console.log("voice-memory-test: ok");

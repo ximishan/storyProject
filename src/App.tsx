@@ -7,11 +7,27 @@ import {
   Video, Volume2, WandSparkles, X
 } from "lucide-react";
 import systemPromptTemplatesData from "../shared/system-prompt-templates.json";
+import visualStylesData from "../shared/visual-styles.json";
 import packageInfo from "../package.json";
 import { DEFAULT_VOLC_VOICE_ID, VOLC_VOICE_CATEGORIES, VOLC_VOICES, type VolcVoiceOption } from "./volcVoices";
 
 type Page = "tasks" | "history" | "create" | "playground" | "voice" | "music" | "tests" | "templates" | "styles" | "drafts" | "settings";
 type SettingsTab = "llm" | "image" | "tts" | "output" | "diagnostics";
+
+type BuiltinVisualStyle = {
+  id: string;
+  name: string;
+  tag: string;
+  short_name: string;
+  prefix: string;
+  suffix: string;
+  negative_prompt: string;
+  description: string;
+  track_hints: string[];
+  allow_color: boolean;
+};
+
+const BUILTIN_VISUAL_STYLES = visualStylesData as BuiltinVisualStyle[];
 
 const nav = [
   { page: "create" as Page, label: "开始创作", icon: WandSparkles },
@@ -46,12 +62,12 @@ const STYLE_PREVIEW_ASSETS: Record<string, string> = {
   "oil-painting": "./style-previews/oil-painting-8NyuzxAO.webp",
   cinematic: "./style-previews/cinematic-BdXqwPs4.webp",
   "ancient-cinematic": "./style-previews/ancient-cinematic-COp7S7MP.webp",
-  "retro-film": "./style-previews/vintage-film-CrPRxEWS.webp",
+  "vintage-film": "./style-previews/vintage-film-CrPRxEWS.webp",
   watercolor: "./style-previews/watercolor-DPPl-c7w.webp",
-  magazine: "./style-previews/illustration-Dx-tzI7d.webp",
+  illustration: "./style-previews/illustration-Dx-tzI7d.webp",
   "pixar-3d": "./style-previews/pixar-3d-DqhR0fI-.webp",
   "ink-wash": "./style-previews/ink-wash-n6PE-maw.webp",
-  "folk-illustration": "./style-previews/folk-tale-gongbi-D-GnOj_N.webp",
+  "folk-tale-gongbi": "./style-previews/folk-tale-gongbi-D-GnOj_N.webp",
   ghibli: "./style-previews/ghibli-CLd8wrdG.webp"
 };
 
@@ -149,7 +165,7 @@ function Tasks({ tasks, onCreate, onRefresh, title = "任务队列", desc = "查
       <div className="toolbar-actions">
         <select value={statusFilter} onChange={e => setStatusFilter(e.target.value)}>
           <option value="all">全部状态</option><option value="pending">草稿</option><option value="review">待确认</option>
-          <option value="running">运行中</option><option value="interrupted">已中断</option><option value="completed">已完成</option><option value="failed">失败</option><option value="cancelled">已取消</option>
+          <option value="running">运行中</option><option value="cancelling">取消收尾中</option><option value="interrupted">已中断</option><option value="completed">已完成</option><option value="failed">失败</option><option value="cancelled">已取消</option>
         </select>
         {!history && checked.length > 0 && <button className="primary" onClick={async () => { await window.storybound.runQueue(checked); setChecked([]); onRefresh(); }}><Play size={15} />串行执行 {checked.length} 项</button>}
         {!history && tasks.some(task => Number(task.queue_order || 0) > 0 && !["completed", "cancelled"].includes(task.status)) && <button onClick={async () => { await window.storybound.resumeQueue(); onRefresh(); }}><RefreshCw size={15} />恢复上次队列</button>}
@@ -164,7 +180,7 @@ function Tasks({ tasks, onCreate, onRefresh, title = "任务队列", desc = "查
     </div> : <div className="task-grid">{filtered.map(task =>
       <article className="task-card" key={task.id} onClick={() => setSelected(task)}>
         <div className="task-top">
-          <div className="task-check"><input type="checkbox" checked={checked.includes(task.id)} onClick={e => e.stopPropagation()} onChange={e => setChecked(current => e.target.checked ? [...current, task.id] : current.filter(id => id !== task.id))} /><span className={`status ${task.status}`}>{task.status === "running" && <LoaderCircle size={13} className="spin" />}{statusText(task.status)}</span></div>
+          <div className="task-check"><input type="checkbox" checked={checked.includes(task.id)} onClick={e => e.stopPropagation()} onChange={e => setChecked(current => e.target.checked ? [...current, task.id] : current.filter(id => id !== task.id))} /><span className={`status ${task.status}`}>{["running", "cancelling"].includes(task.status) && <LoaderCircle size={13} className="spin" />}{statusText(task.status)}</span></div>
           <button className="icon-btn"><MoreHorizontal size={18} /></button>
         </div>
         <h3>{task.title || "未命名任务"}</h3>
@@ -183,10 +199,10 @@ function Tasks({ tasks, onCreate, onRefresh, title = "任务队列", desc = "查
             } else if (task.pause_mode === "none") await window.storybound.runTask(task.id);
             else await window.storybound.prepareTask(task.id);
             onRefresh();
-          }} disabled={task.status === "running"}>
+          }} disabled={["running", "cancelling"].includes(task.status)}>
             <Play size={15} />{task.status === "review" ? "确认分镜" : task.status === "completed" ? "打开工作台" : task.status === "interrupted" ? "从断点继续" : task.status === "failed" ? "从失败处继续" : task.pipeline_data ? "继续处理" : "生成脚本"}
           </button>
-          {task.status === "running" && <button onClick={async e => { e.stopPropagation(); await window.storybound.cancelTask(task.id); onRefresh(); }}>取消</button>}
+          {task.status === "running" && <button onClick={async e => { e.stopPropagation(); await window.storybound.cancelTask(task.id); onRefresh(); }}>取消</button>}{task.status === "cancelling" && <button disabled>等待已提交图片</button>}
           <button title="复制任务" onClick={async e => { e.stopPropagation(); await window.storybound.duplicateTask(task.id); onRefresh(); }}><Copy size={15} /></button>
           <button className="danger" onClick={async e => { e.stopPropagation(); await window.storybound.deleteTask(task.id); onRefresh(); }}>
             <Trash2 size={15} />
@@ -260,6 +276,17 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
       setBusy("");
     }
   };
+  const cancelCurrent = async () => {
+    setMessage("正在取消任务并停止当前请求…");
+    try {
+      await window.storybound.cancelTask(task.id);
+      setBusy("");
+      setMessage("任务已取消");
+      await onRefresh();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : String(error));
+    }
+  };
   const save = () => pipeline
     ? run("保存脚本", () => window.storybound.updatePipeline(task.id, pipeline))
     : Promise.resolve();
@@ -318,6 +345,11 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
       } : current.runtime
     };
   });
+  const missingImageScenes = pipeline?.scenes?.filter(scene =>
+    !scene.image_path || ["pending", "failed", "interrupted"].includes(String(scene.image_status || ""))
+  ) || [];
+  const missingImageCount = missingImageScenes.length;
+  const completedImageCount = Math.max(0, Number(pipeline?.scenes?.length || 0) - missingImageCount);
   const hasAssets = Boolean(pipeline?.scenes?.length && pipeline.scenes.every(scene => scene.image_path && scene.audio_path));
   const stages = ["分析文案", "改写脚本", "拆分分镜", "生成画面", "生成配音", "合成视频", "剪映草稿", "完成"];
 
@@ -339,11 +371,16 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
       <div className="workflow-actions">
         {!pipeline && <button className="primary" disabled={Boolean(busy)} onClick={() => run("生成脚本", () => window.storybound.prepareTask(task.id))}><Sparkles size={16} />生成脚本与分镜</button>}
         {pipeline && <button disabled={Boolean(busy)} onClick={save}><Save size={16} />保存修改</button>}
-        {pipeline && !hasAssets && <button className="primary" disabled={Boolean(busy)} onClick={async () => {
+        {pipeline && missingImageCount > 0 && <button className="primary" disabled={Boolean(busy)} onClick={async () => {
           await save();
-          await run("生成全部素材与视频", () => window.storybound.continueTask(task.id));
-        }}><Play size={16} />{task.status === "interrupted" ? "从断点继续" : "确认并补齐素材生成视频"}</button>}
+          await run(`补齐 ${missingImageCount} 张缺失画面`, () => window.storybound.repairMissingImages(task.id));
+        }}><RefreshCw size={16} />补齐缺失画面（{missingImageCount}）</button>}
+        {pipeline && missingImageCount === 0 && !hasAssets && <button className="primary" disabled={Boolean(busy)} onClick={async () => {
+          await save();
+          await run("生成配音与视频", () => window.storybound.continueTask(task.id));
+        }}><Play size={16} />{task.status === "interrupted" ? "从断点继续" : "确认并生成配音与视频"}</button>}
         {hasAssets && <button className="primary" disabled={Boolean(busy)} onClick={() => setShowRenderOptions(true)}><RefreshCw size={16} />使用现有素材重新合成</button>}
+        {task.status === "cancelling" ? <button className="danger" disabled><LoaderCircle size={16} className="spin" />正在下载已提交图片</button> : (task.status === "running" || Boolean(busy)) && <button className="danger" onClick={cancelCurrent}><X size={16} />取消当前任务</button>}
       </div>
       <div className="artifact-actions">
         {task.video_path && <button className="primary" onClick={() => window.storybound.openPath(task.video_path!)}><Video size={16} />播放视频</button>}
@@ -401,15 +438,19 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
         <div className="prompt-safety-note">主标题和副标题只在片头显示；旁白字幕会按语义拆成单行短句，并跟随配音逐段显示。图片动画采用剪映风格关键帧、连续缓入缓出与高分辨率超采样渲染；运镜强度只改变幅度，不会切换算法。</div>
       </EditorModal>}
       {pipeline?.scenes?.length ? <div className="scene-list">
-        <h3>分镜工作台 · {pipeline.scenes.length} 镜</h3>
+        <h3>分镜工作台 · {pipeline.scenes.length} 镜 · 图片已完成 {completedImageCount}/{pipeline.scenes.length}{missingImageCount ? ` · 待补齐 ${missingImageCount}` : ""}</h3>
         {pipeline.scenes.map(scene => <div className="scene-editor" key={scene.index}>
           <div className="scene-editor-head">
             <strong>镜头 {String(scene.index).padStart(2, "0")}</strong>
             <span>{scene.duration?.toFixed(1) || "—"}s</span>
             <div>
-              <button disabled={Boolean(busy)} onClick={() => run(`重做镜头 ${scene.index} 画面`, () => window.storybound.regenerateScene(task.id, scene.index, "image"))}>
+              <button
+                disabled={Boolean(busy)}
+                title={busy && busy !== `重做镜头 ${scene.index} 画面` ? "当前已有一个图片任务正在执行，请等待完成后再操作" : ""}
+                onClick={() => run(`重做镜头 ${scene.index} 画面`, () => window.storybound.regenerateScene(task.id, scene.index, "image"))}
+              >
                 {busy === `重做镜头 ${scene.index} 画面` ? <LoaderCircle size={13} className="spin" /> : <RefreshCw size={13} />}
-                {busy === `重做镜头 ${scene.index} 画面` ? "生成中…" : "重做画面"}
+                {busy === `重做镜头 ${scene.index} 画面` ? "生成中…" : (busy ? "等待当前任务" : (scene.image_path ? "重做画面" : "生成画面"))}
               </button>
               <button disabled={Boolean(busy)} onClick={() => run(`替换镜头 ${scene.index} 画面`, () => window.storybound.replaceSceneImage(task.id, scene.index))}><Upload size={13} />上传替换</button>
               <button disabled={Boolean(busy)} onClick={() => run(`重做镜头 ${scene.index} 配音`, () => window.storybound.regenerateScene(task.id, scene.index, "audio"))}><Volume2 size={13} />重做配音</button>
@@ -431,7 +472,7 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
             <span className={scene.audio_path ? "ready" : ""}>配音 {scene.audio_path ? "已生成" : "未生成"}{scene.audio_status ? ` · ${assetStatusText(scene.audio_status)}` : ""}</span>
             {scene.image_error && <span className="asset-warning" title={scene.image_error}>画面错误：{scene.image_error}</span>}
             {scene.audio_error && <span className="asset-warning" title={scene.audio_error}>配音错误：{scene.audio_error}</span>}
-            {scene.image_provider && <span className="ready">{scene.image_provider}</span>}
+            {scene.image_provider && <span className="ready">{imageProviderName(scene.image_provider)}</span>}
             {scene.use_reference && <span className="ready">使用参考图</span>}
             {scene.video_path && <span className="ready">动态画面已生成</span>}
             {scene.video_provider && <span className="ready">{scene.video_provider}</span>}
@@ -447,6 +488,7 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
 
 
 const VOICE_FAVORITES_KEY = "storybound.voiceFavorites.v2";
+const VOICE_SELECTION_KEY = "storybound.lastVoiceSelection.v2";
 const DEFAULT_VOICE_FAVORITES = [
   "zh_male_dongfanghaoran_moon_bigtts",
   "zh_male_yuanboxiaoshu_moon_bigtts",
@@ -596,16 +638,9 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
   const trackStyles: Record<string, string> = {
     "character-story": "black-white", "health-book": "oil-painting", "culture-knowledge": "ancient-cinematic",
     "picture-book": "pixar-3d", ecommerce: "realistic", inspiration: "cinematic",
-    "folk-tale": "folk-illustration", general: "realistic", "food-vlog": "retro-film"
+    "folk-tale": "folk-tale-gongbi", general: "realistic", "food-vlog": "vintage-film"
   };
-  const visualStyles = [
-    ["black-white", "黑白摄影", "纪实感"], ["realistic", "写实彩色", "质感胶片"],
-    ["oil-painting", "油画风格", "印象写意"], ["cinematic", "现代电影", "宽屏调色"],
-    ["ancient-cinematic", "古风电影", "古代史诗"], ["retro-film", "复古胶片", "80年代柯达"],
-    ["watercolor", "水彩治愈", "柔和晕染"], ["magazine", "杂志插画", "极简色块"],
-    ["pixar-3d", "皮克斯 3D", "动画质感"], ["ink-wash", "中国水墨", "文人意境"],
-    ["folk-illustration", "民间故事工笔风", "工笔叙事"], ["ghibli", "吉卜力", "治愈日漫"]
-  ];
+  const visualStyles = BUILTIN_VISUAL_STYLES.map(item => [item.id, item.name, item.tag] as const);
   const [style, setStyle] = useState(trackStyles["character-story"]);
   const [ratio, setRatio] = useState("9:16");
   const [targetScenes, setTargetScenes] = useState(0);
@@ -633,7 +668,7 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
   const [coverImageMode, setCoverImageMode] = useState("off");
   const [coverTemplateId, setCoverTemplateId] = useState("cinematic-poster");
   const [processingMode, setProcessingMode] = useState("auto");
-  const [pauseMode, setPauseMode] = useState("none");
+  const [pauseMode, setPauseMode] = useState("script");
   const [pausePoints, setPausePoints] = useState<number[]>([]);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [sourceMode, setSourceMode] = useState("paste");
@@ -652,6 +687,7 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
   const [bgmId, setBgmId] = useState("builtin");
   const [saving, setSaving] = useState(false);
   const [draftJustSaved, setDraftJustSaved] = useState(false);
+  const [voiceSelectionLoaded, setVoiceSelectionLoaded] = useState(false);
 
   useEffect(() => {
     window.storybound.listStyles().then(setCustomStyles);
@@ -659,14 +695,42 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
     window.storybound.getTemplates().then(setDraftTemplates);
     window.storybound.listCoverTemplates().then(setCoverTemplates);
     window.storybound.listBgm().then(setBgmItems);
-    window.storybound.getConfig().then(config => {
-      const provider = config.tts?.provider || "system";
+    Promise.all([window.storybound.getConfig(), window.storybound.listTasks()]).then(([config, tasks]) => {
+      const latestTask = tasks.find(item => item.task_type !== "podcast");
+      let remembered: { provider?: string; speaker?: string; speed?: number } | null = null;
+      try {
+        const parsed = JSON.parse(localStorage.getItem(VOICE_SELECTION_KEY) || "null");
+        if (parsed && typeof parsed === "object") remembered = parsed;
+      } catch {
+        remembered = null;
+      }
+
+      const configProvider = config.tts?.provider === "volcengine" ? "volcengine" : "system";
+      const latestProvider = latestTask?.tts_provider === "system" && String(latestTask?.speaker || "").includes("_bigtts")
+        ? "volcengine"
+        : latestTask?.tts_provider;
+      const rememberedProvider = remembered?.provider;
+      // 设置页决定当前使用哪一种 TTS 服务；本地记忆只恢复该服务下最后选中的音色和语速。
+      const provider = configProvider;
+      const configSpeaker = provider === "system"
+        ? (config.tts?.system?.voice || "")
+        : (config.tts?.volcengine?.speaker || DEFAULT_VOLC_VOICE_ID);
+      const latestSpeaker = latestProvider === provider && typeof latestTask?.speaker === "string" ? latestTask.speaker : undefined;
+      const rememberedSpeaker = rememberedProvider === provider && typeof remembered?.speaker === "string" ? remembered.speaker : undefined;
+
       setTtsProvider(provider);
+      setSpeaker(rememberedSpeaker ?? latestSpeaker ?? configSpeaker);
+      setTtsSpeed(Number(remembered?.speed || latestTask?.tts_speed || 1));
       setVolcPreviewConfigured(Boolean(config.tts?.volcengine?.app_id?.trim() && config.tts?.volcengine?.access_key?.trim()));
-      setSpeaker(provider === "system" ? (config.tts?.system?.voice || "") : (config.tts?.volcengine?.speaker || DEFAULT_VOLC_VOICE_ID));
-    });
+      setVoiceSelectionLoaded(true);
+    }).catch(() => setVoiceSelectionLoaded(true));
     window.storybound.listSystemVoices().then(setSystemVoices).catch(() => setSystemVoices([]));
   }, []);
+
+  useEffect(() => {
+    if (!voiceSelectionLoaded) return;
+    localStorage.setItem(VOICE_SELECTION_KEY, JSON.stringify({ provider: ttsProvider, speaker, speed: ttsSpeed }));
+  }, [voiceSelectionLoaded, ttsProvider, speaker, ttsSpeed]);
 
   const chooseTrack = (id: string) => {
     setTrack(id);
@@ -689,12 +753,21 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
   const productReferenceMode = selectedReferenceKind === "product";
 
   const normalizedProcessingMode = processingMode === "semi" ? "semi_auto" : processingMode;
-  const disabledPauseSteps = normalizedProcessingMode === "direct" ? [0, 1, 2]
-    : normalizedProcessingMode === "semi_auto" ? [0, 1] : [];
+  const pauseStageOptions = [
+    { value: 3, label: "脚本与分镜确认" },
+    { value: 4, label: "图片确认" },
+    { value: 5, label: "配音确认" }
+  ];
+  const disabledPauseSteps: number[] = [];
   const effectivePausePoints = pausePoints.filter(step => !disabledPauseSteps.includes(step));
+  const willPauseAtScript = pauseMode === "script" || (pauseMode === "custom" && effectivePausePoints.includes(3));
   const canSave = text.trim().length > 0;
   const canStart = text.trim().length >= 50;
   const wordsPerScene = targetLength > 0 && targetScenes > 0 ? Math.round(targetLength / targetScenes) : 0;
+  const currentSceneCharacters = Array.from(text.trim().replace(/\s+/gu, "")).length;
+  const estimatedCharsPerMinute = 230 * Math.max(0.75, Math.min(1.5, Number(ttsSpeed || 1)));
+  const estimatedDurationMinutes = currentSceneCharacters / estimatedCharsPerMinute;
+  const autoSceneEstimate = Math.max(1, Math.round(estimatedDurationMinutes * 5));
 
   const submit = async (start: boolean) => {
     const cleanText = text.trim();
@@ -718,9 +791,17 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
     setSaving(true);
     setDraftJustSaved(false);
     try {
-      const effectivePause = pauseMode === "custom"
-        ? (effectivePausePoints.some(step => step <= 3) ? "script" : effectivePausePoints.length ? "custom" : "none")
-        : pauseMode === "critical" ? "script" : pauseMode;
+      const effectivePausePointsResolved = pauseMode === "image" ? [4]
+        : pauseMode === "audio" ? [5]
+        : pauseMode === "custom" ? effectivePausePoints
+        : [];
+      const effectivePause = pauseMode === "script"
+        ? "script"
+        : pauseMode === "image" || pauseMode === "audio"
+          ? "custom"
+          : pauseMode === "custom"
+            ? (effectivePausePointsResolved.includes(3) ? "script" : effectivePausePointsResolved.length ? "custom" : "none")
+            : "none";
       const effectiveVideoIntro = materialSource === "ai" && taskType !== "podcast"
         ? (videoIntro === -2 ? Math.max(1, customIntroCount) : videoIntro) : 0;
       const effectiveCoverMode = materialSource === "ai" ? coverImageMode : "off";
@@ -740,11 +821,11 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
         characterConsistencyMode: materialSource === "ai" && !productReferenceMode ? characterConsistencyMode : "off",
         coverImageMode: effectiveCoverMode, coverTemplateId,
         pauseMode: effectivePause,
-        sourceMode, sourceQuery, sourceRequirements, bgmId, speaker,
+        sourceMode, sourceQuery, sourceRequirements, bgmId, speaker, ttsProvider,
         taskType, scriptFormat: taskType === "podcast" ? "dialogue" : "narration",
         podcastImageMode, podcastSpeakers,
         processingMode: normalizedProcessingMode,
-        pausePoints: effectivePausePoints,
+        pausePoints: effectivePausePointsResolved,
         videoIntro: effectiveVideoIntro,
         videoIntroDuration: effectiveVideoIntro === 0 ? 0 : videoIntroDuration,
         researchWeb, researchAi, researchIma
@@ -818,8 +899,8 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
           <OptionGroup title="改写强度" hint="强度越高原创度越高，但与对标结构差异越大"><Choice active={rewriteIntensity === "standard"} onClick={() => setRewriteIntensity("standard")} title="标准改写" badge="推荐" /><Choice active={rewriteIntensity === "deep"} onClick={() => setRewriteIntensity("deep")} title="深度改写" /><Choice active={rewriteIntensity === "original"} onClick={() => setRewriteIntensity("original")} title="高度原创" /></OptionGroup>
           <OptionGroup title="叙事视角" hint="切换人称可大幅提升原创度"><Choice active={narrativePov === "original"} onClick={() => setNarrativePov("original")} title="保持原文" badge="默认" /><Choice active={narrativePov === "first"} onClick={() => setNarrativePov("first")} title="第一人称" /><Choice active={narrativePov === "third"} onClick={() => setNarrativePov("third")} title="第三人称" /></OptionGroup>
           <label className="toggle-line"><span><b>带货模式</b><small>{keepPromotion ? "改写时保留带货段落" : "改写时删除带货段落"}</small></span><input type="checkbox" checked={keepPromotion} onChange={e => setKeepPromotion(e.target.checked)} /></label>
-          <div className="number-pair"><label>目标字数<input type="number" min={100} step={50} value={targetLength || ""} onChange={e => setTargetLength(Number(e.target.value))} placeholder="自动" /><small>字（±15%，留空跟随原文）</small></label><label>目标分镜数<input type="number" min={3} step={1} value={targetScenes || ""} onChange={e => setTargetScenes(Number(e.target.value))} placeholder="自动" /><small>个（±10%，建议每镜 25-45 字{wordsPerScene ? ` · 当前约 ${wordsPerScene} 字/镜` : ""}）</small></label></div>
-        </> : <div className="mode-note">{normalizedProcessingMode === "semi_auto" ? "半自动：保留输入原文，AI 只做智能分句。" : "直接出片：跳过 AI 改写，按空行和句号机械切分。"} 此模式下改写强度、叙事视角与带货设置已自动隐藏。</div>}
+          <div className="number-pair"><label>目标字数<input type="number" min={100} step={50} value={targetLength || ""} onChange={e => setTargetLength(Number(e.target.value))} placeholder="自动" /><small>字（±15%，留空跟随原文）</small></label><label>目标分镜数<input type="number" min={1} step={1} value={targetScenes || ""} onChange={e => setTargetScenes(Number(e.target.value))} placeholder="自动" /><small>个（留空时由大模型按自然语义分镜，整体约每分钟 5 镜、每镜约 10～14 秒；默认语速下通常约 40～55 字，标点计入、空白不计{targetScenes ? (wordsPerScene ? ` · 当前约 ${wordsPerScene} 字/镜` : "") : currentSceneCharacters ? ` · 当前输入预计 ${autoSceneEstimate} 张` : ""}）</small></label></div>
+        </> : <div className="mode-note">{normalizedProcessingMode === "semi_auto" ? "半自动：完全锁定输入原文，Claude 只组合连续原文编号做分镜，不返回也不修改文字。" : "直接出片：跳过 AI 改写，按自然语义每镜约 40～50 个中文字符切分。"} 此模式下改写强度、叙事视角与带货设置已自动隐藏。</div>}
         {taskType === "podcast" && normalizedProcessingMode !== "auto" && <div className="podcast-warning"><b>🎙️ 双人播客 + 半自动/直接出片：</b>文案需自带对话标签，每行以 <code>[A]</code>（主持人）或 <code>[B]</code>（主讲）开头；没有标签请切回“全自动”。</div>}
       </CreateSection>
 
@@ -872,14 +953,14 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
         {advancedOpen && <div className="advanced-content">
           <div className="advanced-two-column">
             <OptionGroup title="处理模式" hint="后续提示词、生图、配音和剪映草稿都会继续执行"><Choice active={normalizedProcessingMode === "auto"} onClick={() => setProcessingMode("auto")} title="全自动" badge="推荐" /><Choice active={normalizedProcessingMode === "semi_auto"} onClick={() => setProcessingMode("semi_auto")} title="半自动" /><Choice active={normalizedProcessingMode === "direct"} onClick={() => setProcessingMode("direct")} title="直接出片" /></OptionGroup>
-            <OptionGroup title="暂停确认" hint="选择流水线在哪些步骤后暂停，等你确认再继续"><Choice active={pauseMode === "none"} onClick={() => setPauseMode("none")} title="不暂停" /><Choice active={pauseMode === "critical"} onClick={() => setPauseMode("critical")} title="关键节点" badge="推荐" /><Choice active={pauseMode === "every"} onClick={() => setPauseMode("every")} title="每步确认" /><Choice active={pauseMode === "custom"} onClick={() => setPauseMode("custom")} title="自定义" /></OptionGroup>
+            <OptionGroup title="暂停确认" hint="只保留真实可用的三个确认节点，避免误导"><Choice active={pauseMode === "none"} onClick={() => setPauseMode("none")} title="不暂停" /><Choice active={pauseMode === "script"} onClick={() => setPauseMode("script")} title="脚本与分镜确认" badge="推荐" /><Choice active={pauseMode === "image"} onClick={() => setPauseMode("image")} title="图片确认" /><Choice active={pauseMode === "audio"} onClick={() => setPauseMode("audio")} title="配音确认" /><Choice active={pauseMode === "custom"} onClick={() => setPauseMode("custom")} title="自定义" /></OptionGroup>
           </div>
-          {pauseMode === "custom" && <div className="pause-points"><b>勾选“哪些步骤后暂停让我确认”{disabledPauseSteps.length ? "（灰色项已被处理模式跳过）" : ""}</b>{["文案预审", "智能改写", "分句分镜", "提示词生成", "批量生图", "TTS 配音"].map((name, index) => { const disabled = disabledPauseSteps.includes(index); return <label className={disabled ? "disabled" : ""} key={name}><input type="checkbox" disabled={disabled} checked={!disabled && effectivePausePoints.includes(index)} onChange={e => setPausePoints(current => e.target.checked ? [...current.filter(item => item !== index), index] : current.filter(item => item !== index))} />Step {index} · {name}</label>; })}</div>}
-          {normalizedProcessingMode !== "auto" && <div className="mode-note">{normalizedProcessingMode === "semi_auto" ? "半自动：完整保留输入原文，AI 只提取主角/产品档案、拆分镜头并生成画面提示词。" : "直接出片：跳过预审、改写和智能分句，按空行或句号机械切分。"}</div>}
+          {pauseMode === "custom" && <div className="pause-points"><b>勾选“哪些阶段后暂停让我确认”</b>{pauseStageOptions.map(item => <label key={item.value}><input type="checkbox" checked={effectivePausePoints.includes(item.value)} onChange={e => setPausePoints(current => e.target.checked ? [...current.filter(step => step !== item.value), item.value] : current.filter(step => step !== item.value))} />Step {item.value} · {item.label}</label>)}</div>}
+          {normalizedProcessingMode !== "auto" && <div className="mode-note">{normalizedProcessingMode === "semi_auto" ? "半自动：原文逐字锁定；Claude 只组合连续原文编号确定分镜，并生成主角/产品档案和画面提示词。" : "直接出片：跳过预审和改写，按自然语义及每分钟约 5 镜的节奏自动切分。"}</div>}
           <label>提示词模板<select value={promptTemplateId} onChange={e => setPromptTemplateId(e.target.value)}><option value="">跟随赛道默认</option><optgroup label="系统模板">{systemPromptTemplates.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</optgroup>{promptTemplates.length > 0 && <optgroup label="自定义模板">{promptTemplates.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</optgroup>}</select><small>全自动与半自动会执行文案/元数据/分镜三阶段规划；直接出片不调用大模型。</small></label>
         </div>}
       </div>
-      <div className="create-submit-bar"><div><b>自定义 / 其他</b><small>{canStart ? "当前语言模型 · 可开始生成" : canSave ? `还需 ${Math.max(0, 50 - text.trim().length)} 字才能开始生成` : "请输入至少 50 字文案"}</small></div><button disabled={!canSave || saving} onClick={() => submit(false)}>{draftJustSaved ? <CheckCircle2 size={15} /> : <Save size={15} />}{draftJustSaved ? "已保存" : "保存为草稿"}</button><button className="primary" disabled={!canStart || saving} onClick={() => submit(true)}>{saving ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />}开始生成 <kbd>Ctrl+Enter</kbd></button></div>
+      <div className="create-submit-bar"><div><b>自定义 / 其他</b><small>{canStart ? "当前语言模型 · 可开始生成" : canSave ? `还需 ${Math.max(0, 50 - text.trim().length)} 字才能开始生成` : "请输入至少 50 字文案"}</small></div><button disabled={!canSave || saving} onClick={() => submit(false)}>{draftJustSaved ? <CheckCircle2 size={15} /> : <Save size={15} />}{draftJustSaved ? "已保存" : "保存为草稿"}</button><button className="primary" disabled={!canStart || saving} onClick={() => submit(true)}>{saving ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />}{willPauseAtScript ? "生成脚本与分镜" : "直接开始生成"} <kbd>Ctrl+Enter</kbd></button></div>
     </div>
     <VolcVoicePicker open={voicePickerOpen} value={speaker} speed={ttsSpeed} configured={volcPreviewConfigured} onClose={() => setVoicePickerOpen(false)} onPick={voice => setSpeaker(voice.id)} />
   </section>;
@@ -1056,6 +1137,12 @@ function LlmSettings({ draft, setDraft }: { draft: AppConfig; setDraft: (next: A
 const providerName = (provider: string) => ({
   custom: "自定义"
 }[provider] || provider);
+const imageProviderName = (provider: string) => {
+  const value = String(provider || "");
+  if (value.startsWith("custom_image")) return "foxcode";
+  if (value.toLowerCase().startsWith("apimart")) return "Apimart";
+  return value;
+};
 const maskKey = (key: string) => key ? `${key.slice(0, 4)}••••${key.slice(-4)}` : "未填写 Key";
 
 function ImageSettings({ draft, setDraft }: { draft: AppConfig; setDraft: (next: AppConfig) => void }) {
@@ -1070,22 +1157,24 @@ function ImageSettings({ draft, setDraft }: { draft: AppConfig; setDraft: (next:
     setDraft({ ...draft, image_provider: next });
   };
   const updateCustom = (patch: Partial<AppConfig["custom_image"]>) => setDraft({ ...draft, custom_image: { ...draft.custom_image, ...patch } });
+  const updateApimart = (patch: Partial<AppConfig["apimart"]>) => setDraft({ ...draft, apimart: { ...draft.apimart, ...patch } });
   const updateModelscope = (patch: Partial<AppConfig["modelscope"]>) => setDraft({ ...draft, modelscope: { ...draft.modelscope, ...patch } });
   const updateRunningHub = (patch: Partial<AppConfig["runninghub"]>) => setDraft({ ...draft, runninghub: { ...draft.runninghub, ...patch } });
-  const common = provider === "modelscope" ? draft.modelscope : provider === "runninghub" ? draft.runninghub : draft.custom_image;
-  const testLabel = provider === "custom_image" ? "测试生图（会消耗额度）" : "测试连接";
+  const common = provider === "modelscope" ? draft.modelscope : provider === "runninghub" ? draft.runninghub : provider === "apimart" ? draft.apimart : draft.custom_image;
+  const testLabel = ["custom_image", "apimart"].includes(provider) ? "测试生图（会消耗额度）" : "测试连接";
 
   return <>
-    <PanelHeading icon={Image} title="AI 绘图" desc="分镜图片生成 · 支持 OpenAI 兼容 Images API、魔搭与 RunningHub" />
+    <PanelHeading icon={Image} title="AI 绘图" desc="分镜图片生成 · 可在 foxcode 与 Apimart 之间切换" />
     <div className="image-provider-tabs">
-      <button className={provider === "custom_image" ? "active" : ""} onClick={() => setProvider("custom_image")}>OpenAI 兼容接口{provider === "custom_image" && <small>使用中</small>}</button>
+      <button className={provider === "custom_image" ? "active" : ""} onClick={() => setProvider("custom_image")}>foxcode{provider === "custom_image" && <small>使用中</small>}</button>
+      <button className={provider === "apimart" ? "active" : ""} onClick={() => setProvider("apimart")}>Apimart{provider === "apimart" && <small>使用中</small>}</button>
       <button className={provider === "modelscope" ? "active" : ""} onClick={() => setProvider("modelscope")}>魔搭免费{provider === "modelscope" && <small>使用中</small>}</button>
       <button className={provider === "runninghub" ? "active" : ""} onClick={() => setProvider("runninghub")}>RunningHub{provider === "runninghub" && <small>使用中</small>}</button>
     </div>
     <div className="image-settings-card">
       {provider === "custom_image" && <>
         <div className="info-box">
-          已对接 OpenAI 官方接口格式：无参考图时调用 <code>/images/generations</code>，上传参考图后自动调用 <code>/images/edits</code>。API Key 只保存到本机配置文件，不会写入源码。
+          foxcode 使用 OpenAI 兼容图片接口：无参考图时调用 <code>/images/generations</code>，上传参考图后自动调用 <code>/images/edits</code>。API Key 只保存到本机配置文件。
         </div>
         <div className="form-grid">
           <label>显示名称<input value={draft.custom_image.display_name} onChange={e => updateCustom({ display_name: e.target.value })} placeholder="例如：GPT Image 中转接口" /></label>
@@ -1102,6 +1191,7 @@ function ImageSettings({ draft, setDraft }: { draft: AppConfig; setDraft: (next:
           <label>文生图返回格式<select value={draft.custom_image.response_format} onChange={e => updateCustom({ response_format: e.target.value })}><option value="auto">不传（按接口默认）</option><option value="b64_json">b64_json</option><option value="url">url</option></select></label>
           <label>参考图返回格式<select value={draft.custom_image.edit_response_format} onChange={e => updateCustom({ edit_response_format: e.target.value })}><option value="b64_json">b64_json（文档示例）</option><option value="url">url</option><option value="auto">不传此字段</option></select></label>
           <label>审核灵敏度<select value={draft.custom_image.moderation || "none"} onChange={e => updateCustom({ moderation: e.target.value })}><option value="none">不传（兼容中转站）</option><option value="auto">auto（标准）</option><option value="low">low（较宽松）</option></select><small>仅支持该参数的 GPT Image 兼容接口有效。</small></label>
+          <label>负向提示词字段（可选）<input value={draft.custom_image.negative_prompt_field || ""} onChange={e => updateCustom({ negative_prompt_field: e.target.value })} placeholder="例如 negative_prompt" /><small>接口明确支持时再填写；留空不会发送未知字段。</small></label>
           <label className="full">代理地址（可选）<input value={draft.custom_image.proxy_url} onChange={e => updateCustom({ proxy_url: e.target.value })} placeholder="http://127.0.0.1:7890" /></label>
         </div>
         <button className="text-action" onClick={() => setShowAdvanced(value => !value)}>{showAdvanced ? "收起高级设置" : "展开高级设置"}</button>
@@ -1119,11 +1209,31 @@ function ImageSettings({ draft, setDraft }: { draft: AppConfig; setDraft: (next:
           <label className="full">额外请求参数 JSON<textarea value={draft.custom_image.extra_body_json} onChange={e => updateCustom({ extra_body_json: e.target.value })} placeholder='{"background":"opaque"}' /><small>文生图时合并到 JSON 请求体；参考图编辑时转换为 multipart 表单字段。</small></label>
         </div>}
       </>}
+      {provider === "apimart" && <>
+        <div className="info-box">
+          Apimart 使用异步任务接口。提交成功后会持续查询任务状态，并在图片生成完成后立即下载到本地。取消创作时，只停止提交后续图片；已经提交的图片仍会继续查询并下载。
+        </div>
+        <div className="form-grid">
+          <label>服务名称<input value="Apimart" disabled /></label>
+          <label>模型<input value={draft.apimart.model || "gpt-image-2"} disabled /></label>
+          <label className="full">Base URL<input value={draft.apimart.base_url} onChange={e => updateApimart({ base_url: e.target.value })} placeholder="https://api.apimart.ai/v1" /></label>
+          <label className="full">API Key<small>从 Apimart 控制台获取</small><div className="secret-input">
+            <input type={showKey ? "text" : "password"} value={draft.apimart.api_key} onChange={e => updateApimart({ api_key: e.target.value })} placeholder="sk-xxxx" />
+            <button title="显示或隐藏" onClick={() => setShowKey(value => !value)}><Eye size={16} /></button>
+            <button title="复制" onClick={() => window.storybound.writeClipboard(draft.apimart.api_key)}><Copy size={16} /></button>
+          </div></label>
+          <label>输出分辨率<select value={draft.apimart.resolution || "1k"} onChange={e => updateApimart({ resolution: e.target.value })}><option value="1k">1K</option><option value="2k">2K</option><option value="4k">4K</option></select></label>
+          <label>代理地址（可选）<input value={draft.apimart.proxy_url} onChange={e => updateApimart({ proxy_url: e.target.value })} placeholder="http://127.0.0.1:7890" /></label>
+          <label className="check-label"><input type="checkbox" checked={Boolean(draft.apimart.official_fallback)} onChange={e => updateApimart({ official_fallback: e.target.checked })} />启用官方渠道兜底</label>
+          <label className="check-label"><input type="checkbox" checked={draft.apimart.policy_fallback !== false} onChange={e => updateApimart({ policy_fallback: e.target.checked })} />审核拒绝后自动改写并重试</label>
+        </div>
+      </>}
       {provider === "modelscope" && <div className="form-grid">
         <label className="full">Access Token<input type="password" value={draft.modelscope.api_key} onChange={e => updateModelscope({ api_key: e.target.value })} /></label>
         <label className="full">API 地址<input value={draft.modelscope.base_url} onChange={e => updateModelscope({ base_url: e.target.value })} /></label>
         <label className="full">模型<input value={draft.modelscope.model} onChange={e => updateModelscope({ model: e.target.value })} list="modelscope-models" /><datalist id="modelscope-models"><option value="Tongyi-MAI/Z-Image-Turbo" /><option value="Tongyi-MAI/Z-Image" /><option value="Qwen/Qwen-Image-2512" /></datalist></label>
         <label>并发数<input type="number" min={1} max={6} value={draft.modelscope.concurrency} onChange={e => updateModelscope({ concurrency: Number(e.target.value) })} /></label>
+        <label>负向提示词字段<input value={draft.modelscope.negative_prompt_field || "negative_prompt"} onChange={e => updateModelscope({ negative_prompt_field: e.target.value })} /></label>
         <label>代理地址<input value={draft.modelscope.proxy_url} onChange={e => updateModelscope({ proxy_url: e.target.value })} /></label>
       </div>}
       {provider === "runninghub" && <div className="form-grid">
@@ -1131,11 +1241,11 @@ function ImageSettings({ draft, setDraft }: { draft: AppConfig; setDraft: (next:
         <label>官方图片模型<select value={draft.runninghub.model || "rh-image-g2"} onChange={e => updateRunningHub({ model: e.target.value })}><option value="rh-image-g2">全能图片 G-2.0</option><option value="rh-image-x">全能图片 X</option><option value="rh-image-v2">全能图片 V2</option></select></label>
         <label>代理地址<input value={draft.runninghub.proxy_url} onChange={e => updateRunningHub({ proxy_url: e.target.value })} /></label>
         <label className="full">自定义 Workflow ID（可选）<input value={draft.runninghub.workflow_id} onChange={e => updateRunningHub({ workflow_id: e.target.value })} placeholder="留空则使用上方官方模型" /><small>填写后将改用旧版自定义工作流；动态分镜仍使用官方图生视频接口。</small></label>
-        {draft.runninghub.workflow_id && <><label>提示词节点 ID<input value={draft.runninghub.prompt_node_id} onChange={e => updateRunningHub({ prompt_node_id: e.target.value })} /></label><label>提示词字段名<input value={draft.runninghub.prompt_field_name} onChange={e => updateRunningHub({ prompt_field_name: e.target.value })} /></label><label className="full">固定节点参数 JSON<textarea value={draft.runninghub.node_info_json} onChange={e => updateRunningHub({ node_info_json: e.target.value })} placeholder='[{"nodeId":"5","fieldName":"width","fieldValue":"1024"}]' /><small>参考图节点的 fieldValue 可填写 {"{{reference_image}}"}，生成时会自动上传并替换。</small></label></>}
+        {draft.runninghub.workflow_id && <><label>提示词节点 ID<input value={draft.runninghub.prompt_node_id} onChange={e => updateRunningHub({ prompt_node_id: e.target.value })} /></label><label>提示词字段名<input value={draft.runninghub.prompt_field_name} onChange={e => updateRunningHub({ prompt_field_name: e.target.value })} /></label><label className="full">固定节点参数 JSON<textarea value={draft.runninghub.node_info_json} onChange={e => updateRunningHub({ node_info_json: e.target.value })} placeholder='[{"nodeId":"5","fieldName":"width","fieldValue":"1024"}]' /><small>{"fieldValue 可使用 {{reference_image}}、{{prompt}}、{{negative_prompt}} 占位符；生成时自动替换。"}</small></label></>}
       </div>}
       <div className="image-common-settings">
-        <strong>画面比例</strong><div>{ratios.map(ratio => <button className={common.ratio === ratio ? "selected" : ""} onClick={() => provider === "modelscope" ? updateModelscope({ ratio }) : provider === "runninghub" ? updateRunningHub({ ratio }) : updateCustom({ ratio })} key={ratio}>{ratio}</button>)}</div>
-        <label>并发数<input type="number" min={1} max={6} value={common.concurrency} onChange={e => provider === "modelscope" ? updateModelscope({ concurrency: Number(e.target.value) }) : provider === "runninghub" ? updateRunningHub({ concurrency: Number(e.target.value) }) : updateCustom({ concurrency: Number(e.target.value) })} /></label>
+        <strong>画面比例</strong><div>{ratios.map(ratio => <button className={common.ratio === ratio ? "selected" : ""} onClick={() => provider === "modelscope" ? updateModelscope({ ratio }) : provider === "runninghub" ? updateRunningHub({ ratio }) : provider === "apimart" ? updateApimart({ ratio }) : updateCustom({ ratio })} key={ratio}>{ratio}</button>)}</div>
+        <label>并发数<input type="number" min={1} max={6} value={common.concurrency} onChange={e => provider === "modelscope" ? updateModelscope({ concurrency: Number(e.target.value) }) : provider === "runninghub" ? updateRunningHub({ concurrency: Number(e.target.value) }) : provider === "apimart" ? updateApimart({ concurrency: Number(e.target.value) }) : updateCustom({ concurrency: Number(e.target.value) })} /></label>
       </div>
       <div className="tts-test-row"><button disabled={testing} onClick={async () => {
         setTesting(true); setTestMessage("");
@@ -1415,11 +1525,10 @@ function MusicMv() {
 }
 
 function ImagePlayground() {
-  const styles = ["黑白摄影", "写实彩色", "油画风格", "现代电影", "古风电影", "复古胶片", "水彩治愈", "杂志插画", "皮克斯 3D", "中国水墨", "民间故事工笔", "吉卜力"];
   const ratios = ["21:9", "16:9", "3:2", "4:3", "1:1", "3:4", "2:3", "9:16"];
   const [mode, setMode] = useState<"text" | "reference" | "smart">("text");
   const [prompt, setPrompt] = useState("");
-  const [selectedStyles, setSelectedStyles] = useState<string[]>([]);
+  const [selectedStyle, setSelectedStyle] = useState("realistic");
   const [ratio, setRatio] = useState("9:16");
   const [resolution, setResolution] = useState("1k");
   const [referenceImagePath, setReferenceImagePath] = useState("");
@@ -1433,13 +1542,24 @@ function ImagePlayground() {
     if (!prompt.trim()) return;
     if (mode === "reference" && !referenceImagePath) { setError("图像参考模式需要先选择参考图"); return; }
     setLoading(true); setError("");
-    const style = selectedStyles.join("，") + (mode === "smart" ? "，智能补全主体、环境、光线、镜头与构图细节" : "");
-    try { setResult(await window.storybound.generateImage({ prompt, style, ratio, resolution, referenceImagePath: mode === "text" ? "" : referenceImagePath })); await refreshHistory(); }
+    const scenePrompt = mode === "smart"
+      ? `${prompt}，请补全主体、环境、光线、镜头与构图细节，但不要改变所选画面风格`
+      : prompt;
+    try {
+      setResult(await window.storybound.generateImage({
+        prompt: scenePrompt,
+        styleId: selectedStyle,
+        ratio,
+        resolution,
+        referenceImagePath: mode === "text" ? "" : referenceImagePath
+      }));
+      await refreshHistory();
+    }
     catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
     finally { setLoading(false); }
   };
   return <section>
-    <PageHeader eyebrow="IMAGE LAB" title="画图实验室" desc="输入提示词、选择风格与比例直接出图；不写入任务历史，也不启动视频流水线。" />
+    <PageHeader eyebrow="IMAGE LAB" title="画图实验室" desc="输入提示词、单选画面风格与比例直接出图；所有入口使用同一套原版风格配置。" />
     <div className="playground-panel">
       <div className="playground-modes">
         <button className={mode === "text" ? "selected" : ""} onClick={() => setMode("text")}>✍️ 文生图</button>
@@ -1448,9 +1568,9 @@ function ImagePlayground() {
       </div>
       <label className="playground-prompt">提示词<textarea value={prompt} onChange={e => setPrompt(e.target.value)} placeholder="例如：一位老者站在书房窗前，望向远方，金色阳光透过窗帘洒在脸上" /></label>
       {mode !== "text" && <button className="picker" onClick={async () => setReferenceImagePath(await window.storybound.selectImage())}><Upload size={15} />{referenceImagePath ? referenceImagePath.split(/[\\/]/).pop() : "选择图像参考"}</button>}
-      <div className="playground-group"><strong>画面风格 <small>不选 = 使用原始提示词出图</small></strong><div className="chip-list">{styles.map(item =>
-        <button className={selectedStyles.includes(item) ? "selected" : ""} key={item} onClick={() => setSelectedStyles(values => values.includes(item) ? values.filter(value => value !== item) : [...values, item])}>{item}</button>)}</div></div>
-      <div className="playground-group"><strong>比例 <small>可多选界面；当前生成选择 {ratio}</small></strong><div className="ratio-chip-list">{ratios.map(item => <button className={ratio === item ? "selected" : ""} key={item} onClick={() => setRatio(item)}>{item}</button>)}</div></div>
+      <div className="playground-group"><strong>画面风格 <small>单选；不选时使用原始提示词</small></strong><div className="chip-list">{BUILTIN_VISUAL_STYLES.map(item =>
+        <button className={selectedStyle === item.id ? "selected" : ""} key={item.id} onClick={() => setSelectedStyle(item.id)}>{item.name}</button>)}</div></div>
+      <div className="playground-group"><strong>比例 <small>当前生成选择 {ratio}</small></strong><div className="ratio-chip-list">{ratios.map(item => <button className={ratio === item ? "selected" : ""} key={item} onClick={() => setRatio(item)}>{item}</button>)}</div></div>
       <div className="playground-group"><strong>分辨率</strong><div className="chip-list">{["1k", "2k", "4k"].map(item => <button className={resolution === item ? "selected" : ""} key={item} onClick={() => setResolution(item)}>{item.toUpperCase()}</button>)}</div></div>
       <div className="playground-generate-row"><button className="primary" disabled={!prompt.trim() || loading} onClick={generate}>
           {loading ? <LoaderCircle className="spin" size={17} /> : <Image size={17} />}生成测试图片
@@ -1472,11 +1592,15 @@ function ImagePlayground() {
 }
 
 function VisualStyles() {
-  const builtins = [
-    { id: "cinematic", name: "电影质感", tag: "内置", prefix: "电影级光影，叙事构图", suffix: "高细节，无文字无水印", negative_prompt: "", description: "适合人物故事与情绪叙事" },
-    { id: "black-white", name: "黑白纪实", tag: "内置", prefix: "黑白纪实摄影，真实颗粒", suffix: "新闻摄影构图", negative_prompt: "彩色，卡通", description: "适合历史与人物纪实" },
-    { id: "illustration", name: "叙事插画", tag: "内置", prefix: "精致叙事插画，统一角色设计", suffix: "细腻色彩", negative_prompt: "照片，水印", description: "适合故事与知识内容" }
-  ];
+  const builtins: StyleRecord[] = BUILTIN_VISUAL_STYLES.map(item => ({
+    id: item.id,
+    name: item.name,
+    tag: item.tag,
+    prefix: item.prefix,
+    suffix: item.suffix,
+    negative_prompt: item.negative_prompt,
+    description: item.description
+  }));
   const [styles, setStyles] = useState<StyleRecord[]>([]);
   const [editing, setEditing] = useState<Partial<StyleRecord> | null>(null);
   const refresh = () => window.storybound.listStyles().then(setStyles);
@@ -1562,7 +1686,7 @@ function PromptTemplates() {
     {editing && <EditorModal title="编辑提示词模板" onClose={() => setEditing(null)} onSave={save}>
       <label>名称<input value={editing.name || ""} onChange={e => setEditing({ ...editing, name: e.target.value })} /></label>
       <label>内容类型<select value={editing.base_track || "character-story"} onChange={e => setEditing({ ...editing, base_track: e.target.value })}>{tracks.map(track => <option key={track.id} value={track.id}>{track.name}</option>)}</select></label>
-      <label>默认画风<input value={editing.style_id || "cinematic"} onChange={e => setEditing({ ...editing, style_id: e.target.value })} placeholder="例如 black-white / cinematic" /></label>
+      <label>默认画风<select value={editing.style_id || "cinematic"} onChange={e => setEditing({ ...editing, style_id: e.target.value })}>{BUILTIN_VISUAL_STYLES.map(item => <option key={item.id} value={item.id}>{item.name}（{item.id}）</option>)}</select></label>
       <label>描述<input value={editing.description || ""} onChange={e => setEditing({ ...editing, description: e.target.value })} /></label>
       <div className="template-editor-section"><h3>主角档案</h3><p>控制 Step 2 是否提取并向后续人物镜头注入稳定外貌信息。</p>
         <label>提取模式<select value={editing.character_card_mode || "follow"} onChange={e => setEditing({ ...editing, character_card_mode: e.target.value as "follow" | "force" | "skip" })}><option value="follow">跟随赛道</option><option value="force">强制提取</option><option value="skip">强制跳过</option></select></label>
@@ -2008,7 +2132,7 @@ function TextLayerEditor({ title, config, canvasHeight, open, active, onToggle, 
   </DraftAccordion>;
 }
 
-const statusText = (status: TaskStatus) => ({ pending: "待处理", running: "进行中", interrupted: "已中断", review: "待确认脚本", completed: "已完成", failed: "失败", cancelled: "已取消" }[status]);
+const statusText = (status: TaskStatus) => ({ pending: "待处理", running: "进行中", cancelling: "取消收尾中", interrupted: "已中断", review: "待确认脚本", completed: "已完成", failed: "失败", cancelled: "已取消" }[status]);
 const assetStatusText = (status: string) => ({ pending: "待处理", running: "处理中", remote_running: "远程处理中", interrupted: "待恢复", completed: "完成", failed: "失败", failed_fallback: "失败已兜底", skipped: "已跳过" }[status] || status);
 const trackName = (track: string) => tracks.find(item => item.id === track)?.name || track;
 const styleGradient = (id: string) => {

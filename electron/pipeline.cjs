@@ -4,16 +4,26 @@ const {
   generateSceneImage, generateRunningHubVideo, synthesizeSpeech,
   mediaDuration, resolveResource, spawnAsync, ffmpegPath
 } = require("./services.cjs");
-const { renderVideo } = require("./media.cjs");
+const { renderVideo, buildCaptionTimings } = require("./media.cjs");
 const { generateJianyingDraft } = require("./draft.cjs");
 const { generateCover } = require("./cover.cjs");
 const { planVideoScript } = require("./llm-planner.cjs");
 const {
   atomicWriteJson, atomicWriteFile, readJsonSafe, fileLooksUsable,
-  retryOperation, fingerprint
+  retryOperation, fingerprint, isTransientError
 } = require("./checkpoint.cjs");
-const { buildPolicySafeImagePrompt } = require("./image-prompt-safety.cjs");
 const { sceneReferencePaths } = require("./reference-routing.cjs");
+const { throwIfCancelled, TaskCancelledError, isCancellationError } = require("./cancellation.cjs");
+
+
+function assertTaskActive(task) {
+  throwIfCancelled();
+  if (task?.shouldCancel?.()) {
+    const error = new Error("任务已取消");
+    error.code = "TASK_CANCELLED";
+    throw error;
+  }
+}
 
 function podcastSpeakerPair(id) {
   if (id === "liufei-xiaolei") {
@@ -151,8 +161,9 @@ async function ensureCharacterReferenceGrid({ app, task, config, outputDir, scri
     emit(4, "正在生成主角九宫格定妆参考图（仅调用一次图片接口）");
     const prompt = `${stablePrompt}。生成一张严格3×3九宫格人物设定图，同一个人物贯穿全部九格，骨相、五官、身份特征完全一致。第一行青年，第二行中年，第三行老年；每行依次为正面、左侧45度、右侧45度半身肖像。年龄只按行变化，每行发型与服装统一，纯净中性背景，均匀棚拍光线，五官清晰无遮挡，无文字，无水印，无额外人物。`;
     await generateSceneImage({
-      app, config, prompt, destination: gridPath, ratio: "1:1", index: "character-grid",
-      materialSource: "ai", referenceImagePath: "", requestId: `storybound-${task.id}-character-grid`
+      app, config, prompt, styleConfig: task.style_config, destination: gridPath, ratio: "1:1", index: "character-grid",
+      materialSource: "ai", referenceImagePath: "", requestId: `storybound-${task.id}-character-grid`,
+      shouldStopSubmitting: () => Boolean(task?.shouldCancel?.())
     });
   }
 
@@ -171,51 +182,52 @@ async function ensureCharacterReferenceGrid({ app, task, config, outputDir, scri
   persist({ character_reference_grid: gridPath, character_reference_groups: groups });
 }
 
-function sceneVoiceSegments(scene) {
-  const values = Array.isArray(scene.caption_segments)
+
+function taskVoiceProvider(task, config) {
+  if (task?.task_type === "podcast") return "volcengine";
+  const stored = String(task?.tts_provider || "").trim();
+  const speaker = String(task?.speaker || "").trim();
+  // 兼容旧任务：旧版没有保存 provider，但火山音色 ID 可明确识别。
+  if (speaker.includes("_bigtts") && stored !== "volcengine") return "volcengine";
+  if (stored === "system" || stored === "volcengine") return stored;
+  return config?.tts?.provider === "volcengine" ? "volcengine" : "system";
+}
+
+function sceneVoiceText(scene) {
+  const narration = String(scene?.narration || "").trim();
+  if (narration) return narration;
+  const fallback = Array.isArray(scene?.caption_segments)
     ? scene.caption_segments.map(item => String(item || "").trim()).filter(Boolean)
     : [];
-  return values.length ? values : [String(scene.narration || "").trim()].filter(Boolean);
+  return fallback.join("，");
+}
+
+function captionMaxChars(task) {
+  return Math.max(6, Math.min(30, Number(task?.draft_template?.caption?.maxCharsPerLine || 14)));
+}
+
+function syncSceneCaptionTimings(scene, duration, task) {
+  const timings = buildCaptionTimings(sceneVoiceText(scene), duration, captionMaxChars(task));
+  scene.caption_timings = timings;
+  scene.caption_segments = timings.map(item => item.text);
+  return timings;
 }
 
 async function synthesizeSegmentedScene({ app, config, scene, task, audioDir, destination }) {
-  const segments = sceneVoiceSegments(scene);
-  if (segments.length === 1) {
-    await synthesizeSpeech({
-      app, config, text: segments[0], destination,
-      speed: Number(task.tts_speed || 1),
-      speaker: task.task_type === "podcast" ? scene.speaker_id : task.speaker
-    });
-    const duration = await mediaDuration(app, config, destination);
-    scene.caption_timings = [{ text: segments[0], start: 0, end: duration }];
-    return duration;
-  }
+  const text = sceneVoiceText(scene);
+  if (!text) throw new Error(`第 ${scene.index || "?"} 镜没有可用于配音的旁白文本`);
 
-  const segmentDir = path.join(audioDir, `scene-${scene.index}-segments`);
-  fs.mkdirSync(segmentDir, { recursive: true });
-  const extension = path.extname(destination) || ".wav";
-  const files = [];
-  const timings = [];
-  let cursor = 0;
-  for (let index = 0; index < segments.length; index += 1) {
-    const segmentPath = path.join(segmentDir, `${String(index + 1).padStart(3, "0")}${extension}`);
-    await synthesizeSpeech({
-      app, config, text: segments[index], destination: segmentPath,
-      speed: Number(task.tts_speed || 1),
-      speaker: task.task_type === "podcast" ? scene.speaker_id : task.speaker
-    });
-    const duration = await mediaDuration(app, config, segmentPath);
-    timings.push({ text: segments[index], start: cursor, end: cursor + duration });
-    cursor += duration;
-    files.push(segmentPath);
-  }
-  const concatList = path.join(segmentDir, "concat.txt");
-  atomicWriteFile(concatList, files.map(file => `file '${file.replace(/\\/g, "/").replace(/'/g, "'\\''")}'`).join("\n"), "utf8");
-  await spawnAsync(ffmpegPath(app, config), [
-    "-y", "-f", "concat", "-safe", "0", "-i", concatList, "-c", "copy", destination
-  ]);
-  scene.caption_timings = timings;
-  return await mediaDuration(app, config, destination);
+  // TTS 永远使用完整旁白一次性合成，字幕长度只能影响显示，不能再反向切割语音。
+  await synthesizeSpeech({
+    app, config, text, destination,
+    speed: Number(task.tts_speed || 1),
+    provider: taskVoiceProvider(task, config),
+    speaker: task.task_type === "podcast" ? scene.speaker_id : task.speaker
+  });
+  const duration = await mediaDuration(app, config, destination);
+  syncSceneCaptionTimings(scene, duration, task);
+  scene.audio_generation_mode = "continuous-v1";
+  return duration;
 }
 
 function writePublishAssets(outputDir, script) {
@@ -238,12 +250,14 @@ function writePublishAssets(outputDir, script) {
 }
 
 async function preparePipeline({ task, config, baseOutputDir, emit, checkpoint = () => {} }) {
+  assertTaskActive(task);
   const outputDir = taskOutputDir(task, config, baseOutputDir);
   fs.mkdirSync(outputDir, { recursive: true });
   checkpoint({ outputDir, currentStage: "planning", currentStep: 1 });
 
   const sourceSnapshot = { ...task };
   delete sourceSnapshot.shouldCancel;
+  delete sourceSnapshot.abortSignal;
   if (sourceSnapshot.prompt_template?.api_key) sourceSnapshot.prompt_template.api_key = "***";
   atomicWriteJson(path.join(outputDir, "source.json"), sourceSnapshot);
 
@@ -260,6 +274,7 @@ async function preparePipeline({ task, config, baseOutputDir, emit, checkpoint =
       detail: status
     })
   });
+  assertTaskActive(task);
   writePublishAssets(outputDir, script);
   atomicWriteJson(path.join(outputDir, "model-response.txt"), script);
 
@@ -294,6 +309,7 @@ async function preparePipeline({ task, config, baseOutputDir, emit, checkpoint =
 }
 
 async function completePipeline({ app, task, config, outputDir, script, emit, checkpoint = () => {} }) {
+  assertTaskActive(task);
   const imagesDir = path.join(outputDir, "images");
   const audioDir = path.join(outputDir, "audio");
   fs.mkdirSync(imagesDir, { recursive: true });
@@ -335,6 +351,7 @@ async function completePipeline({ app, task, config, outputDir, script, emit, ch
     return snapshot;
   };
   await ensureCharacterReferenceGrid({ app, task, config, outputDir, script, emit, persist });
+  assertTaskActive(task);
   persist({ current_stage: "images", current_step: 4, detail: "检查图片断点" });
 
   const singlePodcastImage = task.task_type === "podcast" && task.podcast_image_mode === "single";
@@ -359,88 +376,174 @@ async function completePipeline({ app, task, config, outputDir, script, emit, ch
   const imageSection = config[config.image_provider] || {};
   const imageConcurrency = Math.max(1, Math.min(6, Number(imageSection.concurrency || 1)));
   let imageCursor = 0;
+  const imageFailures = [];
+  const cancelRequested = () => Boolean(task?.shouldCancel?.());
   const imageWorker = async () => {
     while (imageCursor < pendingImages.length) {
+      // Cancellation during image generation is a soft stop: no new scene is
+      // taken from the queue, while scenes already taken by workers are allowed
+      // to finish their submit/poll/download lifecycle.
+      if (cancelRequested()) return;
       const scene = pendingImages[imageCursor++];
       if (!scene) continue;
-      if (task.shouldCancel?.()) throw new Error("任务已取消");
+      assertTaskActive(task);
       scene.image_status = "running";
       scene.image_attempts = Number(scene.image_attempts || 0) + 1;
       scene.image_error = "";
       persist({ current_stage: "images", current_step: 4, detail: `生成画面 ${scene.index}` });
       emit(4, `${scene.image_remote_task_id ? "恢复远程画面任务" : "正在生成画面"} ${scene.index}/${workingScenes.length}`);
       const imagePath = path.join(imagesDir, `${scene.index}.png`);
-      const stylePrefix = task.style_config?.prefix || "";
-      const styleSuffix = task.style_config?.suffix || "";
-      const rawRequestPrompt = [stylePrefix, scene.image_prompt, styleSuffix].filter(Boolean).join("，");
-      const requestSafety = buildPolicySafeImagePrompt(rawRequestPrompt, "preflight");
-      if (requestSafety.adjusted) {
-        scene.image_prompt_original = scene.image_prompt_original || scene.image_prompt;
-        scene.image_prompt = requestSafety.prompt;
-        scene.image_prompt_safety_adjusted = true;
-        scene.image_prompt_safety_reasons = [...new Set([...(scene.image_prompt_safety_reasons || []), ...(requestSafety.reasons || [])])];
-        persist({ detail: `画面 ${scene.index} 已在发送前改写为克制画面` });
+      const scenePrompt = String(scene.image_prompt || scene.desc_prompt || scene.visual || scene.narration || "").trim();
+      if (!scenePrompt) {
+        scene.image_status = "failed";
+        scene.image_error = `第 ${scene.index} 镜缺少生图提示词`;
+        imageFailures.push({ index: scene.index, message: scene.image_error });
+        persist({ current_stage: "images", current_step: 4, detail: scene.image_error });
+        emit(4, `${scene.image_error}，已跳过并继续生成其他画面`);
+        continue;
       }
-      const requestId = `storybound-${task.id}-image-${scene.index}-${fingerprint(requestSafety.prompt).slice(0, 12)}`;
+      const requestId = `storybound-${task.id}-image-${scene.index}-${fingerprint(`${task.style_config?.id || task.style}:${scenePrompt}`).slice(0, 12)}`;
+      const canResumeVerifiedStyleRequest = () => Boolean(
+        scene.image_remote_task_id
+        && scene.image_style_id === task.style_config?.id
+        && scene.image_style_registry_version === task.style_config?.registry_version
+      );
+      const verifiedRemoteTaskId = () => (canResumeVerifiedStyleRequest() ? scene.image_remote_task_id : "");
+      if (scene.image_remote_task_id && !verifiedRemoteTaskId()) {
+        // A task submitted by an older build may already contain a black-and-white
+        // fallback prompt. Never continue polling it under a different/unverified style.
+        scene.image_remote_task_id = "";
+        scene.image_remote_provider = "";
+        scene.image_status = "running";
+        persist({ detail: `画面 ${scene.index} 的旧远程任务缺少可信画风标记，已按当前画风重新提交` });
+      }
       try {
-        const imageResult = await retryOperation(async () => generateSceneImage({
-          app,
-          config,
-          prompt: requestSafety.prompt,
-          destination: imagePath,
-          ratio: task.ratio,
-          index: scene.index,
-          materialSource: task.material_source,
-          referenceImagePath: sceneReferencePaths({
-            task,
-            scene,
-            generatedCharacterPaths: generatedReferencePaths({ ...script, runtime }, scene)
-          }),
-          resumeTaskId: scene.image_remote_task_id || "",
-          requestId,
-          onRemoteTask: remote => {
-            scene.image_remote_task_id = remote.taskId || "";
-            scene.image_remote_provider = remote.provider || "";
-            scene.image_status = "remote_running";
-            persist({ current_stage: "images", current_step: 4, detail: `画面 ${scene.index} 已提交远程任务` });
-          },
-          onProgress: progress => {
-            const elapsedSeconds = Math.max(0, Math.round(Number(progress.elapsed_ms || 0) / 1000));
-            const statusHint = progress.http_status ? `，接口返回 ${progress.http_status}` : "";
-            emit(4, `第 ${scene.index} 镜正在等待图片结果：第 ${Number(progress.attempt || 0)} 次查询，已等待 ${elapsedSeconds} 秒${statusHint}`);
-          }
-        }), {
+        const imageResult = await retryOperation(async () => {
+          const resumeTaskId = verifiedRemoteTaskId();
+          // A retry after the user pressed cancel must never submit a fresh task.
+          // It may only resume polling an already-recorded remote task.
+          if (cancelRequested() && !resumeTaskId) throw new TaskCancelledError("已停止提交后续图片");
+          return generateSceneImage({
+            app,
+            config,
+            prompt: scenePrompt,
+            styleConfig: task.style_config,
+            destination: imagePath,
+            ratio: task.ratio,
+            index: scene.index,
+            materialSource: task.material_source,
+            referenceImagePath: sceneReferencePaths({
+              task,
+              scene,
+              generatedCharacterPaths: generatedReferencePaths({ ...script, runtime }, scene)
+            }),
+            resumeTaskId,
+            requestId,
+            shouldStopSubmitting: cancelRequested,
+            onRemoteTask: remote => {
+              scene.image_remote_task_id = remote.taskId || "";
+              scene.image_remote_provider = remote.provider || "";
+              // Mark the style at submit time. If polling encounters a temporary
+              // error, a retry can safely resume this exact task instead of
+              // creating a second billable image task.
+              scene.image_style_id = task.style_config?.id || task.style;
+              scene.image_style_registry_version = task.style_config?.registry_version || "";
+              scene.image_status = "remote_running";
+              persist({
+                current_stage: cancelRequested() ? "images_draining" : "images",
+                current_step: 4,
+                detail: `画面 ${scene.index} 已提交远程任务`
+              });
+            },
+            onProgress: progress => {
+              const elapsedSeconds = Math.max(0, Math.round(Number(progress.elapsed_ms || 0) / 1000));
+              const statusHint = progress.http_status ? `，接口返回 ${progress.http_status}` : "";
+              const cancelHint = cancelRequested() ? "；任务已取消，但会继续下载这张已提交图片" : "";
+              emit(4, `第 ${scene.index} 镜正在等待图片结果：第 ${Number(progress.attempt || 0)} 次查询，已等待 ${elapsedSeconds} 秒${statusHint}${cancelHint}`);
+            }
+          });
+        }, {
           attempts: 3,
+          shouldRetry: error => isTransientError(error) && (!cancelRequested() || Boolean(verifiedRemoteTaskId())),
           onRetry: (error, attempt, delay) => {
             scene.image_error = String(error?.message || error);
             persist({ detail: `画面 ${scene.index} 第 ${attempt} 次失败，${delay}ms 后重试` });
-            emit(4, `第 ${scene.index} 镜网络异常，正在重试`);
+            emit(4, verifiedRemoteTaskId()
+              ? `第 ${scene.index} 镜查询异常，继续恢复已提交任务`
+              : `第 ${scene.index} 镜网络异常，正在重试`);
           }
         });
         scene.image_path = imagePath;
         scene.image_provider = imageResult.provider || "";
         scene.source_url = imageResult.sourceUrl || "";
         scene.image_remote_task_id = imageResult.taskId || scene.image_remote_task_id || "";
-        scene.image_prompt_used = imageResult.promptUsed || requestSafety.prompt;
-        if (imageResult.promptUsed && imageResult.promptUsed !== scene.image_prompt) scene.image_prompt = imageResult.promptUsed;
+        scene.image_prompt_used = imageResult.promptUsed || "";
+        scene.image_safe_prompt_used = imageResult.safeScenePrompt || scenePrompt;
+        scene.image_negative_prompt_used = imageResult.negativePromptUsed || "";
+        scene.image_style_id = imageResult.styleId || task.style_config?.id || task.style;
+        scene.image_style_registry_version = imageResult.registryVersion || task.style_config?.registry_version || "";
+        scene.image_fallback_level = imageResult.fallbackLevel || "preflight";
         scene.image_policy_adjusted = Boolean(imageResult.policyAdjusted);
         scene.image_status = "completed";
         scene.image_error = "";
         if (scene.image_policy_adjusted) emit(4, `第 ${scene.index} 镜触发审核，已自动改写为克制画面并生成成功`);
-        persist({ detail: scene.image_policy_adjusted ? `画面 ${scene.index} 审核改写后完成` : `画面 ${scene.index} 完成` });
+        persist({
+          current_stage: cancelRequested() ? "images_draining" : "images",
+          current_step: 4,
+          detail: cancelRequested() ? `画面 ${scene.index} 已下载，继续等待其他已提交图片` : (scene.image_policy_adjusted ? `画面 ${scene.index} 审核改写后完成` : `画面 ${scene.index} 完成`)
+        });
       } catch (error) {
         if (!usableAsset(imagePath, 512)) removePartial(imagePath);
+        if (cancelRequested() || isCancellationError(error)) {
+          if (scene.image_remote_task_id) {
+            scene.image_status = "failed";
+            scene.image_error = String(error?.message || error);
+          } else {
+            // This scene never reached the remote service, so keep it pending.
+            scene.image_status = "pending";
+            scene.image_error = "";
+          }
+          persist({
+            current_stage: "images_draining",
+            current_step: 4,
+            detail: scene.image_remote_task_id
+              ? `已提交画面 ${scene.index} 未能下载：${String(error?.message || error).slice(0, 120)}`
+              : `已取消，画面 ${scene.index} 未提交`
+          });
+          return;
+        }
         scene.image_status = "failed";
         scene.image_error = String(error?.message || error);
-        persist({ detail: `画面 ${scene.index} 失败：${scene.image_error.slice(0, 160)}` });
-        const sceneError = new Error(`第 ${scene.index} 镜图片生成失败：${scene.image_error}`);
-        sceneError.cause = error;
-        sceneError.code = error?.code || "IMAGE_GENERATION_FAILED";
-        throw sceneError;
+        imageFailures.push({ index: scene.index, message: scene.image_error });
+        persist({
+          current_stage: "images",
+          current_step: 4,
+          detail: `画面 ${scene.index} 失败，继续处理其他画面：${scene.image_error.slice(0, 160)}`
+        });
+        emit(4, `第 ${scene.index} 镜生成失败，已记录错误并继续生成后续画面`);
+        continue;
       }
     }
   };
-  await Promise.all(Array.from({ length: Math.min(imageConcurrency, pendingImages.length) }, () => imageWorker()));
+  const imageWorkerResults = await Promise.allSettled(
+    Array.from({ length: Math.min(imageConcurrency, pendingImages.length) }, () => imageWorker())
+  );
+  if (cancelRequested()) {
+    persist({
+      current_stage: "cancelled_after_images",
+      current_step: 4,
+      detail: "任务已取消；已停止提交新图片，所有已提交图片已完成查询与本地保存"
+    });
+    throw new TaskCancelledError("任务已取消；已提交图片已完成下载，后续流程未执行");
+  }
+  const failedWorker = imageWorkerResults.find(result => result.status === "rejected");
+  if (failedWorker?.status === "rejected") {
+    // A worker should only reject for cancellation or an unexpected programming
+    // error. Individual provider failures are recorded per scene and must not
+    // stop the remaining queue.
+    throw failedWorker.reason;
+  }
+  assertTaskActive(task);
   if (singlePodcastImage && workingScenes[0]?.image_path) {
     workingScenes.forEach(scene => {
       scene.image_path = workingScenes[0].image_path;
@@ -448,6 +551,29 @@ async function completePipeline({ app, task, config, outputDir, script, emit, ch
       scene.source_url = workingScenes[0].source_url;
       scene.image_status = "completed";
     });
+  }
+  assertTaskActive(task);
+  const incompleteImageScenes = workingScenes.filter(scene => !usableAsset(scene.image_path, 512));
+  if (incompleteImageScenes.length) {
+    const completedCount = workingScenes.length - incompleteImageScenes.length;
+    const failedIndexes = incompleteImageScenes.map(scene => Number(scene.index));
+    const summary = `图片已完成 ${completedCount}/${workingScenes.length}，仍有 ${incompleteImageScenes.length} 张需要补齐`;
+    emit(4, `${summary}：镜头 ${failedIndexes.join("、")}`);
+    return {
+      paused: true,
+      partialImages: true,
+      pauseStep: 4,
+      missingImageCount: incompleteImageScenes.length,
+      failedSceneIndexes: failedIndexes,
+      imageFailures,
+      outputDir,
+      script: persist({
+        current_stage: "review_images_partial",
+        current_step: 4,
+        detail: summary
+      }),
+      finalVideo: "", subtitlePath: "", draftDir: "", coverPath: ""
+    };
   }
   persist({ current_stage: "images_completed", current_step: 4, detail: "图片全部完成" });
 
@@ -463,8 +589,18 @@ async function completePipeline({ app, task, config, outputDir, script, emit, ch
   const generatedScenes = [];
   persist({ current_stage: "audio", current_step: 5, detail: "检查配音断点" });
   for (const scene of workingScenes) {
-    if (task.shouldCancel?.()) throw new Error("任务已取消");
+    assertTaskActive(task);
+    const legacySegmentDir = path.join(audioDir, `scene-${scene.index}-segments`);
     let audioReady = await usableMedia(app, config, scene.audio_path);
+    // 上一版曾按字幕分段逐条合成语音；发现遗留分段目录时自动作废旧音频，避免继续复用断裂配音。
+    if (audioReady && fs.existsSync(legacySegmentDir)) {
+      removePartial(scene.audio_path);
+      try { fs.rmSync(legacySegmentDir, { recursive: true, force: true }); } catch {}
+      scene.audio_path = "";
+      scene.audio_status = "pending";
+      scene.audio_error = "检测到旧版分段配音，已改为整段重新合成";
+      audioReady = false;
+    }
     if (!audioReady && scene.audio_path) {
       removePartial(scene.audio_path);
       scene.audio_path = "";
@@ -504,9 +640,12 @@ async function completePipeline({ app, task, config, outputDir, script, emit, ch
       emit(5, `复用已生成配音 ${scene.index}/${workingScenes.length}`);
       scene.audio_status = "completed";
       if (!scene.duration) scene.duration = await mediaDuration(app, config, scene.audio_path);
+      // 字幕只依据现有音频总时长重新排布，不修改、不裁切现有语音。
+      syncSceneCaptionTimings(scene, scene.duration, task);
     }
     generatedScenes.push(scene);
   }
+  assertTaskActive(task);
   persist({ current_stage: "audio_completed", current_step: 5, detail: "配音全部完成" });
 
   if (shouldPauseAfter(task, 5)) {
@@ -534,7 +673,7 @@ async function completePipeline({ app, task, config, outputDir, script, emit, ch
       const videosDir = path.join(outputDir, "videos");
       fs.mkdirSync(videosDir, { recursive: true });
       for (const scene of selectedScenes) {
-        if (task.shouldCancel?.()) throw new Error("任务已取消");
+        assertTaskActive(task);
         if (await usableMedia(app, config, scene.video_path)) {
           scene.video_status = "completed";
           emit(6, `复用动态画面 ${scene.index}/${workingScenes.length}`);
@@ -591,6 +730,7 @@ async function completePipeline({ app, task, config, outputDir, script, emit, ch
     }
   }
 
+  assertTaskActive(task);
   emit(6, "正在合成字幕与 MP4");
   persist({ current_stage: "render", current_step: 6, render_status: "running", detail: "合成最终视频" });
   const configuredBgm = task.bgm_id === "none" ? "" : task.bgm_path || (config.media?.use_default_bgm
@@ -647,6 +787,7 @@ async function completePipeline({ app, task, config, outputDir, script, emit, ch
   }
   persist({ cover_status: runtime.cover_status, cover_path: coverPath, detail: "封面处理完成" });
 
+  assertTaskActive(task);
   emit(7, "正在生成剪映草稿");
   let draftDir = runtime.draft_dir || "";
   if (draftDir && fs.existsSync(draftDir)) {
@@ -671,6 +812,7 @@ async function completePipeline({ app, task, config, outputDir, script, emit, ch
     }
   }
 
+  assertTaskActive(task);
   emit(8, "全部生成完成");
   const finalScript = persist({
     current_stage: "completed",
@@ -695,6 +837,7 @@ async function completePipeline({ app, task, config, outputDir, script, emit, ch
 }
 
 async function runPipeline({ app, task, config, baseOutputDir, emit, checkpoint = () => {} }) {
+  assertTaskActive(task);
   const outputDir = taskOutputDir(task, config, baseOutputDir);
   const existing = readJsonSafe(path.join(outputDir, "pipeline.json"), null);
   if (existing?.scenes?.length) {
@@ -707,6 +850,7 @@ async function runPipeline({ app, task, config, baseOutputDir, emit, checkpoint 
 }
 
 async function regenerateScene({ app, task, config, outputDir, script, sceneIndex, kind, emit = () => {} }) {
+  assertTaskActive(task);
   const scene = script.scenes.find(item => Number(item.index) === Number(sceneIndex));
   if (!scene) throw new Error("分镜不存在");
   if (kind === "image") {
@@ -726,17 +870,12 @@ async function regenerateScene({ app, task, config, outputDir, script, sceneInde
     scene.image_error = "";
     atomicWriteJson(path.join(outputDir, "pipeline.json"), script);
     emit(4, `第 ${scene.index} 镜将放弃旧远程任务，并按当前配置重新提交图片生成请求`);
-    const rawRequestPrompt = [task.style_config?.prefix, scene.image_prompt, task.style_config?.suffix].filter(Boolean).join("，");
-    const requestSafety = buildPolicySafeImagePrompt(rawRequestPrompt, "preflight");
-    if (requestSafety.adjusted) {
-      scene.image_prompt_original = scene.image_prompt_original || scene.image_prompt;
-      scene.image_prompt = requestSafety.prompt;
-      scene.image_prompt_safety_adjusted = true;
-      scene.image_prompt_safety_reasons = [...new Set([...(scene.image_prompt_safety_reasons || []), ...(requestSafety.reasons || [])])];
-    }
+    const scenePrompt = String(scene.image_prompt || scene.desc_prompt || scene.visual || scene.narration || "").trim();
+    if (!scenePrompt) throw new Error(`第 ${scene.index} 镜缺少生图提示词`);
     const imageResult = await generateSceneImage({
       app, config,
-      prompt: requestSafety.prompt,
+      prompt: scenePrompt,
+      styleConfig: task.style_config,
       destination: imagePath, ratio: task.ratio, index: scene.index,
       materialSource: task.material_source,
       referenceImagePath: sceneReferencePaths({
@@ -753,6 +892,7 @@ async function regenerateScene({ app, task, config, outputDir, script, sceneInde
         atomicWriteJson(path.join(outputDir, "pipeline.json"), script);
       },
       onProgress: progress => {
+        assertTaskActive(task);
         const elapsedSeconds = Math.max(0, Math.round(Number(progress.elapsed_ms || 0) / 1000));
         const statusHint = progress.http_status ? `，接口返回 ${progress.http_status}` : "";
         const stateText = progress.state === "completed" ? "图片已生成" : progress.state === "timeout" ? "等待超时" : "正在等待图片结果";
@@ -762,9 +902,13 @@ async function regenerateScene({ app, task, config, outputDir, script, sceneInde
     scene.image_path = imagePath;
     scene.image_provider = imageResult.provider || "";
     scene.image_remote_task_id = imageResult.taskId || scene.image_remote_task_id || "";
-    scene.image_prompt_used = imageResult.promptUsed || requestSafety.prompt;
+    scene.image_prompt_used = imageResult.promptUsed || "";
+    scene.image_safe_prompt_used = imageResult.safeScenePrompt || scenePrompt;
+    scene.image_negative_prompt_used = imageResult.negativePromptUsed || "";
+    scene.image_style_id = imageResult.styleId || task.style_config?.id || task.style;
+    scene.image_style_registry_version = imageResult.registryVersion || task.style_config?.registry_version || "";
+    scene.image_fallback_level = imageResult.fallbackLevel || "preflight";
     scene.image_policy_adjusted = Boolean(imageResult.policyAdjusted);
-    if (scene.image_prompt_used) scene.image_prompt = scene.image_prompt_used;
     scene.source_url = imageResult.sourceUrl || "";
     scene.image_status = "completed";
     scene.video_path = "";
@@ -802,6 +946,7 @@ async function regenerateScene({ app, task, config, outputDir, script, sceneInde
 }
 
 async function renderPrepared({ app, task, config, outputDir, script, emit, options = {} }) {
+  assertTaskActive(task);
   for (const scene of script.scenes) {
     if (!usableAsset(scene.image_path, 512) || !(await usableMedia(app, config, scene.audio_path))) {
       throw new Error(`第 ${scene.index} 镜素材不完整，请先生成图片和配音`);
@@ -851,12 +996,14 @@ async function renderPrepared({ app, task, config, outputDir, script, emit, opti
     title: script.title || task.title,
     subtitle: subtitleText(script),
     onProgress: progress => {
+      assertTaskActive(task);
       if (progress.phase === "clip") emit(6, `正在重新合成镜头 ${progress.current}/${progress.total}`);
       else if (progress.phase === "concat") emit(6, "镜头合并完成，正在准备文字图层");
       else if (progress.phase === "overlay") emit(6, "正在烧录字幕、标题与安全提示");
     }
   });
 
+  assertTaskActive(task);
   emit(7, "正在按新运镜重新生成剪映草稿");
   let draftDir = "";
   try {
@@ -867,6 +1014,7 @@ async function renderPrepared({ app, task, config, outputDir, script, emit, opti
     atomicWriteFile(path.join(outputDir, "draft-error.txt"), String(error?.stack || error), "utf8");
   }
 
+  assertTaskActive(task);
   emit(8, "重新合成完成，可直接播放 final-rerender.mp4");
   let coverPath = script.runtime?.cover_path || task.cover_path || "";
   if (!coverPath && task.cover_image_mode !== "off") {
@@ -898,5 +1046,6 @@ module.exports = {
   completePipeline,
   regenerateScene,
   renderPrepared,
-  taskOutputDir
+  taskOutputDir,
+  _pipelineTest: { sceneVoiceText, captionMaxChars, syncSceneCaptionTimings }
 };

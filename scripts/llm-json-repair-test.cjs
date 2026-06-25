@@ -9,6 +9,18 @@ const { cleanJsonText, testModelConnection } = require("../electron/llm-planner.
   assert.equal(locallyRepaired.title, "测试");
   assert.equal(locallyRepaired.narration, '他说："努力吧！"然后继续前进。\n第二行');
 
+  assert.throws(() => cleanJsonText(`{
+    "scenes": [
+      {
+        "index": 17,
+        "narration": "1945年她带着三个女儿去了美国，为了养家，她进入正在筹建的联合国工作。",
+        "caption_segments": ["1945年她带着三个女儿", "去了美国", "为了养家", "她进入正在筹建的联合国工作"]
+        "visual": "她带着三个女儿抵达美国，随后走进联合国筹建办公室"
+      }
+    ]
+  }`), /JSON 格式错误/);
+
+
   const calls = [];
   const server = http.createServer((req, res) => {
     let raw = "";

@@ -1,5 +1,5 @@
 const defaultConfig: AppConfig = {
-  config_version: 4,
+  config_version: 6,
   llm: {
     provider: "local",
     protocol: "local",
@@ -19,7 +19,7 @@ const defaultConfig: AppConfig = {
     proxy_url: "", custom_models: []
   },
   custom_image: {
-    display_name: "OpenAI 兼容图片接口",
+    display_name: "foxcode",
     base_url: "https://dm-fox.rjj.cc/codex/v1",
     api_key: "",
     model: "gpt-image-2",
@@ -41,6 +41,20 @@ const defaultConfig: AppConfig = {
     ratio: "9:16",
     resolution: "1k",
     concurrency: 3,
+    proxy_url: ""
+  },
+  apimart: {
+    display_name: "Apimart",
+    base_url: "https://api.apimart.ai/v1",
+    api_key: "",
+    model: "gpt-image-2",
+    ratio: "9:16",
+    resolution: "1k",
+    concurrency: 3,
+    official_fallback: false,
+    policy_fallback: true,
+    poll_interval_ms: 3000,
+    poll_timeout_seconds: 600,
     proxy_url: ""
   },
   runninghub: {
@@ -149,6 +163,7 @@ export function installBrowserMock() {
         style: input.style,
         ratio: input.ratio,
         target_scenes: input.targetScenes,
+        tts_provider: input.ttsProvider || "system",
         tts_speed: input.ttsSpeed,
         prompt_template_id: input.promptTemplateId,
         rewrite_intensity: input.rewriteIntensity,
@@ -162,7 +177,7 @@ export function installBrowserMock() {
         character_consistency_mode: input.characterConsistencyMode,
         cover_image_mode: input.coverImageMode,
         cover_template_id: input.coverTemplateId,
-        pause_mode: input.pauseMode,
+        pause_mode: input.pauseMode || "script",
         source_mode: input.sourceMode,
         source_query: input.sourceQuery,
         source_requirements: input.sourceRequirements,
@@ -227,6 +242,23 @@ export function installBrowserMock() {
         return {
           ...task, status: "completed", current_step: 8,
           video_path: "C:\\demo\\final.mp4", draft_dir: "C:\\demo\\draft",
+          pipeline_data: JSON.stringify(pipeline)
+        };
+      });
+      return tasks.find(task => task.id === id)!;
+    },
+    repairMissingImages: async id => {
+      tasks = tasks.map(task => {
+        if (task.id !== id) return task;
+        const pipeline = JSON.parse(task.pipeline_data || "{}") as PipelineData;
+        pipeline.scenes = pipeline.scenes.map(scene => ({
+          ...scene,
+          image_path: scene.image_path || `C:\\demo\\images\\${scene.index}.png`,
+          image_status: "completed",
+          image_error: ""
+        }));
+        return {
+          ...task, status: "review", current_step: 4, current_stage: "review_images",
           pipeline_data: JSON.stringify(pipeline)
         };
       });

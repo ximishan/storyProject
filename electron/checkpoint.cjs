@@ -1,6 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
+const { throwIfCancelled, cancellableSleep, isCancellationError } = require("./cancellation.cjs");
 
 function ensureDir(target) {
   if (target) fs.mkdirSync(target, { recursive: true });
@@ -67,14 +68,16 @@ async function retryOperation(operation, {
 } = {}) {
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    throwIfCancelled();
     try {
       return await operation(attempt);
     } catch (error) {
       lastError = error;
+      if (isCancellationError(error)) throw error;
       if (attempt >= attempts || !shouldRetry(error)) throw error;
       const delay = Math.min(maxDelayMs, Math.round(initialDelayMs * Math.pow(2, attempt - 1)));
       onRetry(error, attempt, delay);
-      await new Promise(resolve => setTimeout(resolve, delay));
+      await cancellableSleep(delay);
     }
   }
   throw lastError;

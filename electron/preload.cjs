@@ -11,6 +11,7 @@ contextBridge.exposeInMainWorld("storybound", {
   runTask: (id) => ipcRenderer.invoke("tasks:run", id),
   prepareTask: (id) => ipcRenderer.invoke("tasks:prepare", id),
   continueTask: (id) => ipcRenderer.invoke("tasks:continue", id),
+  repairMissingImages: (id) => ipcRenderer.invoke("tasks:repairMissingImages", id),
   updatePipeline: (id, pipeline) => ipcRenderer.invoke("tasks:updatePipeline", id, pipeline),
   regenerateScene: (id, sceneIndex, kind) => ipcRenderer.invoke("tasks:regenerateScene", id, sceneIndex, kind),
   replaceSceneImage: (id, sceneIndex) => ipcRenderer.invoke("tasks:replaceSceneImage", id, sceneIndex),

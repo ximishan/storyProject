@@ -1,10 +1,13 @@
 const fs = require("node:fs");
 const path = require("node:path");
 let ProxyAgent = null;
-try { ({ ProxyAgent } = require("undici")); } catch {}
+let undiciFetch = null;
+try { ({ ProxyAgent, fetch: undiciFetch } = require("undici")); } catch {}
+const llmProxyAgentCache = new Map();
 const { atomicWriteJson, atomicWriteFile, readJsonSafe, fingerprint } = require("./checkpoint.cjs");
-const { buildPolicySafeImagePrompt } = require("./image-prompt-safety.cjs");
+const { resolveVisualStyle } = require("./visual-styles.cjs");
 const { taskReferenceAvailable } = require("./reference-routing.cjs");
+const { currentCancellationSignal, cancellationError, throwIfCancelled } = require("./cancellation.cjs");
 
 const systemPromptTemplates = Object.fromEntries(
   require("../shared/system-prompt-templates.json").map(item => [item.id, item])
@@ -63,7 +66,6 @@ const SCENE_BASE_PROMPT = `你是专业短视频分镜师和图片提示词工�
     {
       "index": 1,
       "narration": "本镜对应的原始旁白，不能漏字或重复",
-      "caption_segments": ["6到12字的完整语义字幕", "不得拆开词语"],
       "visual": "给人看的简洁画面说明",
       "desc_prompt": "只描述本镜主体、动作、环境、镜头、光线和关键细节的中文提示词",
       "use_reference": true,
@@ -75,17 +77,50 @@ const SCENE_BASE_PROMPT = `你是专业短视频分镜师和图片提示词工�
     }
   ]
 }
-每镜只表达一个明确视觉重点。旁白必须完整覆盖，不得改写、漏句或重复。use_reference 必须根据本镜是否真正出现需要保持一致的主角/产品来判断，空镜、环境、器物、资料画面通常为 false。\n图片合规硬规则：当旁白涉及手术、受伤、流血、尸体、暴力或死亡时，不得在 desc_prompt 中直接描写令人不适的细节。必须改用包扎后的手指、医生神情、医疗站环境、布帘遮挡、器械整理、远景或象征性画面。不得输出“鲜血、血液、染血、伤口特写、割口清晰可见、缝合伤口、器官外露、尸体特写、极近景微距”等表达。赛道专用要求不得覆盖本条规则。`;
+每镜只表达一个明确视觉重点。旁白必须完整覆盖，不得改写、漏句或重复。不要输出 caption_segments，字幕会在完整 TTS 生成后由程序按真实音频时长和自然语义自动切分。use_reference 必须根据本镜是否真正出现需要保持一致的主角/产品来判断，空镜、环境、器物、资料画面通常为 false。\n图片合规硬规则：当旁白涉及手术、受伤、流血、尸体、暴力或死亡时，不得在 desc_prompt 中直接描写令人不适的细节。必须改用包扎后的手指、医生神情、医疗站环境、布帘遮挡、器械整理、远景或象征性画面。不得输出“鲜血、血液、染血、伤口特写、割口清晰可见、缝合伤口、器官外露、尸体特写、极近景微距”等表达。赛道专用要求不得覆盖本条规则。`;
 
 const JSON_REPAIR_PROMPT = `你是严格的 JSON 修复器。用户会提供一段本应为 JSON、但可能包含未转义引号、非法换行、尾逗号或多余说明的文本。
 只返回修复后的合法 JSON，不要输出 Markdown，不要解释，不要改写字段含义，不要删除原有有效内容。JSON 字符串中的英文双引号必须正确转义。`;
 
-function llmFetch(url, options, proxyUrl) {
-  if (proxyUrl && !ProxyAgent) throw new Error("已配置 LLM 代理，但 undici 依赖不可用，请重新安装项目依赖");
-  return fetch(url, {
-    ...options,
-    ...(proxyUrl ? { dispatcher: new ProxyAgent(proxyUrl) } : {})
-  });
+function llmProxyDispatcher(value = "") {
+  let proxyUrl = String(value || "").trim();
+  if (!proxyUrl) return null;
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(proxyUrl)) proxyUrl = `http://${proxyUrl}`;
+  let parsed;
+  try { parsed = new URL(proxyUrl); }
+  catch { throw new Error(`LLM 代理地址格式错误：${proxyUrl}`); }
+  if (!["http:", "https:"].includes(parsed.protocol) || !parsed.hostname || !parsed.port) {
+    throw new Error("LLM 代理地址必须是包含端口的 HTTP/HTTPS 地址，例如 http://127.0.0.1:7897");
+  }
+  const normalized = parsed.toString().replace(/\/$/, "");
+  if (!ProxyAgent || !undiciFetch) throw new Error("已配置 LLM 代理，但 undici 的 fetch/ProxyAgent 不可用，请重新安装项目依赖");
+  let dispatcher = llmProxyAgentCache.get(normalized);
+  if (!dispatcher) {
+    dispatcher = new ProxyAgent(normalized);
+    llmProxyAgentCache.set(normalized, dispatcher);
+  }
+  return { normalized, dispatcher };
+}
+
+async function llmFetch(url, options, proxyUrl) {
+  const signal = options?.signal || currentCancellationSignal();
+  throwIfCancelled(signal);
+  const proxy = llmProxyDispatcher(proxyUrl);
+  try {
+    const requestOptions = { ...options, ...(signal ? { signal } : {}) };
+    if (proxy) return await undiciFetch(url, { ...requestOptions, dispatcher: proxy.dispatcher });
+    return await globalThis.fetch(url, requestOptions);
+  } catch (error) {
+    if (signal?.aborted || error?.name === "AbortError") throw cancellationError(signal);
+    if (proxy) {
+      const detail = String(error?.cause?.message || error?.message || error);
+      const wrapped = new Error(`通过 LLM 代理 ${proxy.normalized} 请求失败：${detail}`);
+      wrapped.code = error?.cause?.code || error?.code || "PROXY_REQUEST_FAILED";
+      wrapped.cause = error;
+      throw wrapped;
+    }
+    throw error;
+  }
 }
 
 function normalizeProcessingMode(value) {
@@ -93,18 +128,7 @@ function normalizeProcessingMode(value) {
 }
 
 function splitSourceText(sourceText, targetScenes = 0) {
-  const pieces = String(sourceText || "")
-    .split(/(?<=[。！？!?；;])|\n+/)
-    .map(item => item.trim())
-    .filter(Boolean);
-  if (!pieces.length) return [];
-  const target = Math.max(1, Number(targetScenes || pieces.length));
-  const chunkSize = Math.max(1, Math.ceil(pieces.length / target));
-  const chunks = [];
-  for (let index = 0; index < pieces.length; index += chunkSize) {
-    chunks.push(pieces.slice(index, index + chunkSize).join(""));
-  }
-  return chunks;
+  return splitNarrationForScenePlan(sourceText, targetScenes || inferAutoSceneCount(sourceText));
 }
 
 function podcastSpeakerRoleLine(line) {
@@ -142,18 +166,18 @@ function buildMechanicalScript(task, sourceText = task.input_text, template = {}
   const scenes = chunks.map((item, index) => {
     const subjectPresence = localSubjectPresence(item.text, referenceKind);
     const useReference = subjectPresence !== "none" && taskReferenceAvailable(task, subjectPresence);
-    const rawImagePrompt = `${task.style}风格，${item.text}，主体明确，构图完整，适合${task.ratio}短视频画面，无文字无水印`;
-    const promptSafety = buildPolicySafeImagePrompt(rawImagePrompt, "preflight");
+    task.style_config || resolveVisualStyle(task.style);
+    const rawImagePrompt = `${item.text}，主体明确，构图完整，适合${task.ratio}短视频画面，无文字无水印`;
     return {
       index: index + 1,
       narration: item.text,
       visual: item.text,
-      desc_prompt: promptSafety.prompt,
-      desc_prompt_original: promptSafety.adjusted ? item.text : "",
-      image_prompt: promptSafety.prompt,
-      image_prompt_original: promptSafety.adjusted ? rawImagePrompt : "",
-      image_prompt_safety_adjusted: promptSafety.adjusted,
-      image_prompt_safety_reasons: promptSafety.reasons,
+      desc_prompt: rawImagePrompt,
+      desc_prompt_original: "",
+      image_prompt: rawImagePrompt,
+      image_prompt_original: "",
+      image_prompt_safety_adjusted: false,
+      image_prompt_safety_reasons: [],
       use_reference: useReference,
       reference_reason: useReference ? "直接出片模式使用本地关键词规则判断" : "本镜未识别到需要保持一致的主体",
       subject_presence: useReference ? subjectPresence : "none",
@@ -372,6 +396,7 @@ function repairStringQuotesAndControls(text) {
   return output;
 }
 
+
 function repairJsonCandidate(candidate) {
   let repaired = String(candidate || "")
     .replace(/([{,]\s*)'([^'\\]*(?:\\.[^'\\]*)*)'\s*:/g, (_match, prefix, key) => `${prefix}${JSON.stringify(key)}:`)
@@ -476,6 +501,7 @@ function modelProtocolHint(llm, endpoint, message) {
 }
 
 async function callModelJson(config, { stage, system, user, temperature = 0.3, debugDir, maxTokens = 8192, allowJsonRepair = true }) {
+  throwIfCancelled();
   const llm = config.llm || {};
   if (!llm.api_key) throw new Error("尚未配置语言模型 API Key，请先前往设置");
   if (!llm.model) throw new Error("尚未配置语言模型名称，请先前往设置");
@@ -604,6 +630,7 @@ async function callModelJson(config, { stage, system, user, temperature = 0.3, d
     rawText = payload.choices?.[0]?.message?.content || payload.output_text || "";
   }
 
+  throwIfCancelled();
   writeDebug(debugDir, `${stage}-response.txt`, rawText);
   if (!String(rawText || "").trim()) throw new Error(`${stage}接口成功返回，但没有找到模型文本内容`);
 
@@ -618,7 +645,7 @@ async function callModelJson(config, { stage, system, user, temperature = 0.3, d
       snippet: error.snippet || ""
     });
     if (!allowJsonRepair) {
-      throw new Error(`${stage}返回内容仍不是合法 JSON：${error.message}`);
+      throw new Error(`${stage}返回内容仍不是合法 JSON：${error.message}。原始响应已保存到 llm-debug/${stage}-response.txt，可直接重试当前阶段，无需重新生成前两步。`);
     }
 
     parsed = await callModelJson(config, {
@@ -764,14 +791,13 @@ function normalizeScene(scene, index, task, metadata, template, modules) {
         : false;
   const useReference = hasReference && referenceKind !== "none" && kindMatches && asBoolean(scene.use_reference);
   const rawDescPrompt = String(scene.desc_prompt || scene.image_prompt || scene.visual || "");
-  const descSafety = buildPolicySafeImagePrompt(rawDescPrompt, "preflight");
   const normalized = {
     index: index + 1,
     narration: String(scene.narration || ""),
     caption_segments: normalizeCaptionSegments(scene.narration, scene.caption_segments),
     visual: String(scene.visual || scene.desc_prompt || ""),
-    desc_prompt: descSafety.prompt,
-    desc_prompt_original: descSafety.adjusted ? rawDescPrompt : "",
+    desc_prompt: rawDescPrompt,
+    desc_prompt_original: "",
     image_prompt: "",
     use_reference: useReference,
     reference_reason: hasReference
@@ -785,11 +811,10 @@ function normalizeScene(scene, index, task, metadata, template, modules) {
     speaker_id: String(scene.speaker_id || "")
   };
   const templatedPrompt = applyImagePromptTemplate({ scene: normalized, metadata, template, ratio: task.ratio, modules });
-  const promptSafety = buildPolicySafeImagePrompt(templatedPrompt, "preflight");
-  normalized.image_prompt = promptSafety.prompt;
-  normalized.image_prompt_original = promptSafety.adjusted ? templatedPrompt : "";
-  normalized.image_prompt_safety_adjusted = Boolean(descSafety.adjusted || promptSafety.adjusted);
-  normalized.image_prompt_safety_reasons = [...new Set([...(descSafety.reasons || []), ...(promptSafety.reasons || [])])];
+  normalized.image_prompt = templatedPrompt;
+  normalized.image_prompt_original = "";
+  normalized.image_prompt_safety_adjusted = false;
+  normalized.image_prompt_safety_reasons = [];
   return normalized;
 }
 
@@ -802,9 +827,856 @@ function buildMetadataUserPrompt(task, template, content, characterMode, referen
 }
 
 function buildSceneUserPrompt(task, template, content, metadata, modules, seedPools, referenceKind) {
-  const captionRule = "字幕语义分段硬规则：每个场景必须输出 caption_segments。优先按 narration 原有标点切分；每段建议 6-12 个汉字，必须是完整词语、完整短语或完整语义，禁止按固定字数切断姓名、动词或名词。显示时删除普通标点，但姓名间隔点“·”必须保留。所有分段拼接并去掉普通标点后，必须与 narration 正文完全一致。";
-  const referenceRule = `${captionRule}\n${template.reference_decision_prompt || "只有镜头中清晰出现主角/产品且保持身份外观一致有价值时，use_reference 才能为 true；环境、空镜、器物特写和资料画面设为 false。"}`;
-  return `内容类型：${task.track}\n视频形态：${task.task_type === "podcast" ? "双人播客；每个镜头必须输出 speaker_role(A/B)" : "单人旁白"}\n目标分镜数：${task.target_scenes || "根据旁白长度自动决定"}\n画面比例：${task.ratio}\n视觉风格：${task.style}\n参考图类型：${referenceKind}\n是否已有可用参考图：${taskReferenceAvailable(task, referenceKind) ? "是" : "否"}\n参考图判断标准：${referenceRule}\n分镜骨架模块：${JSON.stringify(modules)}\n图片种子池：${JSON.stringify(seedPools)}\n\n图片合规硬规则：\n涉及医疗救治、受伤、暴力或死亡的旁白，只能使用克制的替代画面。优先表现包扎后的状态、人物神情、环境、器械、布帘遮挡、中景或远景，不得描述开放性创口、流体细节、缝合过程、尸体细节或极近景微距。\n\n请严格执行 system 中的赛道分镜规则，最终输出格式只遵守 system 统一 scenes JSON 协议。\n\n元数据：\n${JSON.stringify(metadata, null, 2)}\n\n必须完整覆盖的旁白：\n${content.narration}`;
+  const referenceRule = template.reference_decision_prompt || "只有镜头中清晰出现主角/产品且保持身份外观一致有价值时，use_reference 才能为 true；环境、空镜、器物特写和资料画面设为 false。";
+  const styleConfig = task.style_config || resolveVisualStyle(task.style);
+  return `内容类型：${task.track}
+视频形态：${task.task_type === "podcast" ? "双人播客；每个镜头必须输出 speaker_role(A/B)" : "单人旁白"}
+目标分镜数：${task.target_scenes || `由大模型按自然语义决定，整体节奏约每分钟 ${TARGET_SCENES_PER_MINUTE} 镜（默认语速下通常约 ${AUTO_SCENE_TARGET_MIN_CHARS}～${AUTO_SCENE_TARGET_MAX_CHARS} 字/镜）`}
+画面比例：${task.ratio}
+当前画面风格：${styleConfig.name}（${styleConfig.id}）
+风格前缀：${styleConfig.prefix}
+风格后缀：${styleConfig.suffix}
+允许使用色彩词：${styleConfig.allow_color ? "true" : "false"}
+重要：本次用户选择的“当前画面风格”拥有最高优先级。system 模板中关于“默认油画/默认黑白/默认电影”等说明只属于赛道示例，不得覆盖本次选择。
+重要：desc_prompt 只输出场景内容，不要写任何画风名称、风格前缀、风格后缀或 negative_prompt；程序会在生图请求阶段统一拼接并校验。
+参考图类型：${referenceKind}
+是否已有可用参考图：${taskReferenceAvailable(task, referenceKind) ? "是" : "否"}
+参考图判断标准：${referenceRule}
+分镜骨架模块：${JSON.stringify(modules)}
+图片种子池：${JSON.stringify(seedPools)}
+
+图片合规硬规则：
+涉及医疗救治、受伤、暴力或死亡的旁白，只能使用克制的替代画面。优先表现包扎后的状态、人物神情、环境、器械、布帘遮挡、中景或远景，不得描述开放性创口、流体细节、缝合过程、尸体细节或极近景微距。
+
+请严格执行 system 中的赛道分镜规则，最终输出格式只遵守 system 统一 scenes JSON 协议。
+
+元数据：
+${JSON.stringify(metadata, null, 2)}
+
+必须完整覆盖的旁白：
+${content.narration}`;
+}
+
+
+const SEMI_AUTO_SCENE_GROUP_PROMPT = `你是专业的短视频分镜导演。当前是“半自动锁定原文”模式：原文一个字都不能修改。
+
+程序已经把原文拆成带编号的连续原文单元。你只负责判断哪些相邻编号应合并为同一个分镜。
+
+核心节奏标准：
+- 整体控制在每分钟约 5 个分镜，每个镜头通常承载约 10～14 秒旁白。
+- 默认语速下，每镜通常约 40～55 个中文字符；字数只用于辅助判断，不能机械截断。
+- 同一时间、地点、人物动作和情绪中的短单元应主动合并。
+- 只有明确的时间跳转、地点切换、主体改变、关键动作或强情绪转折时，才提前切镜。
+- 不要生成十几二十字的碎片镜头，也不要把两个明显不同的画面强行合并。
+
+只返回合法 JSON，不要输出 Markdown，也不要返回任何原文文字。JSON 结构：
+{
+  "groups": [
+    {"unit_ids": [1, 2]},
+    {"unit_ids": [3, 4, 5]}
+  ]
+}
+
+硬规则：
+1. 只能返回编号，不得返回 narration、text、visual、desc_prompt 或任何原文文字。
+2. 所有编号必须按原顺序出现，且每个编号必须恰好使用一次，不能遗漏、重复、倒序或跳号。
+3. 每一组只能包含连续编号；不得把不相邻的编号放入同一组。
+4. 未明确指定数量时，根据整体时长和自然语义决定分镜数，整体尽量接近每分钟 5 镜。
+5. 用户明确指定分镜数时，groups 数量必须严格等于指定数量。`;
+
+const SCENE_PLAN_PROMPT = `你是专业的短视频分镜导演。请直接根据完整旁白的叙事推进、时间变化、地点变化、人物动作和情绪转折来划分镜头，不要机械按字数截断。
+
+核心节奏标准：
+- 整体控制在每分钟约 5 个分镜，也就是每个镜头通常承载约 10～14 秒旁白。
+- 默认语速下，每镜通常约 40～55 个中文字符；中文标点计入字符数，空格和换行不计。
+- “每分钟约 5 镜”是整体节奏目标，字数只用于辅助判断，不能机械每到固定字数就截断。
+- 短句如果与前后处于同一时间、地点、人物动作或情绪，应主动合并，不能单独切成只有十几二十字的碎片镜头。
+- 只有发生明确的时间跳转、地点切换、主体改变、关键动作或强情绪转折时，才允许提前切镜。
+- 不要为了满足预估镜头数破坏完整语义；也不要把两个明显不同的画面硬塞进同一镜头。
+
+只返回合法 JSON，不要输出 Markdown。JSON 结构：
+{
+  "scenes": [
+    {"index": 1, "narration": "本镜完整旁白"}
+  ]
+}
+
+硬规则：
+1. narration 必须从原旁白按原顺序连续切分，完整覆盖原文，不得改写、漏字、添字、重复或改变标点。
+2. 优先在句号、问号、感叹号、分号、破折号后的完整语义处，或明确的时间/地点/动作转换处切镜。
+3. 不得从姓名、日期、数字单位、固定短语、主谓宾结构、转折关系或因果关系中间切断。
+4. 未明确指定数量时，由你根据完整旁白预计时长和自然语义决定数量，整体尽量接近每分钟 5 镜。
+5. 除首尾镜头或真正独立的强转场外，非末尾镜头通常不得少于约 32 个中文字符。
+6. 不要返回 visual、desc_prompt、caption_segments 等其他字段。`;
+
+const SCENE_BATCH_SIZE = 5;
+const TARGET_SCENES_PER_MINUTE = 5;
+const BASE_CHINESE_CHARS_PER_MINUTE = 230;
+const AUTO_SCENE_TARGET_MIN_CHARS = 40;
+const AUTO_SCENE_TARGET_MAX_CHARS = 55;
+const AUTO_SCENE_TARGET_CHARS = 46;
+
+function countSceneCharacters(text) {
+  // 中文标点保留并计数，只忽略空格、制表符和换行。
+  return Array.from(String(text || "").replace(/\s+/gu, "")).length;
+}
+
+function normalizeTtsSpeed(value) {
+  const speed = Number(value || 1);
+  return Number.isFinite(speed) ? Math.max(0.75, Math.min(1.5, speed)) : 1;
+}
+
+function estimateNarrationDurationSeconds(text, ttsSpeed = 1) {
+  const characterCount = countSceneCharacters(text);
+  if (!characterCount) return 0;
+  return characterCount / (BASE_CHINESE_CHARS_PER_MINUTE * normalizeTtsSpeed(ttsSpeed)) * 60;
+}
+
+function inferAutoSceneCount(text, ttsSpeed = 1) {
+  const durationSeconds = estimateNarrationDurationSeconds(text, ttsSpeed);
+  if (!durationSeconds) return 1;
+  // 核心标准：每分钟约 5 个镜头。按预计口播时长换算，而不是先机械切字。
+  return Math.max(1, Math.round(durationSeconds / 60 * TARGET_SCENES_PER_MINUTE));
+}
+
+function splitNarrationAtNaturalPoint(text) {
+  const source = String(text || "").trim();
+  if (source.length < 2) return [source];
+  const midpoint = Math.floor(source.length / 2);
+  const candidates = [];
+  for (let index = 1; index < source.length - 1; index += 1) {
+    if (/[，、：:,；;。！？!?\s]/u.test(source[index])) candidates.push(index + 1);
+  }
+  let splitIndex = candidates
+    .filter(index => index >= 4 && source.length - index >= 4)
+    .sort((left, right) => Math.abs(left - midpoint) - Math.abs(right - midpoint))[0];
+  if (!splitIndex) splitIndex = Math.max(1, Math.min(source.length - 1, midpoint));
+  return [source.slice(0, splitIndex).trim(), source.slice(splitIndex).trim()].filter(Boolean);
+}
+
+function groupNarrationParts(parts, targetCount) {
+  const source = parts.map(item => String(item || "").trim()).filter(Boolean);
+  if (!source.length) return [];
+  const target = Math.max(1, Math.min(Number(targetCount || source.length), source.length));
+  if (target >= source.length) return source;
+
+  const groups = [];
+  let cursor = 0;
+  let remainingLength = source.reduce((sum, item) => sum + item.length, 0);
+  for (let groupIndex = 0; groupIndex < target; groupIndex += 1) {
+    const groupsLeft = target - groupIndex;
+    if (groupsLeft === 1) {
+      groups.push(source.slice(cursor).join(""));
+      break;
+    }
+
+    const desiredLength = remainingLength / groupsLeft;
+    const selected = [];
+    let selectedLength = 0;
+    while (cursor < source.length) {
+      const item = source[cursor];
+      const mustLeave = groupsLeft - 1;
+      if (selected.length && source.length - cursor <= mustLeave) break;
+      const nextLength = selectedLength + item.length;
+      if (selected.length && nextLength > desiredLength) break;
+      selected.push(item);
+      selectedLength = nextLength;
+      cursor += 1;
+    }
+    if (!selected.length) {
+      selected.push(source[cursor]);
+      selectedLength = source[cursor].length;
+      cursor += 1;
+    }
+    groups.push(selected.join(""));
+    remainingLength -= selectedLength;
+  }
+  return groups.filter(Boolean);
+}
+
+function splitNarrationForScenePlan(narration, requestedCount = 0, ttsSpeed = 1) {
+  const source = String(narration || "").trim();
+  if (!source) return [];
+  let parts = (source.match(/[^。！？!?；;\n]+[。！？!?；;]?/gu) || [source])
+    .map(item => item.trim())
+    .filter(Boolean);
+  const inferredCount = inferAutoSceneCount(source, ttsSpeed);
+  const targetCount = Math.max(1, Number(requestedCount || inferredCount));
+
+  while (parts.length < targetCount) {
+    let longestIndex = -1;
+    let longestLength = 0;
+    parts.forEach((item, index) => {
+      if (item.length > longestLength && item.length >= 8) {
+        longestIndex = index;
+        longestLength = item.length;
+      }
+    });
+    if (longestIndex < 0) break;
+    const split = splitNarrationAtNaturalPoint(parts[longestIndex]);
+    if (split.length < 2 || split.some(item => !item)) break;
+    parts.splice(longestIndex, 1, ...split);
+  }
+
+  return parts.length > targetCount
+    ? groupNarrationParts(parts, targetCount)
+    : parts;
+}
+
+function buildSceneNarrationAssignments(task, narration) {
+  if (task.task_type === "podcast") {
+    const lines = String(narration || "")
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean);
+    return lines.map((line, index) => {
+      const parsed = podcastSpeakerRoleLine(line);
+      return {
+        index: index + 1,
+        narration: parsed?.text || line,
+        speaker_role: parsed?.role || (index % 2 ? "B" : "A")
+      };
+    });
+  }
+
+  return splitNarrationForScenePlan(narration, task.target_scenes, task.tts_speed).map((item, index) => ({
+    index: index + 1,
+    narration: item
+  }));
+}
+
+
+function splitNarrationIntoAtomicUnits(value) {
+  const source = String(value || "");
+  if (!source) return [];
+
+  // 先在中文自然停顿符号后切成最小原文片段。每一段都保留原始标点和空白，
+  // 后续只允许按编号合并，因此最终旁白一定能逐字还原。
+  const rawParts = [];
+  let startOffset = 0;
+  let sourceOffset = 0;
+  const characters = Array.from(source);
+  for (let index = 0; index < characters.length; index += 1) {
+    const character = characters[index];
+    sourceOffset += character.length;
+    const isBoundary = /[。！？!?；;，,、：:—…\n]/u.test(character);
+    if (!isBoundary) continue;
+
+    // 连续破折号/省略号视为同一个停顿；句末标点后的引号、括号及紧邻空白归入前一单元。
+    let lookahead = index + 1;
+    while (lookahead < characters.length && character === characters[lookahead] && /[—…]/u.test(character)) {
+      sourceOffset += characters[lookahead].length;
+      index = lookahead;
+      lookahead += 1;
+    }
+    while (lookahead < characters.length && /[”’"'）)\]】}》〉」』]/u.test(characters[lookahead])) {
+      sourceOffset += characters[lookahead].length;
+      index = lookahead;
+      lookahead += 1;
+    }
+    while (lookahead < characters.length && /[ \t\r\n]/u.test(characters[lookahead])) {
+      sourceOffset += characters[lookahead].length;
+      index = lookahead;
+      lookahead += 1;
+    }
+    if (sourceOffset > startOffset) {
+      rawParts.push(source.slice(startOffset, sourceOffset));
+      startOffset = sourceOffset;
+    }
+  }
+  if (startOffset < source.length) rawParts.push(source.slice(startOffset));
+  if (!rawParts.length) rawParts.push(source);
+
+  // 保留这些自然停顿片段作为最小编号单元，不在程序端预先决定镜头边界。
+  // 只有单个片段自身超过 68 字时，才按原始字符位置拆成更小编号单元，
+  // Claude 可以继续把相邻编号重新合并，原文仍然逐字不变。
+  const units = [];
+  for (const part of rawParts) {
+    if (countSceneCharacters(part) <= 68) {
+      units.push(part);
+      continue;
+    }
+    const charactersInPart = Array.from(part);
+    let cursor = 0;
+    while (cursor < charactersInPart.length) {
+      const remaining = charactersInPart.length - cursor;
+      if (remaining <= 68) {
+        units.push(charactersInPart.slice(cursor).join(""));
+        break;
+      }
+      const targetEnd = Math.min(charactersInPart.length, cursor + 46);
+      let splitEnd = targetEnd;
+      for (let probe = targetEnd; probe > cursor + 30; probe -= 1) {
+        if (/[，,、：:；;。！？!?—…\s]/u.test(charactersInPart[probe - 1])) {
+          splitEnd = probe;
+          break;
+        }
+      }
+      units.push(charactersInPart.slice(cursor, splitEnd).join(""));
+      cursor = splitEnd;
+    }
+  }
+
+  const result = units.map((unit, index) => ({
+    id: index + 1,
+    text: unit,
+    characters: countSceneCharacters(unit)
+  }));
+  if (result.map(item => item.text).join("") !== source) {
+    throw new Error("半自动原文单元切分未能逐字还原输入文案");
+  }
+  return result;
+}
+
+function extractSemiAutoSceneGroups(payload) {
+  const rawGroups = Array.isArray(payload?.groups) ? payload.groups : [];
+  if (!rawGroups.length) throw new Error("半自动分镜阶段没有返回 groups 数组");
+  return rawGroups.map((group, index) => {
+    const values = Array.isArray(group)
+      ? group
+      : Array.isArray(group?.unit_ids)
+        ? group.unit_ids
+        : Array.isArray(group?.ids)
+          ? group.ids
+          : Array.isArray(group?.units)
+            ? group.units
+            : [];
+    const ids = values.map(value => Number(value)).filter(Number.isInteger);
+    if (!ids.length) throw new Error(`半自动第 ${index + 1} 个分镜组没有有效编号`);
+    return ids;
+  });
+}
+
+function validateSemiAutoSceneGroups(payload, units, task, narration, requestedCount = 0) {
+  const groups = extractSemiAutoSceneGroups(payload);
+  if (Number(requestedCount) > 0 && groups.length !== Number(requestedCount)) {
+    throw new Error(`半自动分镜数量不正确：期望 ${Number(requestedCount)}，实际 ${groups.length}`);
+  }
+
+  const flattened = groups.flat();
+  const expected = units.map(item => item.id);
+  if (flattened.length !== expected.length || flattened.some((id, index) => id !== expected[index])) {
+    throw new Error("半自动分镜编号必须从 1 开始按顺序完整覆盖，每个编号只能使用一次");
+  }
+  groups.forEach((ids, groupIndex) => {
+    for (let index = 1; index < ids.length; index += 1) {
+      if (ids[index] !== ids[index - 1] + 1) {
+        throw new Error(`半自动第 ${groupIndex + 1} 个分镜包含不连续编号`);
+      }
+    }
+  });
+
+  const unitById = new Map(units.map(item => [item.id, item]));
+  const assignments = groups.map((ids, index) => ({
+    index: index + 1,
+    narration: ids.map(id => unitById.get(id)?.text || "").join(""),
+    source_unit_ids: ids
+  }));
+  const joined = assignments.map(item => item.narration).join("");
+  if (joined !== String(narration || "")) {
+    throw new Error("半自动分镜组合未能逐字完整覆盖原旁白");
+  }
+  validateSceneAssignmentDensity(assignments, task, narration, requestedCount);
+  return assignments;
+}
+
+async function resolveSemiAutoSceneNarrationAssignments({ config, task, content, debugDir, modelIdentity }) {
+  const narration = String(content.narration || "");
+  const units = splitNarrationIntoAtomicUnits(narration);
+  if (!units.length) throw new Error("半自动模式没有可用于分镜的原文单元");
+
+  const manualCount = Number(task.target_scenes || 0) > 0 ? Math.max(1, Number(task.target_scenes)) : 0;
+  if (manualCount > units.length) {
+    throw new Error(`手动分镜数 ${manualCount} 超过可用原文单元数 ${units.length}，请减少目标分镜数或增加自然标点`);
+  }
+  const estimatedCount = inferAutoSceneCount(narration, task.tts_speed);
+  const estimatedDurationSeconds = estimateNarrationDurationSeconds(narration, task.tts_speed);
+  const input = {
+    version: 2,
+    model: modelIdentity,
+    mode: "semi-auto-locked-source-unit-groups",
+    narration,
+    units,
+    manual_count: manualCount,
+    estimated_count: estimatedCount,
+    estimated_duration_seconds: Math.round(estimatedDurationSeconds),
+    target_scenes_per_minute: TARGET_SCENES_PER_MINUTE,
+    tts_speed: normalizeTtsSpeed(task.tts_speed)
+  };
+  const cached = readStageCache(debugDir, "03-scenes-plan-semi", input);
+  if (cached) {
+    try { return validateSemiAutoSceneGroups(cached, units, task, narration, manualCount); }
+    catch (error) { writeDebug(debugDir, "03-scenes-plan-semi-cache-invalid.json", { message: error.message }); }
+  }
+
+  const unitsForPrompt = units.map(item => ({
+    id: item.id,
+    characters: item.characters,
+    text: item.text
+  }));
+  let lastError = null;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const countInstruction = manualCount
+      ? `用户明确指定分镜数：${manualCount}。groups 数量必须严格等于 ${manualCount}。`
+      : `预计旁白约 ${Math.round(estimatedDurationSeconds)} 秒，整体目标约每分钟 5 镜，参考数量约 ${estimatedCount} 镜。请根据语义合并相邻编号。`;
+    const correction = attempt === 1 || !lastError
+      ? ""
+      : `\n\n上一次编号分组未通过校验，原因：${lastError.message || String(lastError)}\n请只修正编号分组，不要返回任何文字。`;
+
+    try {
+      const payload = await callModelJson(config, {
+        stage: attempt === 1 ? "03-scenes-plan-semi" : `03-scenes-plan-semi-retry-${attempt}`,
+        system: SEMI_AUTO_SCENE_GROUP_PROMPT,
+        user: `${countInstruction}\n\n以下是按原顺序排列的原文单元。只返回 groups 和 unit_ids：\n${JSON.stringify(unitsForPrompt, null, 2)}${correction}`,
+        temperature: 0.1,
+        debugDir,
+        maxTokens: Math.max(1024, Math.min(4096, units.length * 40 + estimatedCount * 40))
+      });
+      const assignments = validateSemiAutoSceneGroups(payload, units, task, narration, manualCount);
+      const result = { groups: assignments.map(item => ({ unit_ids: item.source_unit_ids })) };
+      writeStageCache(debugDir, "03-scenes-plan-semi", input, result);
+      return assignments;
+    } catch (error) {
+      lastError = error;
+      writeDebug(debugDir, `03-scenes-plan-semi-attempt-${attempt}-invalid.json`, {
+        message: error?.message || String(error),
+        manual_count: manualCount,
+        estimated_count: estimatedCount,
+        unit_count: units.length
+      });
+    }
+  }
+  throw new Error(`半自动分镜编号连续两次未通过校验：${lastError?.message || String(lastError || "未知错误")}`);
+}
+
+
+
+function semanticSceneText(value) {
+  return Array.from(String(value || ""))
+    .filter(character => /[\p{L}\p{N}]/u.test(character))
+    .join("");
+}
+
+function buildSceneSourceMaps(value) {
+  const source = String(value || "").trim();
+  let semantic = "";
+  let sourceOffset = 0;
+  const semanticEndOffsets = [];
+  const naturalBoundaries = [];
+  for (const character of Array.from(source)) {
+    sourceOffset += character.length;
+    if (/[\p{L}\p{N}]/u.test(character)) {
+      semantic += character;
+      semanticEndOffsets.push(sourceOffset);
+    }
+    if (/[。！？!?；;]/u.test(character)) {
+      naturalBoundaries.push({ semanticIndex: semantic.length, sourceOffset, strength: 3 });
+    } else if (/[，,、：:—…]/u.test(character)) {
+      naturalBoundaries.push({ semanticIndex: semantic.length, sourceOffset, strength: 1 });
+    } else if (/\n/u.test(character)) {
+      naturalBoundaries.push({ semanticIndex: semantic.length, sourceOffset, strength: 2 });
+    }
+  }
+  return { source, semantic, semanticEndOffsets, naturalBoundaries };
+}
+
+function extendSceneBoundary(source, sourceOffset) {
+  let offset = Math.max(0, Math.min(source.length, Number(sourceOffset || 0)));
+  while (offset < source.length && /[\s，。！？；：、,.!?;:…—–\-”“‘’"'）)\]】}》〉」』]/u.test(source[offset])) {
+    offset += 1;
+  }
+  return offset;
+}
+
+function findClaudeSuffixBoundary(sourceSemantic, returnedSemantic, expectedEnd, minimumEnd, maximumEnd) {
+  const maxNeedleLength = Math.min(18, returnedSemantic.length);
+  for (let needleLength = maxNeedleLength; needleLength >= 6; needleLength -= 1) {
+    const needle = returnedSemantic.slice(-needleLength);
+    if (!needle) continue;
+    const matches = [];
+    let searchFrom = Math.max(0, minimumEnd - needleLength);
+    while (searchFrom < sourceSemantic.length) {
+      const found = sourceSemantic.indexOf(needle, searchFrom);
+      if (found < 0) break;
+      const end = found + needleLength;
+      if (end > minimumEnd && end <= maximumEnd) matches.push(end);
+      searchFrom = found + 1;
+    }
+    if (matches.length) {
+      return matches.sort((left, right) => Math.abs(left - expectedEnd) - Math.abs(right - expectedEnd))[0];
+    }
+  }
+  return 0;
+}
+
+function chooseNaturalSceneBoundary(maps, expectedEnd, minimumEnd, maximumEnd) {
+  const candidates = maps.naturalBoundaries
+    .filter(item => item.semanticIndex > minimumEnd && item.semanticIndex <= maximumEnd)
+    .map(item => ({
+      ...item,
+      score: Math.abs(item.semanticIndex - expectedEnd) - item.strength * 1.5
+    }))
+    .sort((left, right) => left.score - right.score);
+  if (candidates.length) return candidates[0].semanticIndex;
+  return Math.max(minimumEnd + 1, Math.min(maximumEnd, expectedEnd));
+}
+
+function reconstructExactSceneAssignments(rawScenes, task, narration) {
+  const maps = buildSceneSourceMaps(narration);
+  if (!maps.source || !maps.semantic) throw new Error("原旁白为空，无法恢复分镜边界");
+  const returnedTexts = rawScenes.map(scene => String(scene?.narration || "").trim());
+  const returnedSemantic = returnedTexts.map(semanticSceneText);
+  const returnedTotal = returnedSemantic.reduce((sum, item) => sum + item.length, 0);
+  if (!returnedTotal) throw new Error("Claude 分镜没有可用于恢复边界的文本");
+
+  const sceneCount = returnedTexts.length;
+  const boundaries = [];
+  let cumulativeReturned = 0;
+  let previousSemanticEnd = 0;
+  let previousSourceOffset = 0;
+
+  for (let index = 0; index < sceneCount - 1; index += 1) {
+    cumulativeReturned += returnedSemantic[index].length;
+    const remainingScenes = sceneCount - index - 1;
+    const expectedEnd = Math.round(cumulativeReturned / returnedTotal * maps.semantic.length);
+    const minimumEnd = previousSemanticEnd;
+    const maximumEnd = Math.max(minimumEnd + 1, maps.semantic.length - remainingScenes);
+    const suffixEnd = findClaudeSuffixBoundary(
+      maps.semantic,
+      returnedSemantic[index],
+      expectedEnd,
+      minimumEnd,
+      maximumEnd
+    );
+    const semanticEnd = suffixEnd || chooseNaturalSceneBoundary(maps, expectedEnd, minimumEnd, maximumEnd);
+    const mappedOffset = maps.semanticEndOffsets[Math.max(0, semanticEnd - 1)] || previousSourceOffset + 1;
+    let sourceOffset = extendSceneBoundary(maps.source, mappedOffset);
+    if (sourceOffset <= previousSourceOffset || sourceOffset >= maps.source.length) {
+      sourceOffset = Math.max(previousSourceOffset + 1, Math.min(maps.source.length - 1, mappedOffset));
+    }
+    boundaries.push(sourceOffset);
+    previousSemanticEnd = semanticEnd;
+    previousSourceOffset = sourceOffset;
+  }
+
+  const assignments = [];
+  let startOffset = 0;
+  for (let index = 0; index < sceneCount; index += 1) {
+    const endOffset = index < boundaries.length ? boundaries[index] : maps.source.length;
+    const exactNarration = maps.source.slice(startOffset, endOffset).trim();
+    if (!exactNarration) throw new Error(`恢复第 ${index + 1} 个分镜时得到空旁白`);
+    assignments.push({
+      index: index + 1,
+      narration: exactNarration,
+      ...(task.task_type === "podcast" ? { speaker_role: rawScenes[index]?.speaker_role === "B" ? "B" : "A" } : {})
+    });
+    startOffset = endOffset;
+  }
+  return assignments;
+}
+
+function validateSceneNarrationAssignments(payload, task, narration, requestedCount = 0) {
+  const rawScenes = Array.isArray(payload?.scenes) ? payload.scenes : [];
+  if (!rawScenes.length) throw new Error("分镜切分阶段没有返回 scenes 数组");
+  let assignments = rawScenes.map((scene, index) => ({
+    index: index + 1,
+    narration: String(scene?.narration || "").trim(),
+    ...(task.task_type === "podcast" ? { speaker_role: scene?.speaker_role === "B" ? "B" : "A" } : {})
+  }));
+  if (assignments.some(item => !item.narration)) throw new Error("分镜切分结果存在空旁白");
+  if (Number(requestedCount) > 0 && task.task_type !== "podcast" && assignments.length !== Number(requestedCount)) {
+    throw new Error(`分镜切分数量不正确：期望 ${Number(requestedCount)}，实际 ${assignments.length}`);
+  }
+  const compact = value => String(value || "").replace(/\s+/gu, "");
+  let joined = assignments.map(item => item.narration).join(task.task_type === "podcast" ? "\n" : "");
+  if (compact(joined) !== compact(narration) && task.task_type !== "podcast") {
+    // Claude 负责决定镜头数量和语义边界；程序再从原旁白按这些边界恢复原文，
+    // 避免模型仅改变引号、标点或个别措辞就让整项任务失败。
+    assignments = reconstructExactSceneAssignments(rawScenes, task, narration);
+    joined = assignments.map(item => item.narration).join("");
+  }
+  if (compact(joined) !== compact(narration)) {
+    throw new Error("无法根据 Claude 分镜边界恢复完整原旁白");
+  }
+
+  validateSceneAssignmentDensity(assignments, task, narration, requestedCount);
+  return assignments;
+}
+
+function validateSceneAssignmentDensity(assignments, task, narration, requestedCount = 0) {
+  // 自动数量模式按“每分钟约 5 镜”校验整体节奏，同时拦截十几二十字的碎片镜头。
+  if (Number(requestedCount) || task.task_type === "podcast") return assignments;
+  const lengths = assignments.map(item => countSceneCharacters(item.narration));
+  const nonFinal = lengths.slice(0, -1);
+  const tooShort = nonFinal.filter(length => length < 32);
+  const tooLong = lengths.filter(length => length > 72);
+  const outsidePreferred = lengths.filter(length => length < 38 || length > 60);
+  const totalCharacters = lengths.reduce((sum, length) => sum + length, 0);
+  const average = totalCharacters / Math.max(1, lengths.length);
+  const durationSeconds = estimateNarrationDurationSeconds(narration, task.tts_speed);
+  const estimatedCount = inferAutoSceneCount(narration, task.tts_speed);
+  const tolerance = Math.max(2, Math.ceil(estimatedCount * 0.2));
+  const scenesPerMinute = durationSeconds > 0 ? assignments.length / (durationSeconds / 60) : TARGET_SCENES_PER_MINUTE;
+
+  if (tooShort.length) {
+    throw new Error(`分镜过于碎片化：存在 ${tooShort.length} 个非末尾镜头少于 32 字，请与前后同场景内容合并`);
+  }
+  if (tooLong.length) {
+    throw new Error(`分镜过长：存在 ${tooLong.length} 个镜头超过 72 字，请在自然语义或画面转折处切分`);
+  }
+  if (outsidePreferred.length > Math.max(2, Math.floor(assignments.length * 0.3))) {
+    throw new Error(`分镜时长分布不稳定：${outsidePreferred.length}/${assignments.length} 个镜头不在约 38～60 字范围`);
+  }
+  if (assignments.length > 2 && (average < 38 || average > 60)) {
+    throw new Error(`分镜平均长度不合理：当前平均 ${average.toFixed(1)} 字，应让整体接近每分钟 5 镜`);
+  }
+  if (estimatedCount >= 4 && Math.abs(assignments.length - estimatedCount) > tolerance) {
+    throw new Error(`分镜数量偏离预计时长过多：约 ${Math.round(durationSeconds)} 秒旁白预计 ${estimatedCount} 镜，实际 ${assignments.length} 镜`);
+  }
+  if (durationSeconds >= 45 && (scenesPerMinute < 3.8 || scenesPerMinute > 6.2)) {
+    throw new Error(`分镜节奏不合理：当前约每分钟 ${scenesPerMinute.toFixed(1)} 镜，目标约每分钟 5 镜`);
+  }
+  return assignments;
+}
+
+async function resolveSceneNarrationAssignments({ config, task, content, debugDir, modelIdentity }) {
+  if (task.task_type === "podcast") return buildSceneNarrationAssignments(task, content.narration);
+  if (normalizeProcessingMode(task.processing_mode) === "semi_auto") {
+    return resolveSemiAutoSceneNarrationAssignments({ config, task, content, debugDir, modelIdentity });
+  }
+
+  const manualCount = Number(task.target_scenes || 0) > 0 ? Math.max(1, Number(task.target_scenes)) : 0;
+  const estimatedCount = inferAutoSceneCount(content.narration, task.tts_speed);
+  const estimatedDurationSeconds = estimateNarrationDurationSeconds(content.narration, task.tts_speed);
+  const input = {
+    version: 6,
+    model: modelIdentity,
+    narration: content.narration,
+    manual_count: manualCount,
+    estimated_count: estimatedCount,
+    estimated_duration_seconds: Math.round(estimatedDurationSeconds),
+    target_scenes_per_minute: TARGET_SCENES_PER_MINUTE,
+    tts_speed: normalizeTtsSpeed(task.tts_speed),
+    density: "about-5-scenes-per-minute-source-reconstruction",
+    task_type: task.task_type
+  };
+  const cached = readStageCache(debugDir, "03-scenes-plan", input);
+  if (cached) {
+    try { return validateSceneNarrationAssignments(cached, task, content.narration, manualCount); }
+    catch (error) { writeDebug(debugDir, "03-scenes-plan-cache-invalid.json", { message: error.message }); }
+  }
+
+  let lastError = null;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    const countInstruction = manualCount
+      ? `用户明确指定镜头数：${manualCount}。必须严格返回 ${manualCount} 个镜头。`
+      : `没有指定固定镜头数。按当前语速预计旁白约 ${Math.round(estimatedDurationSeconds)} 秒，整体目标约每分钟 5 镜，参考数量约 ${estimatedCount} 镜。请以自然语义和真实画面变化为主，但不要生成十几二十字的碎片镜头。`;
+    const correction = attempt === 1 || !lastError
+      ? ""
+      : `\n\n上一次结果未通过校验，原因：${lastError.message || String(lastError)}\n请重新划分镜头，重点合并过短镜头。镜头边界确定后，程序会自动从原旁白恢复逐字内容。`;
+
+    try {
+      const payload = await callModelJson(config, {
+        stage: attempt === 1 ? "03-scenes-plan" : `03-scenes-plan-retry-${attempt}`,
+        system: SCENE_PLAN_PROMPT,
+        user: `${countInstruction}\n\n必须完整覆盖的原旁白：\n${content.narration}${correction}`,
+        temperature: 0.1,
+        debugDir,
+        maxTokens: Math.max(2048, Math.min(8192, estimatedCount * 280))
+      });
+      const assignments = validateSceneNarrationAssignments(payload, task, content.narration, manualCount);
+      const result = { scenes: assignments };
+      writeStageCache(debugDir, "03-scenes-plan", input, result);
+      return assignments;
+    } catch (error) {
+      lastError = error;
+      writeDebug(debugDir, `03-scenes-plan-attempt-${attempt}-invalid.json`, {
+        message: error?.message || String(error),
+        manual_count: manualCount,
+        estimated_count: estimatedCount,
+        estimated_duration_seconds: Math.round(estimatedDurationSeconds)
+      });
+    }
+  }
+
+  // 不再静默退回本地机械切分。Claude 分镜不合格时明确报错，避免生成大量碎片镜头。
+  throw new Error(`Claude 分镜结果连续两次未通过校验：${lastError?.message || String(lastError || "未知错误")}`);
+}
+
+function buildSceneBatchUserPrompt(task, template, content, metadata, modules, seedPools, referenceKind, assignments, batchNumber, batchTotal) {
+  const batchTask = { ...task, target_scenes: assignments.length };
+  const batchNarration = assignments.map(item => item.narration).join(task.task_type === "podcast" ? "\n" : "");
+  const basePrompt = buildSceneUserPrompt(
+    batchTask,
+    template,
+    { ...content, narration: batchNarration },
+    metadata,
+    modules,
+    seedPools,
+    referenceKind
+  );
+  const fixedScenes = assignments.map(item => ({
+    index: item.index,
+    narration: item.narration,
+    ...(task.task_type === "podcast" ? { speaker_role: item.speaker_role } : {})
+  }));
+  return `${basePrompt}
+
+这是第 ${batchNumber}/${batchTotal} 批。本批只处理下面固定镜头清单：
+${JSON.stringify(fixedScenes, null, 2)}
+
+强制规则：
+1. 必须恰好返回 ${assignments.length} 个 scenes，不得增加、删除、合并或拆分。
+2. 每个 scene.index 必须与固定清单一致。
+3. narration 必须逐字复制固定清单中的 narration，不得改写、删字或补字。
+4. 你只负责补充 visual、desc_prompt、use_reference、reference_reason、subject_presence、era_and_location、duration_hint；双人播客还要保留 speaker_role。
+5. 不要输出 caption_segments。`;
+}
+
+function alignSceneBatchPayload(payload, assignments, task) {
+  const scenes = Array.isArray(payload?.scenes) ? payload.scenes : [];
+  if (!scenes.length) throw new Error("本批分镜没有返回 scenes 数组");
+  const byIndex = new Map();
+  scenes.forEach(scene => {
+    const index = Number(scene?.index);
+    if (Number.isInteger(index) && !byIndex.has(index)) byIndex.set(index, scene);
+  });
+
+  return assignments.map((assignment, position) => {
+    const scene = byIndex.get(assignment.index) || scenes[position];
+    if (!scene || typeof scene !== "object") {
+      throw new Error(`本批缺少第 ${assignment.index} 个镜头`);
+    }
+    const aligned = {
+      ...scene,
+      index: assignment.index,
+      narration: assignment.narration,
+      ...(task.task_type === "podcast" ? { speaker_role: assignment.speaker_role } : {})
+    };
+    delete aligned.caption_segments;
+    return aligned;
+  });
+}
+
+async function generateSceneBatch({ config, task, template, content, metadata, modules, seedPools, referenceKind, assignments, batchNumber, batchTotal, debugDir, modelIdentity }) {
+  const startIndex = assignments[0]?.index || 1;
+  const endIndex = assignments[assignments.length - 1]?.index || startIndex;
+  const stage = `03-scenes-${String(startIndex).padStart(3, "0")}-${String(endIndex).padStart(3, "0")}`;
+  const batchInput = {
+    version: 1,
+    model: modelIdentity,
+    batch_number: batchNumber,
+    batch_total: batchTotal,
+    assignments,
+    ratio: task.ratio,
+    style: task.style,
+    style_registry_version: task.style_config?.registry_version || "",
+    style_prefix: task.style_config?.prefix || "",
+    style_suffix: task.style_config?.suffix || "",
+    allow_color: task.style_config?.allow_color !== false,
+    task_type: task.task_type,
+    reference_kind: referenceKind,
+    reference_available: taskReferenceAvailable(task, referenceKind),
+    reference_decision_prompt: template.reference_decision_prompt || "",
+    image_prompt_template: template.image_prompt_template || "",
+    modules,
+    seed_pools: seedPools,
+    metadata,
+    template_prompt: template.step3_system_prompt || ""
+  };
+
+  const cached = readStageCache(debugDir, stage, batchInput);
+  if (cached) return alignSceneBatchPayload(cached, assignments, task);
+
+  try {
+    const payload = await callModelJson(config, {
+      stage,
+      system: `${SCENE_BASE_PROMPT}\n\n赛道专用要求：\n${template.step3_system_prompt || ""}`,
+      user: buildSceneBatchUserPrompt(
+        task,
+        template,
+        content,
+        metadata,
+        modules,
+        seedPools,
+        referenceKind,
+        assignments,
+        batchNumber,
+        batchTotal
+      ),
+      temperature: 0.25,
+      debugDir,
+      maxTokens: Math.max(2048, Math.min(8192, assignments.length * 1400))
+    });
+    const aligned = alignSceneBatchPayload(payload, assignments, task);
+    writeStageCache(debugDir, stage, batchInput, { scenes: aligned });
+    return aligned;
+  } catch (error) {
+    writeDebug(debugDir, `${stage}-batch-error.json`, {
+      message: error?.message || String(error),
+      start_index: startIndex,
+      end_index: endIndex,
+      scene_count: assignments.length
+    });
+    if (assignments.length <= 1) {
+      throw new Error(`${stage}生成失败：${error?.message || error}`);
+    }
+
+    const midpoint = Math.ceil(assignments.length / 2);
+    writeDebug(debugDir, `${stage}-split-retry.json`, {
+      reason: error?.message || String(error),
+      split_at: midpoint,
+      left: assignments.slice(0, midpoint).map(item => item.index),
+      right: assignments.slice(midpoint).map(item => item.index)
+    });
+    const left = await generateSceneBatch({
+      config, task, template, content, metadata, modules, seedPools, referenceKind,
+      assignments: assignments.slice(0, midpoint),
+      batchNumber,
+      batchTotal,
+      debugDir,
+      modelIdentity
+    });
+    const right = await generateSceneBatch({
+      config, task, template, content, metadata, modules, seedPools, referenceKind,
+      assignments: assignments.slice(midpoint),
+      batchNumber,
+      batchTotal,
+      debugDir,
+      modelIdentity
+    });
+    return [...left, ...right];
+  }
+}
+
+async function generateScenesInBatches({ config, task, template, content, metadata, modules, seedPools, referenceKind, assignments, debugDir, modelIdentity }) {
+  if (!assignments.length) throw new Error("旁白无法拆分为分镜");
+  const batches = [];
+  for (let index = 0; index < assignments.length; index += SCENE_BATCH_SIZE) {
+    batches.push(assignments.slice(index, index + SCENE_BATCH_SIZE));
+  }
+
+  const combined = [];
+  for (let index = 0; index < batches.length; index += 1) {
+    throwIfCancelled();
+    const scenes = await generateSceneBatch({
+      config,
+      task,
+      template,
+      content,
+      metadata,
+      modules,
+      seedPools,
+      referenceKind,
+      assignments: batches[index],
+      batchNumber: index + 1,
+      batchTotal: batches.length,
+      debugDir,
+      modelIdentity
+    });
+    combined.push(...scenes);
+  }
+  return combined;
 }
 
 function llmIdentity(config) {
@@ -842,6 +1714,7 @@ function writeStageCache(debugDir, stage, input, result) {
 }
 
 async function planVideoScript({ config, task, outputDir, onStage = () => {} }) {
+  throwIfCancelled();
   const template = resolveTemplate(task);
   const mode = normalizeProcessingMode(task.processing_mode);
   const debugDir = outputDir ? path.join(outputDir, "llm-debug") : "";
@@ -905,14 +1778,17 @@ async function planVideoScript({ config, task, outputDir, onStage = () => {} }) 
       });
       writeStageCache(debugDir, "01-rewrite", rewriteInput, content);
     }
+    throwIfCancelled();
     onStage("01-rewrite", "completed");
   }
   content = {
     title: String(content.title || task.title || String(task.input_text || "").slice(0, 18)),
     summary: String(content.summary || "").slice(0, 200),
-    narration: String(content.narration || (mode === "semi_auto" ? task.input_text : "")).trim()
+    narration: mode === "semi_auto"
+      ? String(task.input_text || "")
+      : String(content.narration || "").trim()
   };
-  if (!content.narration) throw new Error("文案处理阶段没有返回 narration");
+  if (!content.narration.trim()) throw new Error("文案处理阶段没有返回 narration");
 
   const metadataInput = {
     version: 2,
@@ -937,20 +1813,36 @@ async function planVideoScript({ config, task, outputDir, onStage = () => {} }) 
     });
     writeStageCache(debugDir, "02-metadata", metadataInput, rawMetadata);
   }
+  throwIfCancelled();
   onStage("02-metadata", "completed");
   const metadata = normalizeMetadata(rawMetadata, template);
   const publish = metadata.publish || {};
   if (publish.title) content.title = publish.title;
   if (publish.summary) content.summary = publish.summary;
 
+  onStage("03-scenes", "running");
+  const sceneAssignments = await resolveSceneNarrationAssignments({
+    config,
+    task,
+    content,
+    debugDir,
+    modelIdentity
+  });
   const scenesInput = {
-    version: 2,
+    version: 7,
     model: modelIdentity,
+    processing_mode: mode,
     content,
     metadata,
     target_scenes: task.target_scenes,
+    scene_assignments: sceneAssignments,
+    batch_size: SCENE_BATCH_SIZE,
     ratio: task.ratio,
     style: task.style,
+    style_registry_version: task.style_config?.registry_version || "",
+    style_prefix: task.style_config?.prefix || "",
+    style_suffix: task.style_config?.suffix || "",
+    allow_color: task.style_config?.allow_color !== false,
     task_type: task.task_type,
     reference_kind: referenceKind,
     reference_available: taskReferenceAvailable(task, referenceKind),
@@ -962,16 +1854,23 @@ async function planVideoScript({ config, task, outputDir, onStage = () => {} }) 
   };
   let scenePayload = readStageCache(debugDir, "03-scenes", scenesInput);
   if (!scenePayload) {
-    onStage("03-scenes", "running");
-    scenePayload = await callModelJson(config, {
-      stage: "03-scenes",
-      system: `${SCENE_BASE_PROMPT}\n\n赛道专用要求：\n${template.step3_system_prompt || ""}`,
-      user: buildSceneUserPrompt(task, template, content, metadata, modules, seedPools, referenceKind),
-      temperature: 0.35,
-      debugDir
+    const generatedScenes = await generateScenesInBatches({
+      config,
+      task,
+      template,
+      content,
+      metadata,
+      modules,
+      seedPools,
+      referenceKind,
+      assignments: sceneAssignments,
+      debugDir,
+      modelIdentity
     });
+    scenePayload = { scenes: generatedScenes };
     writeStageCache(debugDir, "03-scenes", scenesInput, scenePayload);
   }
+  throwIfCancelled();
   onStage("03-scenes", "completed");
   if (!Array.isArray(scenePayload.scenes) || !scenePayload.scenes.length) {
     throw new Error("分镜阶段没有返回 scenes 数组");
@@ -1012,5 +1911,16 @@ module.exports = {
   normalizeProcessingMode,
   normalizeCaptionSegments,
   applyImagePromptTemplate,
+  splitNarrationForScenePlan,
+  countSceneCharacters,
+  inferAutoSceneCount,
+  estimateNarrationDurationSeconds,
+  buildSceneNarrationAssignments,
+  splitNarrationIntoAtomicUnits,
+  extractSemiAutoSceneGroups,
+  validateSemiAutoSceneGroups,
+  validateSceneAssignmentDensity,
+  reconstructExactSceneAssignments,
+  validateSceneNarrationAssignments,
   testModelConnection
 };

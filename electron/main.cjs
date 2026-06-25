@@ -10,14 +10,22 @@ const { renderMusicVideo, _captionTest } = require("./media.cjs");
 const { generateMusicDraft } = require("./draft.cjs");
 const crypto = require("node:crypto");
 const { atomicWriteJson } = require("./checkpoint.cjs");
-const { buildPolicySafeImagePrompt } = require("./image-prompt-safety.cjs");
+const {
+  TaskCancelledError, runWithCancellation, isCancellationError
+} = require("./cancellation.cjs");
+const {
+  STYLE_REGISTRY_VERSION, STYLE_REGISTRY_SOURCE_SHA256,
+  canonicalStyleId, normalizeVisualStyle,
+  resolveVisualStyle, styleSnapshot
+} = require("./visual-styles.cjs");
 
 let mainWindow;
 let db;
 let queueRunning = false;
+const activeTaskRuns = new Map();
 
 const defaultConfig = {
-  config_version: 4,
+  config_version: 6,
   llm: {
     provider: "local",
     protocol: "local",
@@ -34,10 +42,10 @@ const defaultConfig = {
   modelscope: {
     api_key: "", base_url: "https://api-inference.modelscope.cn/v1",
     model: "Tongyi-MAI/Z-Image-Turbo", ratio: "9:16", resolution: "1k", concurrency: 1,
-    proxy_url: "", custom_models: []
+    proxy_url: "", custom_models: [], negative_prompt_field: "negative_prompt"
   },
   custom_image: {
-    display_name: "OpenAI 兼容图片接口",
+    display_name: "foxcode",
     base_url: "https://dm-fox.rjj.cc/codex/v1",
     api_key: "",
     model: "gpt-image-2",
@@ -54,11 +62,26 @@ const defaultConfig = {
     status_field: "status",
     image_field: "data.0.url",
     success_values: "succeeded,completed,success",
+    negative_prompt_field: "",
     extra_body_json: "",
     ratio_mapping_json: "",
     ratio: "9:16",
     resolution: "1k",
     concurrency: 3,
+    proxy_url: ""
+  },
+  apimart: {
+    display_name: "Apimart",
+    base_url: "https://api.apimart.ai/v1",
+    api_key: "",
+    model: "gpt-image-2",
+    ratio: "9:16",
+    resolution: "1k",
+    concurrency: 3,
+    official_fallback: false,
+    policy_fallback: true,
+    poll_interval_ms: 3000,
+    poll_timeout_seconds: 600,
     proxy_url: ""
   },
   runninghub: {
@@ -97,6 +120,7 @@ function readConfig() {
       gpt_image: { ...defaultConfig.gpt_image, ...saved.gpt_image },
       modelscope: { ...defaultConfig.modelscope, ...saved.modelscope },
       custom_image: { ...defaultConfig.custom_image, ...saved.custom_image },
+      apimart: { ...defaultConfig.apimart, ...saved.apimart },
       runninghub: { ...defaultConfig.runninghub, ...saved.runninghub },
       tts: {
         provider: saved.tts?.provider || (saved.tts?.volcengine?.app_id && saved.tts?.volcengine?.access_key ? "volcengine" : "system"),
@@ -107,7 +131,7 @@ function readConfig() {
       media: { ...defaultConfig.media, ...saved.media },
       ui: { ...defaultConfig.ui, ...saved.ui }
     };
-    if (!saved.config_version || saved.config_version < 4) {
+    if (!saved.config_version || saved.config_version < 6) {
       if (!merged.llm.api_key && merged.llm.provider !== "local") {
         merged.llm.provider = "local";
         merged.llm.protocol = "local";
@@ -115,9 +139,14 @@ function readConfig() {
       if (!saved.tts?.provider) {
         merged.tts.provider = merged.tts.volcengine.app_id && merged.tts.volcengine.access_key ? "volcengine" : "system";
       }
-      merged.config_version = 4;
+      merged.custom_image.display_name = merged.custom_image.display_name || "foxcode";
+      merged.apimart.display_name = "Apimart";
+      merged.config_version = 6;
       fs.writeFileSync(configPath(), JSON.stringify(merged, null, 2), "utf8");
     }
+    merged.custom_image.display_name = "foxcode";
+    merged.apimart.display_name = "Apimart";
+    merged.apimart.model = "gpt-image-2";
     if (merged.image_provider === "gpt_image") {
       merged.custom_image = {
         ...merged.custom_image,
@@ -127,7 +156,7 @@ function readConfig() {
       };
       merged.image_provider = "custom_image";
     }
-    if (!["custom_image", "modelscope", "runninghub", "placeholder"].includes(merged.image_provider)) {
+    if (!["custom_image", "apimart", "modelscope", "runninghub", "placeholder"].includes(merged.image_provider)) {
       merged.image_provider = "custom_image";
     }
     if (!["system", "volcengine"].includes(merged.tts.provider)) merged.tts.provider = "system";
@@ -235,7 +264,7 @@ app.on("window-all-closed", () => {
 });
 
 ipcMain.handle("tasks:list", () =>
-  db.prepare("SELECT * FROM tasks ORDER BY datetime(created_at) DESC").all().map(sanitizeStoredTaskPrompts)
+  db.prepare("SELECT * FROM tasks ORDER BY datetime(created_at) DESC").all().map(restoreStoredTaskPromptLayers)
 );
 ipcMain.handle("tasks:create", (_event, input) => createTask(db, input));
 ipcMain.handle("tasks:delete", (_event, id) => {
@@ -243,7 +272,31 @@ ipcMain.handle("tasks:delete", (_event, id) => {
   db.prepare("DELETE FROM tasks WHERE id=?").run(id);
 });
 ipcMain.handle("tasks:cancel", (_event, id) => {
-  db.prepare("UPDATE tasks SET cancel_requested=1,status=CASE WHEN status='pending' THEN 'cancelled' ELSE status END WHERE id=?").run(id);
+  const controller = activeTaskRuns.get(id);
+  const state = db.prepare("SELECT status,current_stage,current_step,cancel_requested FROM tasks WHERE id=?").get(id);
+  if (!state) throw new Error("任务不存在");
+  const active = Boolean(controller && !controller.signal.aborted);
+  const stage = String(state.current_stage || "").toLowerCase();
+  const drainingImages = active && (stage.startsWith("images") || (Number(state.current_step || 0) === 4 && state.status === "running"));
+
+  if (drainingImages) {
+    // Soft cancel while images are being generated: stop scheduling new scenes,
+    // but keep the current HTTP requests / remote task polling alive so every
+    // already-submitted image is downloaded before the pipeline exits.
+    db.prepare(`UPDATE tasks SET cancel_requested=1,status='cancelling',current_stage='images_draining',
+      error_message='已停止提交新图片，正在等待已提交图片下载',queue_order=0,queue_batch_id='',last_heartbeat_at=? WHERE id=?`).run(Date.now(), id);
+    mainWindow?.webContents.send("task:event", {
+      taskId: id,
+      status: "cancelling",
+      step: 4,
+      message: "已停止提交后续图片，正在等待已提交任务生成并下载到本地"
+    });
+  } else {
+    db.prepare(`UPDATE tasks SET cancel_requested=1,status='cancelled',current_stage='cancelled',
+      error_message='任务已取消',queue_order=0,queue_batch_id='',last_heartbeat_at=? WHERE id=?`).run(Date.now(), id);
+    if (controller && !controller.signal.aborted) controller.abort(new TaskCancelledError());
+    mainWindow?.webContents.send("task:event", { taskId: id, status: "cancelled", step: 0, message: "任务已取消，正在停止当前请求和本地进程" });
+  }
   return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
 });
 ipcMain.handle("tasks:duplicate", (_event, id) => {
@@ -251,7 +304,7 @@ ipcMain.handle("tasks:duplicate", (_event, id) => {
   if (!task) throw new Error("任务不存在");
   return createTask(db, {
     title: `${task.title} - 副本`, inputText: task.input_text, track: task.track, style: task.style,
-    ratio: task.ratio, targetScenes: task.target_scenes, ttsSpeed: task.tts_speed,
+    ratio: task.ratio, targetScenes: task.target_scenes, ttsProvider: task.tts_provider, ttsSpeed: task.tts_speed,
     promptTemplateId: task.prompt_template_id, rewriteIntensity: task.rewrite_intensity,
     narrativePov: task.narrative_pov, keepPromotion: task.keep_promotion,
     materialSource: task.material_source, targetLength: task.target_length,
@@ -414,7 +467,13 @@ ipcMain.handle("config:save", (_event, config) => {
   const normalized = {
     ...defaultConfig,
     ...config,
-    config_version: 4,
+    config_version: 6,
+    llm: { ...defaultConfig.llm, ...config?.llm },
+    gpt_image: { ...defaultConfig.gpt_image, ...config?.gpt_image },
+    modelscope: { ...defaultConfig.modelscope, ...config?.modelscope },
+    custom_image: { ...defaultConfig.custom_image, ...config?.custom_image, display_name: "foxcode" },
+    apimart: { ...defaultConfig.apimart, ...config?.apimart, display_name: "Apimart", model: "gpt-image-2" },
+    runninghub: { ...defaultConfig.runninghub, ...config?.runninghub },
     tts: {
       provider: ["system", "volcengine"].includes(config?.tts?.provider) ? config.tts.provider : "system",
       system: { ...defaultConfig.tts.system, ...config?.tts?.system },
@@ -528,11 +587,15 @@ ipcMain.handle("image:generate", async (_event, input) => {
   const config = readConfig();
   const providerKey = config.image_provider;
   if (config[providerKey]) config[providerKey] = { ...config[providerKey], ratio: input.ratio || "9:16", resolution: input.resolution || "1k" };
+  const styleToken = String(input.styleId || input.style || "").trim();
   db.prepare("INSERT INTO playground_jobs(id,prompt,style_id,provider,ratio,resolution,reference_image_path,status,created_at) VALUES(?,?,?,?,?,?,?,?,?)")
-    .run(id, input.prompt, input.style || "", config.image_provider, input.ratio || "9:16", input.resolution || "1k", input.referenceImagePath || "", "running", Date.now());
+    .run(id, input.prompt, styleToken ? canonicalStyleId(styleToken) : "", config.image_provider, input.ratio || "9:16", input.resolution || "1k", input.referenceImagePath || "", "running", Date.now());
   try {
+    const customStyle = styleToken ? db.prepare("SELECT * FROM custom_styles WHERE id=?").get(canonicalStyleId(styleToken)) : null;
+    const primaryStyle = styleToken ? resolveVisualStyle(styleToken, customStyle) : null;
     const result = await generateSceneImage({
-      app, config, prompt: `${input.style ? `${input.style}，` : ""}${input.prompt}`,
+      app, config, prompt: String(input.prompt || ""),
+      styleConfig: primaryStyle,
       destination, ratio: input.ratio || "9:16", index: 1,
       referenceImagePath: input.referenceImagePath || ""
     });
@@ -781,35 +844,30 @@ ipcMain.handle("music:generate", async (_event, input) => {
   return { outputDir, videoPath: video.finalVideo, draftDir };
 });
 
-function sanitizeStoredTaskPrompts(task) {
+function restoreStoredTaskPromptLayers(task) {
   if (!task?.pipeline_data) return task;
   let script;
   try { script = JSON.parse(task.pipeline_data); } catch { return task; }
   if (!Array.isArray(script?.scenes)) return task;
   let changed = false;
   for (const scene of script.scenes) {
-    const rawDesc = String(scene.desc_prompt || "");
-    if (rawDesc) {
-      const safeDesc = buildPolicySafeImagePrompt(rawDesc, "preflight");
-      if (safeDesc.adjusted && safeDesc.prompt !== rawDesc) {
-        scene.desc_prompt_original = scene.desc_prompt_original || rawDesc;
-        scene.desc_prompt = safeDesc.prompt;
-        scene.image_prompt_safety_adjusted = true;
-        scene.image_prompt_safety_reasons = [...new Set([...(scene.image_prompt_safety_reasons || []), ...(safeDesc.reasons || [])])];
-        changed = true;
-      }
+    // Older builds permanently replaced the base prompt with a temporary policy fallback.
+    // Restore both original prompt layers before clearing the legacy flag. Safety is now
+    // applied only at request time and must never overwrite persisted scene content.
+    const wasSafetyAdjusted = Boolean(scene.image_prompt_safety_adjusted);
+    if (!wasSafetyAdjusted) continue;
+    if (scene.image_prompt_original) {
+      scene.image_prompt = String(scene.image_prompt_original);
+      scene.image_prompt_original = "";
+      changed = true;
     }
-    const rawPrompt = String(scene.image_prompt || "");
-    if (rawPrompt) {
-      const safePrompt = buildPolicySafeImagePrompt(rawPrompt, "preflight");
-      if (safePrompt.adjusted && safePrompt.prompt !== rawPrompt) {
-        scene.image_prompt_original = scene.image_prompt_original || rawPrompt;
-        scene.image_prompt = safePrompt.prompt;
-        scene.image_prompt_safety_adjusted = true;
-        scene.image_prompt_safety_reasons = [...new Set([...(scene.image_prompt_safety_reasons || []), ...(safePrompt.reasons || [])])];
-        changed = true;
-      }
+    if (scene.desc_prompt_original) {
+      scene.desc_prompt = String(scene.desc_prompt_original);
+      scene.desc_prompt_original = "";
+      changed = true;
     }
+    scene.image_prompt_safety_adjusted = false;
+    changed = true;
   }
   if (!changed) return task;
   const pipelineData = JSON.stringify(script);
@@ -824,19 +882,55 @@ function sanitizeStoredTaskPrompts(task) {
   return task;
 }
 
+function resolveTaskVisualStyle(task) {
+  const rawStyle = String(task.style || "").trim();
+  if (!rawStyle) {
+    throw new Error("任务没有保存画面风格。为避免错误回退成黑白摄影，请在任务中重新选择画面风格后再运行。");
+  }
+  const requested = canonicalStyleId(rawStyle);
+  const customStyle = db.prepare("SELECT * FROM custom_styles WHERE id=?").get(requested);
+  let snapshot = null;
+  try { snapshot = task.style_snapshot_json ? JSON.parse(task.style_snapshot_json) : null; } catch {}
+
+  let resolved;
+  const snapshotMatches = snapshot && canonicalStyleId(snapshot.id) === requested;
+  const snapshotIsCustom = snapshotMatches && snapshot.origin === "custom";
+  const snapshotIsVerifiedBuiltin = snapshotMatches
+    && snapshot.origin !== "custom"
+    && snapshot.registry_version === STYLE_REGISTRY_VERSION
+    && snapshot.registry_source_sha256 === STYLE_REGISTRY_SOURCE_SHA256;
+  if (snapshotIsCustom || snapshotIsVerifiedBuiltin) {
+    resolved = normalizeVisualStyle(snapshot, snapshot.origin || "snapshot");
+  } else {
+    // Discard snapshots created by earlier unverified rebuilds. A stale/fake
+    // snapshot must never override the registry extracted from the original EXE.
+    resolved = resolveVisualStyle(requested, customStyle);
+  }
+
+  const snapshotJson = JSON.stringify(styleSnapshot(resolved));
+  if (task.style !== resolved.id || task.style_snapshot_json !== snapshotJson || task.style_registry_version !== resolved.registry_version) {
+    db.prepare("UPDATE tasks SET style=?,style_snapshot_json=?,style_registry_version=? WHERE id=?")
+      .run(resolved.id, snapshotJson, resolved.registry_version || "", task.id);
+    task.style = resolved.id;
+    task.style_snapshot_json = snapshotJson;
+    task.style_registry_version = resolved.registry_version || "";
+  }
+  return resolved;
+}
+
 function loadTask(id) {
-  const task = sanitizeStoredTaskPrompts(db.prepare("SELECT * FROM tasks WHERE id=?").get(id));
+  const task = restoreStoredTaskPromptLayers(db.prepare("SELECT * FROM tasks WHERE id=?").get(id));
   if (!task) throw new Error("任务不存在");
   if (task.prompt_template_id) {
     task.prompt_template = db.prepare("SELECT * FROM user_prompt_templates WHERE id=?").get(task.prompt_template_id);
   }
-  task.style_config = db.prepare("SELECT * FROM custom_styles WHERE id=?").get(task.style);
+  task.style_config = resolveTaskVisualStyle(task);
   const draft = db.prepare("SELECT config FROM draft_templates WHERE id=?").get(task.template_id);
   task.draft_template = draft ? JSON.parse(draft.config) : null;
   task.cover_template = db.prepare("SELECT * FROM cover_templates WHERE id=?").get(task.cover_template_id);
   if (task.bgm_id === "builtin") task.bgm_path = app.isPackaged ? path.join(process.resourcesPath, "default-bgm.mp3") : path.join(__dirname, "..", "resources", "default-bgm.mp3");
   else if (task.bgm_id && task.bgm_id !== "none") task.bgm_path = db.prepare("SELECT path FROM bgm_library WHERE id=?").get(task.bgm_id)?.path || "";
-  task.shouldCancel = () => Boolean(db.prepare("SELECT cancel_requested FROM tasks WHERE id=?").get(id)?.cancel_requested);
+  task.shouldCancel = () => Boolean(activeTaskRuns.get(id)?.signal.aborted || db.prepare("SELECT cancel_requested FROM tasks WHERE id=?").get(id)?.cancel_requested);
   return task;
 }
 
@@ -888,8 +982,8 @@ ipcMain.handle("tasks:replaceSceneImage", async (_event, id, sceneIndex) => {
 function taskCheckpoint(id) {
   return ({ outputDir = "", pipeline = null, currentStage = "", currentStep = 0, detail = "" } = {}) => {
     const now = Date.now();
-    const task = db.prepare("SELECT output_dir,pipeline_data,current_step,current_stage FROM tasks WHERE id=?").get(id);
-    if (!task) return;
+    const task = db.prepare("SELECT output_dir,pipeline_data,current_step,current_stage,cancel_requested,status FROM tasks WHERE id=?").get(id);
+    if (!task || task.status === "cancelled") return;
     const nextOutputDir = outputDir || task.output_dir || "";
     const nextPipeline = pipeline ? JSON.stringify(pipeline) : task.pipeline_data;
     const nextStep = Number(currentStep || task.current_step || 0);
@@ -905,16 +999,23 @@ function taskCheckpoint(id) {
 
 function taskEmitter(id) {
   return (step, message) => {
+    const state = db.prepare("SELECT cancel_requested,status FROM tasks WHERE id=?").get(id);
+    if (!state || state.status === "cancelled" || activeTaskRuns.get(id)?.signal.aborted) return;
     const now = Date.now();
     db.prepare("UPDATE tasks SET current_step=?,last_heartbeat_at=? WHERE id=?").run(step, now, id);
     db.prepare("INSERT INTO task_events(task_id,type,step,detail,data_json,ts) VALUES(?,?,?,?,?,?)")
       .run(id, "progress", step, message, "{}", now);
-    mainWindow?.webContents.send("task:event", { taskId: id, status: "running", step, message });
+    const eventStatus = state.status === "cancelling" ? "cancelling" : "running";
+    mainWindow?.webContents.send("task:event", { taskId: id, status: eventStatus, step, message });
   };
 }
 
 function beginTaskRun(id, { keepStep = false } = {}) {
   const before = db.prepare("SELECT status,current_step FROM tasks WHERE id=?").get(id);
+  const previous = activeTaskRuns.get(id);
+  if (previous && !previous.signal.aborted) throw new Error("任务正在运行，请勿重复启动");
+  const controller = new AbortController();
+  activeTaskRuns.set(id, controller);
   const task = loadTask(id);
   const config = readConfig();
   const outputDir = taskOutputDir(task, config, path.join(app.getPath("documents"), "Storybound"));
@@ -925,14 +1026,25 @@ function beginTaskRun(id, { keepStep = false } = {}) {
     .run(outputDir, resume ? "resuming" : "planning", keepStep ? Number(before?.current_step || 0) : (resume ? Number(before?.current_step || 0) : 0), resume ? 1 : 0, Date.now(), id);
   task.output_dir = outputDir;
   task.status = "running";
-  return { task, config, outputDir, resume };
+  task.abortSignal = controller.signal;
+  task.shouldCancel = () => Boolean(controller.signal.aborted || db.prepare("SELECT cancel_requested FROM tasks WHERE id=?").get(id)?.cancel_requested);
+  return { task, config, outputDir, resume, controller };
+}
+
+function assertTaskRunActive(id, controller) {
+  const row = db.prepare("SELECT cancel_requested,status FROM tasks WHERE id=?").get(id);
+  if (controller?.signal.aborted || row?.cancel_requested || row?.status === "cancelled") throw new TaskCancelledError();
+}
+
+function finishTaskRun(id, controller) {
+  if (activeTaskRuns.get(id) === controller) activeTaskRuns.delete(id);
 }
 
 function taskFailure(id, error) {
   const message = error instanceof Error ? error.message : String(error);
   const cancelRequested = Boolean(db.prepare("SELECT cancel_requested FROM tasks WHERE id=?").get(id)?.cancel_requested);
-  if (cancelRequested || message.includes("取消")) {
-    db.prepare("UPDATE tasks SET status='cancelled',current_stage='cancelled',error_message='任务已取消',last_heartbeat_at=? WHERE id=?").run(Date.now(), id);
+  if (cancelRequested || isCancellationError(error) || message.includes("取消")) {
+    db.prepare("UPDATE tasks SET status='cancelled',current_stage='cancelled',error_message='任务已取消',queue_order=0,queue_batch_id='',last_heartbeat_at=? WHERE id=?").run(Date.now(), id);
     mainWindow?.webContents.send("task:event", { taskId: id, status: "cancelled", step: 0, message: "任务已取消" });
     return;
   }
@@ -948,146 +1060,224 @@ function taskFailure(id, error) {
 }
 
 ipcMain.handle("tasks:prepare", async (_event, id) => {
-  const { task, config } = beginTaskRun(id);
+  const { task, config, controller } = beginTaskRun(id);
   try {
-    const result = await preparePipeline({
-      task,
-      config,
-      baseOutputDir: path.join(app.getPath("documents"), "Storybound"),
-      emit: taskEmitter(id),
-      checkpoint: taskCheckpoint(id)
+    return await runWithCancellation(controller.signal, async () => {
+      const result = await preparePipeline({
+        task,
+        config,
+        baseOutputDir: path.join(app.getPath("documents"), "Storybound"),
+        emit: taskEmitter(id),
+        checkpoint: taskCheckpoint(id)
+      });
+      assertTaskRunActive(id, controller);
+      db.prepare("UPDATE tasks SET status='review',current_stage='review_script',current_step=3,output_dir=?,pipeline_data=?,last_checkpoint_at=? WHERE id=?")
+        .run(result.outputDir, JSON.stringify(result.script), Date.now(), id);
+      mainWindow?.webContents.send("task:event", { taskId: id, status: "review", step: 3, message: "脚本和分镜已生成，请确认后继续" });
+      return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
     });
-    db.prepare("UPDATE tasks SET status='review',current_stage='review_script',current_step=3,output_dir=?,pipeline_data=?,last_checkpoint_at=? WHERE id=?")
-      .run(result.outputDir, JSON.stringify(result.script), Date.now(), id);
-    mainWindow?.webContents.send("task:event", { taskId: id, status: "review", step: 3, message: "脚本和分镜已生成，请确认后继续" });
-    return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
   } catch (error) {
     taskFailure(id, error);
     throw error;
+  } finally {
+    finishTaskRun(id, controller);
   }
 });
 
 ipcMain.handle("tasks:continue", async (_event, id) => {
-  const { task, config, outputDir } = beginTaskRun(id, { keepStep: true });
-  let script = null;
-  try { script = task.pipeline_data ? JSON.parse(task.pipeline_data) : null; } catch {}
-  if (!script?.scenes?.length && fs.existsSync(path.join(outputDir, "pipeline.json"))) {
-    try { script = JSON.parse(fs.readFileSync(path.join(outputDir, "pipeline.json"), "utf8")); } catch {}
-  }
-  if (!Array.isArray(script?.scenes)) throw new Error("请先生成并确认脚本");
+  const { task, config, outputDir, controller } = beginTaskRun(id, { keepStep: true });
   try {
-    const result = await completePipeline({
-      app, task, config, outputDir, script,
-      emit: taskEmitter(id), checkpoint: taskCheckpoint(id)
-    });
-    if (result.paused) {
-      db.prepare("UPDATE tasks SET status='review',current_stage=?,current_step=?,pipeline_data=?,last_checkpoint_at=? WHERE id=?")
-        .run(result.pauseStep === 5 ? "review_audio" : "review_images", result.pauseStep || 4, JSON.stringify(result.script), Date.now(), id);
-      const message = result.pauseStep === 5 ? "配音已生成，请试听后继续" : "图片已生成，请检查画廊后继续";
-      mainWindow?.webContents.send("task:event", { taskId: id, status: "review", step: result.pauseStep || 4, message });
+    return await runWithCancellation(controller.signal, async () => {
+      let script = null;
+      try { script = task.pipeline_data ? JSON.parse(task.pipeline_data) : null; } catch {}
+      if (!script?.scenes?.length && fs.existsSync(path.join(outputDir, "pipeline.json"))) {
+        try { script = JSON.parse(fs.readFileSync(path.join(outputDir, "pipeline.json"), "utf8")); } catch {}
+      }
+      if (!Array.isArray(script?.scenes)) throw new Error("请先生成并确认脚本");
+      const result = await completePipeline({
+        app, task, config, outputDir, script,
+        emit: taskEmitter(id), checkpoint: taskCheckpoint(id)
+      });
+      assertTaskRunActive(id, controller);
+      if (result.paused) {
+        const reviewStage = result.partialImages
+          ? "review_images_partial"
+          : (result.pauseStep === 5 ? "review_audio" : "review_images");
+        db.prepare("UPDATE tasks SET status='review',current_stage=?,current_step=?,pipeline_data=?,last_checkpoint_at=? WHERE id=?")
+          .run(reviewStage, result.pauseStep || 4, JSON.stringify(result.script), Date.now(), id);
+        const message = result.partialImages
+          ? `图片已完成 ${result.script.scenes.length - Number(result.missingImageCount || 0)}/${result.script.scenes.length}，仍有 ${Number(result.missingImageCount || 0)} 张需要补齐`
+          : (result.pauseStep === 5 ? "配音已生成，请试听后继续" : "图片已生成，请检查画廊后继续");
+        mainWindow?.webContents.send("task:event", { taskId: id, status: "review", step: result.pauseStep || 4, message });
+        return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
+      }
+      db.prepare("UPDATE tasks SET status='completed',current_stage='completed',current_step=8,video_path=?,draft_dir=?,cover_path=?,pipeline_data=?,queue_order=0,queue_batch_id='',completed_at=datetime('now','localtime'),last_checkpoint_at=? WHERE id=?")
+        .run(result.finalVideo, result.draftDir, result.coverPath || "", JSON.stringify(result.script), Date.now(), id);
       return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
-    }
-    db.prepare("UPDATE tasks SET status='completed',current_stage='completed',current_step=8,video_path=?,draft_dir=?,cover_path=?,pipeline_data=?,queue_order=0,queue_batch_id='',completed_at=datetime('now','localtime'),last_checkpoint_at=? WHERE id=?")
-      .run(result.finalVideo, result.draftDir, result.coverPath || "", JSON.stringify(result.script), Date.now(), id);
-    return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
+    });
   } catch (error) {
     taskFailure(id, error);
     throw error;
+  } finally {
+    finishTaskRun(id, controller);
+  }
+});
+
+ipcMain.handle("tasks:repairMissingImages", async (_event, id) => {
+  const { task, config, outputDir, controller } = beginTaskRun(id, { keepStep: true });
+  try {
+    return await runWithCancellation(controller.signal, async () => {
+      let script = null;
+      try { script = task.pipeline_data ? JSON.parse(task.pipeline_data) : null; } catch {}
+      if (!script?.scenes?.length && fs.existsSync(path.join(outputDir, "pipeline.json"))) {
+        try { script = JSON.parse(fs.readFileSync(path.join(outputDir, "pipeline.json"), "utf8")); } catch {}
+      }
+      if (!Array.isArray(script?.scenes)) throw new Error("请先生成并确认脚本");
+
+      // Force a pause immediately after the image stage. This action only fills
+      // missing/failed images and never starts TTS or video rendering.
+      const repairTask = {
+        ...task,
+        current_step: 3,
+        pause_mode: "every",
+        pause_points: JSON.stringify([4])
+      };
+      const result = await completePipeline({
+        app, task: repairTask, config, outputDir, script,
+        emit: taskEmitter(id), checkpoint: taskCheckpoint(id)
+      });
+      assertTaskRunActive(id, controller);
+      const missingCount = Number(result.missingImageCount || 0);
+      const reviewStage = result.partialImages ? "review_images_partial" : "review_images";
+      db.prepare("UPDATE tasks SET status='review',current_stage=?,current_step=4,pipeline_data=?,error_message='',last_checkpoint_at=? WHERE id=?")
+        .run(reviewStage, JSON.stringify(result.script), Date.now(), id);
+      const total = result.script.scenes.length;
+      const message = missingCount
+        ? `已继续处理全部缺失画面，当前完成 ${total - missingCount}/${total}，仍有 ${missingCount} 张失败`
+        : `缺失画面已全部补齐，共 ${total} 张`;
+      mainWindow?.webContents.send("task:event", { taskId: id, status: "review", step: 4, message });
+      return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
+    });
+  } catch (error) {
+    taskFailure(id, error);
+    throw error;
+  } finally {
+    finishTaskRun(id, controller);
   }
 });
 
 ipcMain.handle("tasks:regenerateScene", async (_event, id, sceneIndex, kind) => {
-  const { task, config, outputDir } = beginTaskRun(id, { keepStep: true });
-  const script = JSON.parse(task.pipeline_data || "{}");
+  const { task, config, outputDir, controller } = beginTaskRun(id, { keepStep: true });
   try {
-    const updated = await regenerateScene({
-      app, task, config, outputDir,
-      script, sceneIndex, kind, emit: taskEmitter(id)
+    return await runWithCancellation(controller.signal, async () => {
+      const script = JSON.parse(task.pipeline_data || "{}");
+      const updated = await regenerateScene({
+        app, task, config, outputDir,
+        script, sceneIndex, kind, emit: taskEmitter(id)
+      });
+      assertTaskRunActive(id, controller);
+      db.prepare("UPDATE tasks SET pipeline_data=?,status='review',current_stage='review',error_message='',last_checkpoint_at=? WHERE id=?")
+        .run(JSON.stringify(updated), Date.now(), id);
+      mainWindow?.webContents.send("task:event", {
+        taskId: id,
+        status: "review",
+        step: kind === "image" ? 4 : 5,
+        message: kind === "image" ? `第 ${sceneIndex} 镜画面重新生成完成` : `第 ${sceneIndex} 镜配音重新生成完成`
+      });
+      return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
     });
-    db.prepare("UPDATE tasks SET pipeline_data=?,status='review',current_stage='review',error_message='',last_checkpoint_at=? WHERE id=?")
-      .run(JSON.stringify(updated), Date.now(), id);
-    mainWindow?.webContents.send("task:event", {
-      taskId: id,
-      status: "review",
-      step: kind === "image" ? 4 : 5,
-      message: kind === "image" ? `第 ${sceneIndex} 镜画面重新生成完成` : `第 ${sceneIndex} 镜配音重新生成完成`
-    });
-    return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
   } catch (error) {
     taskFailure(id, error);
     throw error;
+  } finally {
+    finishTaskRun(id, controller);
   }
 });
 
 ipcMain.handle("tasks:render", async (_event, id, options = {}) => {
-  const { task, config, outputDir } = beginTaskRun(id, { keepStep: true });
-  const script = JSON.parse(task.pipeline_data || "{}");
+  const { task, config, outputDir, controller } = beginTaskRun(id, { keepStep: true });
   try {
-    const result = await renderPrepared({ app, task, config, outputDir, script, emit: taskEmitter(id), options });
-    db.prepare("UPDATE tasks SET status='completed',current_stage='completed',current_step=8,video_path=?,draft_dir=?,cover_path=?,pipeline_data=?,completed_at=datetime('now','localtime'),last_checkpoint_at=? WHERE id=?")
-      .run(result.finalVideo, result.draftDir, result.coverPath || "", JSON.stringify(result.script), Date.now(), id);
-    return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
+    return await runWithCancellation(controller.signal, async () => {
+      const script = JSON.parse(task.pipeline_data || "{}");
+      const result = await renderPrepared({ app, task, config, outputDir, script, emit: taskEmitter(id), options });
+      assertTaskRunActive(id, controller);
+      db.prepare("UPDATE tasks SET status='completed',current_stage='completed',current_step=8,video_path=?,draft_dir=?,cover_path=?,pipeline_data=?,completed_at=datetime('now','localtime'),last_checkpoint_at=? WHERE id=?")
+        .run(result.finalVideo, result.draftDir, result.coverPath || "", JSON.stringify(result.script), Date.now(), id);
+      return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
+    });
   } catch (error) {
     taskFailure(id, error);
     throw error;
+  } finally {
+    finishTaskRun(id, controller);
   }
 });
 
 ipcMain.handle("tasks:run", async (_event, id) => {
-  const { task, config } = beginTaskRun(id);
+  const { task, config, controller } = beginTaskRun(id);
   try {
-    const result = await runPipeline({
-      app,
-      task,
-      config,
-      baseOutputDir: path.join(app.getPath("documents"), "Storybound"),
-      emit: taskEmitter(id),
-      checkpoint: taskCheckpoint(id)
-    });
-    if (result.paused) {
-      db.prepare("UPDATE tasks SET status='review',current_stage=?,current_step=?,output_dir=?,pipeline_data=?,last_checkpoint_at=? WHERE id=?")
-        .run(result.pauseStep === 5 ? "review_audio" : "review_images", result.pauseStep || 4, result.outputDir, JSON.stringify(result.script), Date.now(), id);
-      const message = result.pauseStep === 5 ? "配音已生成，请试听后继续" : "图片已生成，请检查画廊后继续";
+    return await runWithCancellation(controller.signal, async () => {
+      const result = await runPipeline({
+        app,
+        task,
+        config,
+        baseOutputDir: path.join(app.getPath("documents"), "Storybound"),
+        emit: taskEmitter(id),
+        checkpoint: taskCheckpoint(id)
+      });
+      assertTaskRunActive(id, controller);
+      if (result.paused) {
+        const reviewStage = result.partialImages
+          ? "review_images_partial"
+          : (result.pauseStep === 5 ? "review_audio" : "review_images");
+        db.prepare("UPDATE tasks SET status='review',current_stage=?,current_step=?,output_dir=?,pipeline_data=?,last_checkpoint_at=? WHERE id=?")
+          .run(reviewStage, result.pauseStep || 4, result.outputDir, JSON.stringify(result.script), Date.now(), id);
+        const message = result.partialImages
+          ? `图片已完成 ${result.script.scenes.length - Number(result.missingImageCount || 0)}/${result.script.scenes.length}，仍有 ${Number(result.missingImageCount || 0)} 张需要补齐`
+          : (result.pauseStep === 5 ? "配音已生成，请试听后继续" : "图片已生成，请检查画廊后继续");
+        mainWindow?.webContents.send("task:event", {
+          taskId: id, status: "review", step: result.pauseStep || 4, message
+        });
+        return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
+      }
+      db.prepare(`UPDATE tasks SET status='completed',current_stage='completed',current_step=8,output_dir=?,video_path=?,draft_dir=?,cover_path=?,
+        pipeline_data=?,queue_order=0,queue_batch_id='',completed_at=datetime('now','localtime'),last_checkpoint_at=? WHERE id=?`)
+        .run(result.outputDir, result.finalVideo, result.draftDir, result.coverPath || "", JSON.stringify(result.script), Date.now(), id);
       mainWindow?.webContents.send("task:event", {
-        taskId: id, status: "review", step: result.pauseStep || 4, message
+        taskId: id, status: "completed", step: 8, message: `视频已生成：${result.finalVideo}`
       });
       return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
-    }
-    db.prepare(`UPDATE tasks SET status='completed',current_stage='completed',current_step=8,output_dir=?,video_path=?,draft_dir=?,cover_path=?,
-      pipeline_data=?,queue_order=0,queue_batch_id='',completed_at=datetime('now','localtime'),last_checkpoint_at=? WHERE id=?`)
-      .run(result.outputDir, result.finalVideo, result.draftDir, result.coverPath || "", JSON.stringify(result.script), Date.now(), id);
-    mainWindow?.webContents.send("task:event", {
-      taskId: id, status: "completed", step: 8, message: `视频已生成：${result.finalVideo}`
     });
-    return db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
   } catch (error) {
     taskFailure(id, error);
     throw error;
+  } finally {
+    finishTaskRun(id, controller);
   }
 });
 
 async function runQueuedTask(id) {
-  const { task, config } = beginTaskRun(id);
+  const { task, config, controller } = beginTaskRun(id);
   task.pause_mode = "none";
   try {
-    const result = await runPipeline({
-      app,
-      task,
-      config,
-      baseOutputDir: path.join(app.getPath("documents"), "Storybound"),
-      emit: taskEmitter(id),
-      checkpoint: taskCheckpoint(id)
+    await runWithCancellation(controller.signal, async () => {
+      const result = await runPipeline({
+        app,
+        task,
+        config,
+        baseOutputDir: path.join(app.getPath("documents"), "Storybound"),
+        emit: taskEmitter(id),
+        checkpoint: taskCheckpoint(id)
+      });
+      assertTaskRunActive(id, controller);
+      db.prepare(`UPDATE tasks SET status='completed',current_stage='completed',current_step=8,output_dir=?,video_path=?,draft_dir=?,cover_path=?,
+        pipeline_data=?,queue_order=0,queue_batch_id='',completed_at=datetime('now','localtime'),last_checkpoint_at=? WHERE id=?`)
+        .run(result.outputDir, result.finalVideo, result.draftDir, result.coverPath || "", JSON.stringify(result.script), Date.now(), id);
     });
-    db.prepare(`UPDATE tasks SET status='completed',current_stage='completed',current_step=8,output_dir=?,video_path=?,draft_dir=?,cover_path=?,
-      pipeline_data=?,queue_order=0,queue_batch_id='',completed_at=datetime('now','localtime'),last_checkpoint_at=? WHERE id=?`)
-      .run(result.outputDir, result.finalVideo, result.draftDir, result.coverPath || "", JSON.stringify(result.script), Date.now(), id);
   } catch (error) {
-    if (String(error?.message || error).includes("取消")) {
-      db.prepare("UPDATE tasks SET status='cancelled',current_stage='cancelled',error_message='任务已取消',last_heartbeat_at=?,queue_order=0,queue_batch_id='' WHERE id=?")
-        .run(Date.now(), id);
-    } else {
-      taskFailure(id, error);
-    }
+    taskFailure(id, error);
+  } finally {
+    finishTaskRun(id, controller);
   }
 }
 
