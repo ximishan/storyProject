@@ -59,6 +59,13 @@ function isTransientError(error) {
   return /timeout|timed out|ECONNRESET|ECONNREFUSED|ENETUNREACH|EAI_AGAIN|socket|network|fetch failed|429|408|502|503|504|temporar|连接|超时|网络|限流|繁忙/i.test(message);
 }
 
+// 永久性错误：重试也没用，必须人工处理（如充值、换密钥）。除此之外都应重试。
+function isPermanentError(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  return /insufficient balance|insufficient_quota|balance|余额不足|余额不够|欠费|账户余额|please top up|top up|充值|account.*suspend|invalid api key|api key|unauthorized|认证失败|密钥/i.test(message);
+}
+
+
 async function retryOperation(operation, {
   attempts = 3,
   initialDelayMs = 1200,
@@ -90,5 +97,6 @@ module.exports = {
   fingerprint,
   fileLooksUsable,
   retryOperation,
-  isTransientError
+  isTransientError,
+  isPermanentError
 };

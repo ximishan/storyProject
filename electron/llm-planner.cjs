@@ -884,37 +884,45 @@ const SEMI_AUTO_SCENE_GROUP_PROMPT = `你是专业的短视频分镜导演。当
 4. 未明确指定数量时，根据整体时长和自然语义决定分镜数，整体尽量接近每分钟 5 镜。
 5. 用户明确指定分镜数时，groups 数量必须严格等于指定数量。`;
 
-const SCENE_PLAN_PROMPT = `你是专业的短视频分镜导演。请直接根据完整旁白的叙事推进、时间变化、地点变化、人物动作和情绪转折来划分镜头，不要机械按字数截断。
+const SCENE_PLAN_PROMPT = `你是专业的短视频分镜导演。你的任务是把完整旁白切分成连续的分镜，每个分镜对应一个清晰、独立、可成画的画面。
 
-核心节奏标准：
-- 整体控制在每分钟约 5 个分镜，也就是每个镜头通常承载约 10～14 秒旁白。
-- 默认语速下，每镜通常约 40～55 个中文字符；中文标点计入字符数，空格和换行不计。
-- “每分钟约 5 镜”是整体节奏目标，字数只用于辅助判断，不能机械每到固定字数就截断。
-- 短句如果与前后处于同一时间、地点、人物动作或情绪，应主动合并，不能单独切成只有十几二十字的碎片镜头。
-- 只有发生明确的时间跳转、地点切换、主体改变、关键动作或强情绪转折时，才允许提前切镜。
-- 不要为了满足预估镜头数破坏完整语义；也不要把两个明显不同的画面硬塞进同一镜头。
+# 最高原则：语义完整永远优先于字数
+- 绝对不能机械按字数截断。宁可某一镜略长或略短，也不要为了凑字数破坏一句话的完整含义。
+- 每一镜必须是一个语义自洽的画面单元：同一时间、同一地点、同一主体动作或同一情绪，应归为一镜。
+- 只有发生明确的转换时才切镜：时间跳转、地点切换、主体改变、关键动作发生、情绪转折、视角切换。
 
-只返回合法 JSON，不要输出 Markdown。JSON 结构：
+# 节奏目标（用于把控总量，不是硬性字数）
+- 整体节奏约为每分钟 5 个分镜，按口播时长换算，而不是按字数硬切。
+- 默认语速下每镜通常承载约 10 到 14 秒口播，大约 45 到 65 个中文字符，但这只是参考，语义需要时可以适当超出或缩短。
+- 不要生成只有十几个字的碎片镜头，也不要把两个明显不同的画面强行塞进同一镜。
+
+# 切分判断标准（按优先级从高到低）
+1. 在句号、问号、感叹号、分号后的完整语义处优先切分。
+2. 在明确的时间状语（如"三年后""那天夜里"）、地点转换、人物登场处切分。
+3. 在动作或情绪发生明显转折处切分。
+4. 避免在人名、数字单位、固定短语、主谓宾结构、转折或因果关系中间切断。
+
+# 输出格式
+只返回合法 JSON，不要输出 Markdown，不要解释。JSON 结构：
 {
   "scenes": [
     {"index": 1, "narration": "本镜完整旁白"}
   ]
 }
 
-硬规则：
-1. narration 必须从原旁白按原顺序连续切分，完整覆盖原文，不得改写、漏字、添字、重复或改变标点。
-2. 优先在句号、问号、感叹号、分号、破折号后的完整语义处，或明确的时间/地点/动作转换处切镜。
-3. 不得从姓名、日期、数字单位、固定短语、主谓宾结构、转折关系或因果关系中间切断。
-4. 未明确指定数量时，由你根据完整旁白预计时长和自然语义决定数量，整体尽量接近每分钟 5 镜。
-5. 除首尾镜头或真正独立的强转场外，非末尾镜头通常不得少于约 32 个中文字符。
-6. 不要返回 visual、desc_prompt、caption_segments 等其他字段。`;
+# 硬性约束
+1. narration 必须从原旁白按原顺序连续切分，完整覆盖原文，不得改写、漏字、添字、重复或改动标点。
+2. 把所有镜头的 narration 按顺序拼接，必须与原旁白逐字完全一致。
+3. 没有指定固定镜头数时，由你根据完整旁白的语义和预计时长决定数量，整体尽量接近每分钟 5 镜。
+4. 不要返回 visual、desc_prompt、caption_segments 等其他字段。`;
+
 
 const SCENE_BATCH_SIZE = 5;
 const TARGET_SCENES_PER_MINUTE = 5;
 const BASE_CHINESE_CHARS_PER_MINUTE = 230;
-const AUTO_SCENE_TARGET_MIN_CHARS = 40;
-const AUTO_SCENE_TARGET_MAX_CHARS = 55;
-const AUTO_SCENE_TARGET_CHARS = 46;
+const AUTO_SCENE_TARGET_MIN_CHARS = 45;
+const AUTO_SCENE_TARGET_MAX_CHARS = 65;
+const AUTO_SCENE_TARGET_CHARS = 55;
 
 function countSceneCharacters(text) {
   // 中文标点保留并计数，只忽略空格、制表符和换行。
@@ -1404,40 +1412,35 @@ function validateSceneNarrationAssignments(payload, task, narration, requestedCo
 }
 
 function validateSceneAssignmentDensity(assignments, task, narration, requestedCount = 0) {
-  // 自动数量模式按“每分钟约 5 镜”校验整体节奏，同时拦截十几二十字的碎片镜头。
+  // 手动指定分镜数或双人播客时，跳过密度校验，完全按指定方式切分。
   if (Number(requestedCount) || task.task_type === "podcast") return assignments;
   const lengths = assignments.map(item => countSceneCharacters(item.narration));
   const nonFinal = lengths.slice(0, -1);
-  const tooShort = nonFinal.filter(length => length < 32);
-  const tooLong = lengths.filter(length => length > 72);
-  const outsidePreferred = lengths.filter(length => length < 38 || length > 60);
-  const totalCharacters = lengths.reduce((sum, length) => sum + length, 0);
-  const average = totalCharacters / Math.max(1, lengths.length);
+  const tooShort = nonFinal.filter(length => length < 18);
+  const tooLong = lengths.filter(length => length > 95);
   const durationSeconds = estimateNarrationDurationSeconds(narration, task.tts_speed);
   const estimatedCount = inferAutoSceneCount(narration, task.tts_speed);
-  const tolerance = Math.max(2, Math.ceil(estimatedCount * 0.2));
+  const tolerance = Math.max(3, Math.ceil(estimatedCount * 0.4));
   const scenesPerMinute = durationSeconds > 0 ? assignments.length / (durationSeconds / 60) : TARGET_SCENES_PER_MINUTE;
 
-  if (tooShort.length) {
-    throw new Error(`分镜过于碎片化：存在 ${tooShort.length} 个非末尾镜头少于 32 字，请与前后同场景内容合并`);
+  // 只在出现大量碎片镜头时才报错，允许个别短句按语义独立成镜。
+  if (tooShort.length > Math.ceil(assignments.length * 0.35)) {
+    throw new Error(`分镜过于碎片化：存在 ${tooShort.length} 个过短镜头，请与前后同场景内容合并`);
   }
-  if (tooLong.length) {
-    throw new Error(`分镜过长：存在 ${tooLong.length} 个镜头超过 72 字，请在自然语义或画面转折处切分`);
-  }
-  if (outsidePreferred.length > Math.max(2, Math.floor(assignments.length * 0.3))) {
-    throw new Error(`分镜时长分布不稳定：${outsidePreferred.length}/${assignments.length} 个镜头不在约 38～60 字范围`);
-  }
-  if (assignments.length > 2 && (average < 38 || average > 60)) {
-    throw new Error(`分镜平均长度不合理：当前平均 ${average.toFixed(1)} 字，应让整体接近每分钟 5 镜`);
-  }
+  // 允许镜头按语义保持完整，只拦截明显过长、需要在画面转折处切分的镜头。
+  // if (tooLong.length) {
+  //   throw new Error(`分镜过长：存在 ${tooLong.length} 个镜头超过 95 字，请在自然语义或画面转折处切分`);
+  // }
+  // 保留"每分钟约 5 镜"的总量目标，但放宽容差，避免逼模型凑字数。
   if (estimatedCount >= 4 && Math.abs(assignments.length - estimatedCount) > tolerance) {
-    throw new Error(`分镜数量偏离预计时长过多：约 ${Math.round(durationSeconds)} 秒旁白预计 ${estimatedCount} 镜，实际 ${assignments.length} 镜`);
+    throw new Error(`分镜数量偏离预期过多：约 ${Math.round(durationSeconds)} 秒预估 ${estimatedCount} 镜，实际 ${assignments.length} 镜`);
   }
-  if (durationSeconds >= 45 && (scenesPerMinute < 3.8 || scenesPerMinute > 6.2)) {
+  if (durationSeconds >= 45 && (scenesPerMinute < 3 || scenesPerMinute > 7)) {
     throw new Error(`分镜节奏不合理：当前约每分钟 ${scenesPerMinute.toFixed(1)} 镜，目标约每分钟 5 镜`);
   }
   return assignments;
 }
+
 
 async function resolveSceneNarrationAssignments({ config, task, content, debugDir, modelIdentity }) {
   if (task.task_type === "podcast") return buildSceneNarrationAssignments(task, content.narration);

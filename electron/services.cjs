@@ -1137,7 +1137,7 @@ async function generateApiMartImage({ config, prompt, styleConfig = null, destin
       n: 1,
       size: ratio || section.ratio || "9:16",
       resolution: section.resolution || "1k",
-      official_fallback: Boolean(section.official_fallback)
+      official_fallback: false // 砍掉官方兜底，永不触发，避免高额费用
     };
     if (references.length) body.image_urls = references.slice(0, 16).map(imageFileDataUri);
     writeImageStyleAudit(destination, {

@@ -1107,3 +1107,15 @@ select, .form-grid input, .create-options input { height:39px; padding:0 11px; c
   .voice-picker-toolbar span { display:none; }
   .selected-voice-card { min-width:0; width:100%; }
 }
+.publish-edit-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin:12px 0; }
+.publish-edit-grid label, .publish-edit-block { display:grid; gap:6px; color:#8e94a1; font-size:10px; }
+.publish-edit-block { margin:10px 0; }
+.publish-edit-grid input, .publish-edit-block textarea {
+  width:100%; padding:9px 11px; border:1px solid #303541; border-radius:8px;
+  background:#0b0d12; color:#e8ebf1; outline:none; font-size:12px;
+}
+.publish-edit-block textarea { min-height:60px; resize:vertical; line-height:1.6; }
+.publish-result-head button {
+  display:flex; align-items:center; gap:6px; padding:6px 12px;
+  border:1px solid #4b426b; border-radius:7px; background:#1c1928; color:#b9a9ef; cursor:pointer;
+}

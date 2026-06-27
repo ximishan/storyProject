@@ -290,6 +290,16 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
   const save = () => pipeline
     ? run("保存脚本", () => window.storybound.updatePipeline(task.id, pipeline))
     : Promise.resolve();
+  const updatePublish = (patch: Partial<PipelineData>) => setPipeline(current => current ? { ...current, ...patch } : current);
+  const updateSubtitleLine = (lineIndex: number, value: string) => setPipeline(current => {
+    if (!current) return current;
+    const subtitle = [...(current.subtitle || [])];
+    subtitle[lineIndex] = value;
+    return { ...current, subtitle };
+  });
+  const savePublish = () => pipeline
+    ? run("保存发布信息", () => window.storybound.updatePipeline(task.id, pipeline))
+    : Promise.resolve();
   const updateScene = (index: number, patch: Partial<PipelineScene>) => setPipeline(current => {
     if (!current) return current;
     let invalidatesAudio = false;
@@ -391,14 +401,38 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
         {task.cover_path && <button onClick={() => window.storybound.openPath(task.cover_path!)}><Image size={16} />查看封面海报</button>}
       </div>
       {pipeline && <div className="publish-result-card">
-        <div className="publish-result-head"><div><FileText size={16} /><b>发布文案结果</b></div><span>已按赛道提示词生成</span></div>
-        <div className="publish-result-grid">
-          <div><small>主标题</small><b>{pipeline.title || "未生成"}</b></div>
-          <div><small>副标题</small><b>{pipeline.subtitle?.length ? pipeline.subtitle.join(" / ") : "未生成"}</b></div>
+        <div className="publish-result-head">
+          <div><FileText size={16} /><b>发布文案结果</b></div>
+          <button disabled={Boolean(busy)} onClick={savePublish}><Save size={14} /> 保存发布信息</button>
         </div>
-        <p><b>视频简介：</b>{pipeline.summary || "未生成"}</p>
-        {pipeline.tags?.length ? <p><b>发布标签：</b>{pipeline.tags.join(" ")}</p> : null}
-        {pipeline.comments?.length ? <div className="publish-comments"><b>种子评论：</b>{pipeline.comments.map((item, index) => <span key={`${index}-${item}`}>{index + 1}. {item}</span>)}</div> : null}
+        <div className="publish-edit-grid">
+          <label><small>主标题</small>
+            <input value={pipeline.title || ""} onChange={e => updatePublish({ title: e.target.value })} placeholder="主标题" />
+          </label>
+          <label><small>副标题第一句</small>
+            <input value={pipeline.subtitle?.[0] || ""} onChange={e => updateSubtitleLine(0, e.target.value)} placeholder="副标题第一句" />
+          </label>
+          <label><small>副标题第二句</small>
+            <input value={pipeline.subtitle?.[1] || ""} onChange={e => updateSubtitleLine(1, e.target.value)} placeholder="副标题第二句" />
+          </label>
+        </div>
+        <label className="publish-edit-block"><small>视频简介</small>
+          <textarea value={pipeline.summary || ""} onChange={e => updatePublish({ summary: e.target.value })} placeholder="视频简介" />
+        </label>
+        <label className="publish-edit-block"><small>发布标签（用空格分隔）</small>
+          <textarea
+            value={(pipeline.tags || []).join(" ")}
+            onChange={e => updatePublish({ tags: e.target.value.split(/\s+/).map(t => t.trim()).filter(Boolean) })}
+            placeholder="#标签1 #标签2"
+          />
+        </label>
+        <label className="publish-edit-block"><small>种子评论（每行一条）</small>
+          <textarea
+            value={(pipeline.comments || []).join("\n")}
+            onChange={e => updatePublish({ comments: e.target.value.split(/\r?\n/).map(c => c.trim()).filter(Boolean) })}
+            placeholder="每行一条评论"
+          />
+        </label>
       </div>}
       {pipeline?.metadata && <div className="planner-metadata">
         <div className="planner-metadata-head"><div><Sparkles size={16} /><b>大模型视觉规划结果</b></div><span>{pipeline.metadata.planner_mode === "staged-llm" ? "三阶段规划" : "本地规则"}</span></div>
@@ -649,7 +683,7 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
   const [speaker, setSpeaker] = useState(DEFAULT_VOLC_VOICE_ID);
   const [voicePickerOpen, setVoicePickerOpen] = useState(false);
   const [volcPreviewConfigured, setVolcPreviewConfigured] = useState(false);
-  const [ttsProvider, setTtsProvider] = useState("system");
+const [ttsProvider, setTtsProvider] = useState<"system" | "volcengine">("system");
   const [systemVoices, setSystemVoices] = useState<SystemVoice[]>([]);
   const [taskType, setTaskType] = useState("story");
   const [podcastImageMode, setPodcastImageMode] = useState("multi");
@@ -1224,7 +1258,6 @@ function ImageSettings({ draft, setDraft }: { draft: AppConfig; setDraft: (next:
           </div></label>
           <label>输出分辨率<select value={draft.apimart.resolution || "1k"} onChange={e => updateApimart({ resolution: e.target.value })}><option value="1k">1K</option><option value="2k">2K</option><option value="4k">4K</option></select></label>
           <label>代理地址（可选）<input value={draft.apimart.proxy_url} onChange={e => updateApimart({ proxy_url: e.target.value })} placeholder="http://127.0.0.1:7890" /></label>
-          <label className="check-label"><input type="checkbox" checked={Boolean(draft.apimart.official_fallback)} onChange={e => updateApimart({ official_fallback: e.target.checked })} />启用官方渠道兜底</label>
           <label className="check-label"><input type="checkbox" checked={draft.apimart.policy_fallback !== false} onChange={e => updateApimart({ policy_fallback: e.target.checked })} />审核拒绝后自动改写并重试</label>
         </div>
       </>}
