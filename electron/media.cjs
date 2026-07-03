@@ -41,7 +41,12 @@ function stripCaptionDisplayPunctuation(text) {
   return String(text || "")
     // 姓名中的间隔点属于正文，例如“诺尔曼·白求恩”，不能按普通标点删除。
     .replace(/·/gu, "\uE000")
+    // 数字内部的小数点/千位分隔符属于数值正文，例如“2.1”“5.8w”“1,200”。
+    .replace(/(?<=\d)\.(?=\d)/gu, "\uE001")
+    .replace(/(?<=\d),(?=\d)/gu, "\uE002")
     .replace(/\p{P}+/gu, "")
+    .replace(/\uE001/gu, ".")
+    .replace(/\uE002/gu, ",")
     .replace(/\uE000/gu, "·")
     .replace(/\s+/g, "")
     .trim();
@@ -261,12 +266,8 @@ function splitCaptionChunks(text, maxCharsPerLine = 14, maxLines = 1) {
       current += piece;
     }
 
-    // 句号、问号、感叹号和分号属于明确语义边界，不再与下一句拼成同一字幕。
-    if (strongBoundary && current) {
-      pushChunk(current);
-      current = "";
-    } else if (delimiter && current.length >= lineChars) {
-      // 较长分句在逗号处直接切成下一条字幕，避免单条字幕被挤成三行。
+    // 每个标点都作为字幕分隔符；数字内部的小数点/千位分隔符已在上游保护。
+    if (delimiter && current) {
       pushChunk(current);
       current = "";
     }

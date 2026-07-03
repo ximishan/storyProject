@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell, dialog, clipboard } = require("electron");
+const { app, BrowserWindow, Menu, ipcMain, shell, dialog, clipboard } = require("electron");
 const path = require("node:path");
 const fs = require("node:fs");
 const { openDatabase, createTask } = require("./database.cjs");
@@ -177,12 +177,14 @@ function createWindow() {
     minHeight: 720,
     backgroundColor: "#090b10",
     title: "Storybound",
+    autoHideMenuBar: true,
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
       nodeIntegration: false
     }
   });
+  Menu.setApplicationMenu(null);
   mainWindow.webContents.on("console-message", details => {
     const { level = "info", message = "", lineNumber = 0, sourceId = "renderer" } = details || {};
     log(`console level=${level} ${message} (${sourceId}:${lineNumber})`);
@@ -320,7 +322,62 @@ ipcMain.handle("tasks:duplicate", (_event, id) => {
     researchWeb: Boolean(task.research_web), researchAi: Boolean(task.research_ai), researchIma: Boolean(task.research_ima)
   });
 });
+
+function assertNoMojibakeQuestionRuns(pipeline) {
+  const fields = ["narration", "visual", "desc_prompt", "image_prompt", "image_error", "audio_error", "video_error"];
+  const problems = [];
+  for (const scene of pipeline?.scenes || []) {
+    for (const field of fields) {
+      const value = String(scene?.[field] || "");
+      if (/\?{5,}/.test(value)) problems.push(`镜头 ${scene.index || "?"} ${field}`);
+    }
+  }
+  if (problems.length) {
+    throw new Error(`检测到疑似中文编码损坏的问号串，已阻止保存：${problems.slice(0, 5).join("、")}`);
+  }
+}
+
+function isUsableLocalFile(filePath, minBytes = 512) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return false;
+    const stat = fs.statSync(filePath);
+    return stat.isFile() && stat.size >= minBytes;
+  } catch {
+    return false;
+  }
+}
+
+function normalizePipelineLocalAssets(pipeline) {
+  if (!Array.isArray(pipeline?.scenes)) return pipeline;
+  for (const scene of pipeline.scenes) {
+    if (scene?.image_path) {
+      if (isUsableLocalFile(scene.image_path)) {
+        scene.image_status = "completed";
+        scene.image_error = "";
+        if (!scene.image_provider) scene.image_provider = "custom-local";
+      } else {
+        scene.image_path = "";
+        scene.image_status = "pending";
+        scene.image_error = "本地图片文件不存在或不可用";
+      }
+    }
+    if (scene?.audio_path) {
+      if (isUsableLocalFile(scene.audio_path)) {
+        scene.audio_status = "completed";
+        scene.audio_error = "";
+      } else {
+        scene.audio_path = "";
+        scene.audio_status = "pending";
+        scene.audio_error = "本地配音文件不存在或不可用";
+      }
+    }
+  }
+  return pipeline;
+}
+
 ipcMain.handle("tasks:updatePipeline", (_event, id, pipeline) => {
+  pipeline = normalizePipelineLocalAssets(pipeline);
+  assertNoMojibakeQuestionRuns(pipeline);
   const runtime = pipeline?.runtime || {};
   db.prepare("UPDATE tasks SET pipeline_data=?,current_stage=?,current_step=?,last_checkpoint_at=? WHERE id=?")
     .run(JSON.stringify(pipeline), runtime.current_stage || "review", Number(runtime.current_step || 3), Date.now(), id);

@@ -33,10 +33,6 @@ const nav = [
   { page: "create" as Page, label: "开始创作", icon: WandSparkles },
   { page: "tasks" as Page, label: "任务队列", icon: LayoutList },
   { page: "history" as Page, label: "历史任务", icon: History },
-  { page: "playground" as Page, label: "画图实验室", icon: Image },
-  { page: "voice" as Page, label: "配音实验室", icon: Mic2 },
-  { page: "music" as Page, label: "音乐 MV", icon: Music },
-  { page: "tests" as Page, label: "功能测试", icon: CheckCircle2 },
   { page: "templates" as Page, label: "提示词模板", icon: FileText },
   { page: "styles" as Page, label: "视觉风格", icon: Palette },
   { page: "drafts" as Page, label: "草稿模板", icon: LayoutTemplate }
@@ -73,6 +69,7 @@ const STYLE_PREVIEW_ASSETS: Record<string, string> = {
 
 export default function App() {
   const [page, setPage] = useState<Page>("tasks");
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>("llm");
   const [tasks, setTasks] = useState<TaskRecord[]>([]);
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [notice, setNotice] = useState("");
@@ -102,7 +99,7 @@ export default function App() {
           <button className={page === "settings" ? "active" : ""} onClick={() => setPage("settings")}>
           <Settings size={18} /><span>设置</span>
         </button>
-        <button><CircleHelp size={18} /><span>使用帮助</span></button>
+        <button onClick={() => { setSettingsTab("diagnostics"); setPage("settings"); }}><CircleHelp size={18} /><span>使用帮助</span></button>
         <div className="version">Storybound Rebuild · v{packageInfo.version}</div>
       </div>
       </aside>
@@ -120,7 +117,7 @@ export default function App() {
         onManageTemplates={() => setPage("drafts")}
         onManageStyles={() => setPage("styles")}
       />}
-      {page === "settings" && config && <SettingsPage config={config} onSave={async next => {
+      {page === "settings" && config && <SettingsPage config={config} initialTab={settingsTab} onSave={async next => {
         setConfig(await window.storybound.saveConfig(next));
         setNotice("设置已保存");
       }} />}
@@ -355,9 +352,7 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
       } : current.runtime
     };
   });
-  const missingImageScenes = pipeline?.scenes?.filter(scene =>
-    !scene.image_path || ["pending", "failed", "interrupted"].includes(String(scene.image_status || ""))
-  ) || [];
+  const missingImageScenes = pipeline?.scenes?.filter(scene => !scene.image_path) || [];
   const missingImageCount = missingImageScenes.length;
   const completedImageCount = Math.max(0, Number(pipeline?.scenes?.length || 0) - missingImageCount);
   const hasAssets = Boolean(pipeline?.scenes?.length && pipeline.scenes.every(scene => scene.image_path && scene.audio_path));
@@ -502,7 +497,7 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
             {scene.subject_presence && <em>主体：{scene.subject_presence}</em>}
           </div>
           <div className="scene-assets">
-            <span className={scene.image_path ? "ready" : ""}>画面 {scene.image_path ? "已生成" : "未生成"}{scene.image_status ? ` · ${assetStatusText(scene.image_status)}` : ""}</span>
+            <span className={scene.image_path ? "ready" : ""}>画面 {scene.image_path ? "已就绪" : "未生成"}{!scene.image_path && scene.image_status ? ` · ${assetStatusText(scene.image_status)}` : ""}</span>
             <span className={scene.audio_path ? "ready" : ""}>配音 {scene.audio_path ? "已生成" : "未生成"}{scene.audio_status ? ` · ${assetStatusText(scene.audio_status)}` : ""}</span>
             {scene.image_error && <span className="asset-warning" title={scene.image_error}>画面错误：{scene.image_error}</span>}
             {scene.audio_error && <span className="asset-warning" title={scene.audio_error}>配音错误：{scene.audio_error}</span>}
@@ -688,7 +683,7 @@ const [ttsProvider, setTtsProvider] = useState<"system" | "volcengine">("system"
   const [taskType, setTaskType] = useState("story");
   const [podcastImageMode, setPodcastImageMode] = useState("multi");
   const [podcastSpeakers, setPodcastSpeakers] = useState("mizai-dayi");
-  const [rewriteIntensity, setRewriteIntensity] = useState("standard");
+  const [rewriteIntensity, setRewriteIntensity] = useState("original");
   const [narrativePov, setNarrativePov] = useState("original");
   const [keepPromotion, setKeepPromotion] = useState(false);
   const [materialSource, setMaterialSource] = useState("ai");
@@ -794,7 +789,7 @@ const [ttsProvider, setTtsProvider] = useState<"system" | "volcengine">("system"
   ];
   const disabledPauseSteps: number[] = [];
   const effectivePausePoints = pausePoints.filter(step => !disabledPauseSteps.includes(step));
-  const willPauseAtScript = pauseMode === "script" || (pauseMode === "custom" && effectivePausePoints.includes(3));
+  const willPauseAtScript = normalizedProcessingMode === "semi_auto";
   const canSave = text.trim().length > 0;
   const canStart = text.trim().length >= 50;
   const wordsPerScene = targetLength > 0 && targetScenes > 0 ? Math.round(targetLength / targetScenes) : 0;
@@ -817,7 +812,7 @@ const [ttsProvider, setTtsProvider] = useState<"system" | "volcengine">("system"
       const podcastLines = cleanText.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
       const allTagged = podcastLines.length > 0 && podcastLines.every(line => /^[\[【]\s*[ABab]\s*[\]】]\s*.+/.test(line));
       if (!allTagged) {
-        onNotice("双人播客使用半自动或直接出片时，每一行都必须以 [A] 或 [B] 开头");
+        onNotice("双人播客使用半自动时，每一行都必须以 [A] 或 [B] 开头");
         return;
       }
     }
@@ -825,17 +820,7 @@ const [ttsProvider, setTtsProvider] = useState<"system" | "volcengine">("system"
     setSaving(true);
     setDraftJustSaved(false);
     try {
-      const effectivePausePointsResolved = pauseMode === "image" ? [4]
-        : pauseMode === "audio" ? [5]
-        : pauseMode === "custom" ? effectivePausePoints
-        : [];
-      const effectivePause = pauseMode === "script"
-        ? "script"
-        : pauseMode === "image" || pauseMode === "audio"
-          ? "custom"
-          : pauseMode === "custom"
-            ? (effectivePausePointsResolved.includes(3) ? "script" : effectivePausePointsResolved.length ? "custom" : "none")
-            : "none";
+      const effectivePause = normalizedProcessingMode === "semi_auto" ? "script" : "none";
       const effectiveVideoIntro = materialSource === "ai" && taskType !== "podcast"
         ? (videoIntro === -2 ? Math.max(1, customIntroCount) : videoIntro) : 0;
       const effectiveCoverMode = materialSource === "ai" ? coverImageMode : "off";
@@ -848,7 +833,7 @@ const [ttsProvider, setTtsProvider] = useState<"system" | "volcengine">("system"
         ttsSpeed, promptTemplateId,
         rewriteIntensity: normalizedProcessingMode === "auto" ? rewriteIntensity : "standard",
         narrativePov: normalizedProcessingMode === "auto" ? narrativePov : "original",
-        keepPromotion: normalizedProcessingMode === "auto" ? keepPromotion : true,
+        keepPromotion: false,
         materialSource, templateId,
         referenceImagePath: materialSource === "ai" && !productReferenceMode ? referenceImagePath : "",
         productReferenceImagePath: materialSource === "ai" && productReferenceMode ? productReferenceImagePath : "",
@@ -859,7 +844,7 @@ const [ttsProvider, setTtsProvider] = useState<"system" | "volcengine">("system"
         taskType, scriptFormat: taskType === "podcast" ? "dialogue" : "narration",
         podcastImageMode, podcastSpeakers,
         processingMode: normalizedProcessingMode,
-        pausePoints: effectivePausePointsResolved,
+        pausePoints: [],
         videoIntro: effectiveVideoIntro,
         videoIntroDuration: effectiveVideoIntro === 0 ? 0 : videoIntroDuration,
         researchWeb, researchAi, researchIma
@@ -896,32 +881,9 @@ const [ttsProvider, setTtsProvider] = useState<"system" | "volcengine">("system"
       <div><h1>创建视频任务</h1><p>粘贴一段人物故事，几分钟后在剪映里打开</p></div>
     </div>
     <div className="home-create">
-      <CreateSection title="文案" desc="改写 · 叙事视角 · 目标字数">
+      <CreateSection title="文案" desc="">
         <label className="field-title">标题 <span>可选</span><input value={title} onChange={e => setTitle(e.target.value)} placeholder="留空会从文案自动提取" /></label>
-        <div className="source-tabs">
-          <button data-active={sourceMode === "paste"} onClick={() => setSourceMode("paste")}><b>粘贴文案</b><span>已有对标文案，直接贴进来改写</span></button>
-          <button data-active={sourceMode === "research"} onClick={() => setSourceMode("research")}><b>AI 创作 <em>NEW</em></b><span>输入关键词，AI 自动搜资料并创作原稿</span></button>
-        </div>
-        {sourceMode === "research" ? <div className="research-box">
-          <label>关键词<input value={sourceQuery} onChange={e => setSourceQuery(e.target.value)} placeholder="例如：钱学森回国 / 张桂梅 / 苹果秋季发布会" /></label>
-          <div><strong>数据源 <small>至少选一个</small></strong>
-            <label className="source-check"><input type="checkbox" checked={researchWeb} onChange={e => setResearchWeb(e.target.checked)} /><span><b>全网搜索</b><small>从公开网页抓取相关文章作为参考素材</small></span></label>
-            <label className="source-check"><input type="checkbox" checked={researchAi} onChange={e => setResearchAi(e.target.checked)} /><span><b>AI 内置知识补充</b><small>允许 AI 用已有知识补全细节</small></span></label>
-            <label className="source-check muted"><input type="checkbox" disabled checked={researchIma} onChange={e => setResearchIma(e.target.checked)} /><span><b>IMA 知识库</b><small>当前未配置</small></span></label>
-          </div>
-          <label>额外要求 <span>可选</span><textarea value={sourceRequirements} onChange={e => setSourceRequirements(e.target.value)} placeholder="例如：字数控制在 500 字左右；聚焦人物的转折经历；语气偏感性" /></label>
-          <button disabled={!sourceQuery.trim() || (!researchWeb && !researchAi && !researchIma) || researching} onClick={async () => {
-            setResearching(true);
-            try {
-              const result = await window.storybound.researchSource(sourceQuery, sourceRequirements, { web: researchWeb, ai: researchAi, ima: researchIma });
-              setTitle(current => current || result.title);
-              setText(result.text);
-            } catch (error) {
-              onNotice(error instanceof Error ? error.message : String(error));
-            } finally { setResearching(false); }
-          }}>{researching ? <LoaderCircle size={15} className="spin" /> : <Search size={15} />}搜索</button>
-        </div> : <label className="script-field">文案内容<textarea value={text} onChange={e => setText(e.target.value)} placeholder="粘贴一段人物故事原始文案，AI 会自动改写为口播版、拆分分镜、配图配音。" /><small>{text.length.toLocaleString()} 字</small></label>}
-        {sourceMode === "research" && text && <label className="script-field">已生成原稿<textarea value={text} onChange={e => setText(e.target.value)} /><small>{text.length.toLocaleString()} 字</small></label>}
+        <label className="script-field">文案内容<textarea value={text} onChange={e => setText(e.target.value)} placeholder="粘贴一段人物故事原始文案，AI 会自动改写为口播版、拆分分镜、配图配音。" /><small>{text.length.toLocaleString()} 字</small></label>
         <OptionGroup title="视频形态"><Choice active={taskType === "story"} onClick={() => setTaskType("story")} title="旁白视频" desc="单人配音讲述（默认）" /><Choice active={taskType === "podcast"} onClick={() => { setTaskType("podcast"); setVideoIntro(0); }} title="双人播客" desc="两位主播一问一答聊内容" /></OptionGroup>
         {taskType === "podcast" && <div className="podcast-options">
           <OptionGroup title="配图方式"><Choice active={podcastImageMode === "multi"} onClick={() => setPodcastImageMode("multi")} title="按分镜配图" desc="每轮对话一张图" /><Choice active={podcastImageMode === "single"} onClick={() => setPodcastImageMode("single")} title="单图封面" desc="一张主题图铺满全程，最快出片" /></OptionGroup>
@@ -929,13 +891,9 @@ const [ttsProvider, setTtsProvider] = useState<"system" | "volcengine">("system"
           <p className="form-hint">播客使用专属双人音色，常规配音员与语速选项会自动隐藏。</p>
         </div>}
         <OptionGroup title="内容赛道"><div className="home-chip-grid">{tracks.map(({ id, name, desc }) => <Choice key={id} active={track === id} onClick={() => chooseTrack(id)} title={name} desc={desc} />)}</div></OptionGroup>
-        {normalizedProcessingMode === "auto" ? <>
-          <OptionGroup title="改写强度" hint="强度越高原创度越高，但与对标结构差异越大"><Choice active={rewriteIntensity === "standard"} onClick={() => setRewriteIntensity("standard")} title="标准改写" badge="推荐" /><Choice active={rewriteIntensity === "deep"} onClick={() => setRewriteIntensity("deep")} title="深度改写" /><Choice active={rewriteIntensity === "original"} onClick={() => setRewriteIntensity("original")} title="高度原创" /></OptionGroup>
-          <OptionGroup title="叙事视角" hint="切换人称可大幅提升原创度"><Choice active={narrativePov === "original"} onClick={() => setNarrativePov("original")} title="保持原文" badge="默认" /><Choice active={narrativePov === "first"} onClick={() => setNarrativePov("first")} title="第一人称" /><Choice active={narrativePov === "third"} onClick={() => setNarrativePov("third")} title="第三人称" /></OptionGroup>
-          <label className="toggle-line"><span><b>带货模式</b><small>{keepPromotion ? "改写时保留带货段落" : "改写时删除带货段落"}</small></span><input type="checkbox" checked={keepPromotion} onChange={e => setKeepPromotion(e.target.checked)} /></label>
-          <div className="number-pair"><label>目标字数<input type="number" min={100} step={50} value={targetLength || ""} onChange={e => setTargetLength(Number(e.target.value))} placeholder="自动" /><small>字（±15%，留空跟随原文）</small></label><label>目标分镜数<input type="number" min={1} step={1} value={targetScenes || ""} onChange={e => setTargetScenes(Number(e.target.value))} placeholder="自动" /><small>个（留空时由大模型按自然语义分镜，整体约每分钟 5 镜、每镜约 10～14 秒；默认语速下通常约 40～55 字，标点计入、空白不计{targetScenes ? (wordsPerScene ? ` · 当前约 ${wordsPerScene} 字/镜` : "") : currentSceneCharacters ? ` · 当前输入预计 ${autoSceneEstimate} 张` : ""}）</small></label></div>
-        </> : <div className="mode-note">{normalizedProcessingMode === "semi_auto" ? "半自动：完全锁定输入原文，Claude 只组合连续原文编号做分镜，不返回也不修改文字。" : "直接出片：跳过 AI 改写，按自然语义每镜约 40～50 个中文字符切分。"} 此模式下改写强度、叙事视角与带货设置已自动隐藏。</div>}
-        {taskType === "podcast" && normalizedProcessingMode !== "auto" && <div className="podcast-warning"><b>🎙️ 双人播客 + 半自动/直接出片：</b>文案需自带对话标签，每行以 <code>[A]</code>（主持人）或 <code>[B]</code>（主讲）开头；没有标签请切回“全自动”。</div>}
+        {normalizedProcessingMode === "auto" && <OptionGroup title="改写强度" hint="强度越高原创度越高，但与对标结构差异越大"><Choice active={rewriteIntensity === "standard"} onClick={() => setRewriteIntensity("standard")} title="标准改写" badge="推荐" /><Choice active={rewriteIntensity === "deep"} onClick={() => setRewriteIntensity("deep")} title="深度改写" /><Choice active={rewriteIntensity === "original"} onClick={() => setRewriteIntensity("original")} title="高度原创" /></OptionGroup>}
+        {normalizedProcessingMode === "semi_auto" && <div className="mode-note">半自动：完全锁定输入原文，Claude 只组合连续原文编号做分镜，不返回也不修改文字。</div>}
+        {taskType === "podcast" && normalizedProcessingMode !== "auto" && <div className="podcast-warning"><b>🎙️ 双人播客 + 半自动：</b>文案需自带对话标签，每行以 <code>[A]</code>（主持人）或 <code>[B]</code>（主讲）开头；没有标签请切回“全自动”。</div>}
       </CreateSection>
 
       <CreateSection title="出图" desc="素材来源 · 画面风格 · 比例 · 参考图">
@@ -983,15 +941,11 @@ const [ttsProvider, setTtsProvider] = useState<"system" | "volcengine">("system"
       </CreateSection>
 
       <div className="advanced-block">
-        <button className="advanced-trigger" onClick={() => setAdvancedOpen(!advancedOpen)}>{advancedOpen ? "▼" : "▶"} <span><b>高级选项</b><small>处理模式 · 暂停确认（默认值通常已足够）</small></span></button>
+        <button className="advanced-trigger" onClick={() => setAdvancedOpen(!advancedOpen)}>{advancedOpen ? "▼" : "▶"} <span><b>高级选项</b><small>处理模式（默认值通常已足够）</small></span></button>
         {advancedOpen && <div className="advanced-content">
-          <div className="advanced-two-column">
-            <OptionGroup title="处理模式" hint="后续提示词、生图、配音和剪映草稿都会继续执行"><Choice active={normalizedProcessingMode === "auto"} onClick={() => setProcessingMode("auto")} title="全自动" badge="推荐" /><Choice active={normalizedProcessingMode === "semi_auto"} onClick={() => setProcessingMode("semi_auto")} title="半自动" /><Choice active={normalizedProcessingMode === "direct"} onClick={() => setProcessingMode("direct")} title="直接出片" /></OptionGroup>
-            <OptionGroup title="暂停确认" hint="只保留真实可用的三个确认节点，避免误导"><Choice active={pauseMode === "none"} onClick={() => setPauseMode("none")} title="不暂停" /><Choice active={pauseMode === "script"} onClick={() => setPauseMode("script")} title="脚本与分镜确认" badge="推荐" /><Choice active={pauseMode === "image"} onClick={() => setPauseMode("image")} title="图片确认" /><Choice active={pauseMode === "audio"} onClick={() => setPauseMode("audio")} title="配音确认" /><Choice active={pauseMode === "custom"} onClick={() => setPauseMode("custom")} title="自定义" /></OptionGroup>
-          </div>
-          {pauseMode === "custom" && <div className="pause-points"><b>勾选“哪些阶段后暂停让我确认”</b>{pauseStageOptions.map(item => <label key={item.value}><input type="checkbox" checked={effectivePausePoints.includes(item.value)} onChange={e => setPausePoints(current => e.target.checked ? [...current.filter(step => step !== item.value), item.value] : current.filter(step => step !== item.value))} />Step {item.value} · {item.label}</label>)}</div>}
-          {normalizedProcessingMode !== "auto" && <div className="mode-note">{normalizedProcessingMode === "semi_auto" ? "半自动：原文逐字锁定；Claude 只组合连续原文编号确定分镜，并生成主角/产品档案和画面提示词。" : "直接出片：跳过预审和改写，按自然语义及每分钟约 5 镜的节奏自动切分。"}</div>}
-          <label>提示词模板<select value={promptTemplateId} onChange={e => setPromptTemplateId(e.target.value)}><option value="">跟随赛道默认</option><optgroup label="系统模板">{systemPromptTemplates.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</optgroup>{promptTemplates.length > 0 && <optgroup label="自定义模板">{promptTemplates.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</optgroup>}</select><small>全自动与半自动会执行文案/元数据/分镜三阶段规划；直接出片不调用大模型。</small></label>
+          <OptionGroup title="处理模式" hint="后续提示词、生图、配音和剪映草稿都会继续执行"><Choice active={normalizedProcessingMode === "auto"} onClick={() => setProcessingMode("auto")} title="全自动" badge="推荐" /><Choice active={normalizedProcessingMode === "semi_auto"} onClick={() => setProcessingMode("semi_auto")} title="半自动" /></OptionGroup>
+          {normalizedProcessingMode === "semi_auto" && <div className="mode-note">半自动：原文逐字锁定；Claude 只组合连续原文编号确定分镜，并生成主角/产品档案和画面提示词。</div>}
+          <label>提示词模板<select value={promptTemplateId} onChange={e => setPromptTemplateId(e.target.value)}><option value="">跟随赛道默认</option><optgroup label="系统模板">{systemPromptTemplates.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</optgroup>{promptTemplates.length > 0 && <optgroup label="自定义模板">{promptTemplates.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}</optgroup>}</select><small>全自动直接出片不暂停；半自动分镜完成后暂停，等待用户确认。</small></label>
         </div>}
       </div>
       <div className="create-submit-bar"><div><b>自定义 / 其他</b><small>{canStart ? "当前语言模型 · 可开始生成" : canSave ? `还需 ${Math.max(0, 50 - text.trim().length)} 字才能开始生成` : "请输入至少 50 字文案"}</small></div><button disabled={!canSave || saving} onClick={() => submit(false)}>{draftJustSaved ? <CheckCircle2 size={15} /> : <Save size={15} />}{draftJustSaved ? "已保存" : "保存为草稿"}</button><button className="primary" disabled={!canStart || saving} onClick={() => submit(true)}>{saving ? <LoaderCircle className="spin" size={17} /> : <Sparkles size={17} />}{willPauseAtScript ? "生成脚本与分镜" : "直接开始生成"} <kbd>Ctrl+Enter</kbd></button></div>
@@ -1030,9 +984,10 @@ function Choice({ active, onClick, title, desc, badge, disabled = false }: { act
   return <button type="button" className="choice-chip" data-active={active || undefined} disabled={disabled} onClick={onClick}><b>{title}</b>{badge && <em>{badge}</em>}{desc && <small>· {desc}</small>}</button>;
 }
 
-function SettingsPage({ config, onSave }: { config: AppConfig; onSave: (config: AppConfig) => void }) {
+function SettingsPage({ config, initialTab, onSave }: { config: AppConfig; initialTab: SettingsTab; onSave: (config: AppConfig) => void }) {
   const [draft, setDraft] = useState(config);
-  const [tab, setTab] = useState<SettingsTab>("llm");
+  const [tab, setTab] = useState<SettingsTab>(initialTab);
+  useEffect(() => { setTab(initialTab); }, [initialTab]);
   const setSection = <K extends keyof AppConfig>(section: K, value: AppConfig[K]) =>
     setDraft({ ...draft, [section]: value });
 

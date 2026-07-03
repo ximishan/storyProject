@@ -11,15 +11,27 @@ assert.ok(chunks.length >= 3);
 assert.ok(chunks.every(item => item.length <= 8), "单行字幕不得超过设定字数");
 assert.deepEqual(
   chunks,
-  chunks.map(item => item.replace(/\p{P}+/gu, "")),
+  chunks.map(item => item.replace(/[，。！？；：、!?;:]/gu, "").replace(/(?<!\d)[.,]|[.,](?!\d)/gu, "")),
   "成片字幕不应包含标点符号"
 );
 
 const schedule = _captionTest.captionSchedule("你好，世界！继续前进。", 4, 8, 1);
 assert.equal(schedule[0].start, 0);
 assert.equal(schedule.at(-1).end, 4);
-assert.ok(schedule.every(item => !/\p{P}/u.test(item.text)));
+assert.ok(schedule.every(item => !/[，。！？；：、!?;:]|(?<!\d)[.,]|[.,](?!\d)/u.test(item.text)));
 assert.ok(schedule.every(item => !/[\r\n]/u.test(item.text)), "每条字幕必须保持单行");
+
+assert.deepEqual(
+  _captionTest.splitCaptionChunks("他来了，我走了。", 20, 1),
+  ["他来了", "我走了"],
+  "逗号也必须作为字幕分隔符，不能因为字幕未超长就合并"
+);
+
+assert.deepEqual(
+  _captionTest.splitCaptionChunks("数据从2.1涨到5.8w，后来达到1,200个样本。", 14, 1),
+  ["数据从2.1涨到5.8w", "后来达到1,200个样本"],
+  "数字内部的小数点和千位分隔符必须保留"
+);
 
 assert.deepEqual(
   _captionTest.splitCaptionChunks("偏偏跑到中国的战场上钻破庙", 12, 1),

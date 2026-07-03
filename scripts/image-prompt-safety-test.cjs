@@ -19,4 +19,15 @@ const normalResult = buildPolicySafeImagePrompt(normal, "preflight");
 assert.strictEqual(normalResult.adjusted, false);
 assert.strictEqual(normalResult.prompt, normal);
 
+const ironLung = "1950年代美国医院病房，一排巨大金属圆筒铁肺机器整齐排列，每台机器外露出一个孩子的头部，孩子眼睛望向上方的天花板，旁边坐着衣着朴素的父母，9:16构图";
+const ironLungAnalysis = analyzeImagePromptRisk(ironLung);
+assert.strictEqual(ironLungAnalysis.risky, true);
+assert.equal(ironLungAnalysis.category, "minor-medical-restraint");
+assert.ok(ironLungAnalysis.reasons.includes("minor-medical-restraint"));
+const ironLungSafe = buildPolicySafeImagePrompt(ironLung, "preflight");
+assert.strictEqual(ironLungSafe.adjusted, true);
+assert.equal(ironLungSafe.category, "minor-medical-restraint");
+assert.doesNotMatch(ironLungSafe.prompt, /孩子[^，。；]{0,30}(?:只露出|外露|露出)[^，。；]{0,12}(?:头部|脑袋|头)/);
+assert.match(ironLungSafe.prompt, /铁肺设备/);
+
 console.log("Image prompt proactive safety rewrite test passed");

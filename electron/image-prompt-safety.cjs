@@ -9,6 +9,7 @@ const PROCEDURE_PATTERN = /正在做手术|实施手术|外科手术现场|手�
 const VIOLENCE_PATTERN = /处决|虐杀|残杀|刺杀|枪杀|砍杀|爆头|肢解|枪击过程|刀刺过程|爆炸冲击|战斗特写/i;
 const CLOSEUP_PATTERN = /极近景|微距特写|超近景|伤口特写|创口特写|细节清晰|清晰可见/i;
 const REAL_PERSON_HARM_PATTERN = /(?:白求恩|诺尔曼·白求恩|名人|真实人物|本人)[^，。；]{0,30}(?:受伤|流血|伤口|割口|死亡|尸体|手术)/i;
+const MINOR_RESTRAINT_PATTERN = /(?:孩子|儿童|小孩|幼童|病童)[\s\S]{0,80}(?:只露出|外露|露出)[\s\S]{0,24}(?:头部|脑袋|头)[\s\S]{0,80}(?:铁肺|圆筒|金属圆筒|机器|病房)|(?:铁肺|圆筒|金属圆筒|机器)[\s\S]{0,80}(?:孩子|儿童|小孩|幼童|病童)[\s\S]{0,80}(?:只露出|外露|露出)[\s\S]{0,24}(?:头部|脑袋|头)|(?:铁肺|圆筒|金属圆筒|机器)[\s\S]{0,80}(?:只露出|外露出|外露|露出)[\s\S]{0,24}(?:孩子|儿童|小孩|幼童|病童)[\s\S]{0,24}(?:头部|脑袋|头)/i;
 
 function normalizePromptText(prompt) {
   return String(prompt || "")
@@ -46,8 +47,15 @@ function analyzeImagePromptRisk(prompt) {
     score += 3;
     reasons.push("real-person-harm");
   }
+  const minorMedicalRestraint = MINOR_RESTRAINT_PATTERN.test(text);
+  if (minorMedicalRestraint) {
+    score += 3;
+    reasons.push("minor-medical-restraint");
+  }
   const category = /手术|医生|医疗|伤员|患者|感染|纱布|缝合|割口|伤口|创口/i.test(text)
     ? "medical"
+    : minorMedicalRestraint
+      ? "minor-medical-restraint"
     : /战争|战斗|枪|刀|爆炸|处决|虐杀|残杀|刺杀|枪杀/i.test(text)
       ? "violence"
       : /死亡|逝世|遗体|葬礼|墓地|追悼/i.test(text)
@@ -139,6 +147,24 @@ function lossSafePrompt(text) {
   ]);
 }
 
+function minorMedicalRestraintSafePrompt(text, level) {
+  const context = extractSceneContext(text);
+  const scene = level === "ultra"
+    ? "一间安静的1950年代医院病房，数台银灰色铁肺设备整齐排列，画面聚焦历史医疗设备、走廊光线和安静氛围，不直接呈现儿童"
+    : "一间安静的1950年代医院病房，数台银灰色铁肺设备整齐排列，白衣护士在设备间查看仪表，远处父母坐在长椅上安静守候，画面聚焦医疗设备和家属忧虑的氛围，不直接呈现儿童身体";
+  return joinPrompt([
+    context.era,
+    context.location,
+    scene,
+    context.light,
+    "中远景叙事构图",
+    "情绪克制",
+    "适合大众观看",
+    context.ratio,
+    "主体明确，构图完整，无文字无水印"
+  ]);
+}
+
 function genericSafePrompt(text) {
   const context = extractSceneContext(text);
   return joinPrompt([
@@ -183,6 +209,7 @@ function buildPolicySafeImagePrompt(prompt, level = "safe") {
 
   let safePrompt;
   if (analysis.category === "medical") safePrompt = medicalSafePrompt(analysis.text, level);
+  else if (analysis.category === "minor-medical-restraint") safePrompt = minorMedicalRestraintSafePrompt(analysis.text, level);
   else if (analysis.category === "violence") safePrompt = violenceSafePrompt(analysis.text, level);
   else if (analysis.category === "loss") safePrompt = lossSafePrompt(analysis.text);
   else safePrompt = genericSafePrompt(analysis.text);
@@ -192,6 +219,8 @@ function buildPolicySafeImagePrompt(prompt, level = "safe") {
   if (remaining.risky) {
     safePrompt = analysis.category === "medical"
       ? medicalSafePrompt("9:16竖构图", "minimal")
+      : analysis.category === "minor-medical-restraint"
+        ? minorMedicalRestraintSafePrompt("9:16竖构图", "ultra")
       : genericSafePrompt("9:16竖构图");
   }
   return {
