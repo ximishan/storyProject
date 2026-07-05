@@ -973,7 +973,7 @@ const SCENE_PLAN_PROMPT = `你是专业的短视频分镜导演。你的任务�
 4. 不要返回 visual、desc_prompt、caption_segments 等其他字段。`;
 
 
-const SCENE_BATCH_SIZE = 5;
+const SCENE_BATCH_SIZE = 8;
 const TARGET_SCENES_PER_MINUTE = 3;
 const BASE_CHINESE_CHARS_PER_MINUTE = 230;
 const AUTO_SCENE_TARGET_MIN_CHARS = 80;

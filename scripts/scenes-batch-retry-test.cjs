@@ -38,7 +38,7 @@ function sendJson(res, value) { sendModelText(res, JSON.stringify(value)); }
         const fixed = JSON.parse(user.match(/固定镜头清单：\n([\s\S]*?)\n\n强制规则：/)[1]);
         const range = [fixed[0].index, fixed[fixed.length - 1].index];
         visualRanges.push(range);
-        if (range[0] === 6 && range[1] === 10) return sendModelText(res, "BROKEN_6_10");
+        if (range[0] === 1 && range[1] === 8) return sendModelText(res, "BROKEN_1_8");
         return sendJson(res, { scenes: fixed.map(item => ({
           index: item.index, narration: item.narration, visual: `画面${item.index}`,
           desc_prompt: `提示词${item.index}`, use_reference: false,
@@ -63,8 +63,8 @@ function sendJson(res, value) { sendModelText(res, JSON.stringify(value)); }
     });
     assert.equal(result.scenes.length, 10);
     assert.ok(repairCalls >= 1, "损坏JSON应先执行一次原有模型修复");
-    assert.deepEqual(visualRanges, [[1,5],[6,10],[6,8],[9,10]], "整批失败后应只把失败批次继续拆小重试");
-    assert.ok(fs.existsSync(path.join(workDir, "llm-debug", "03-scenes-006-010-split-retry.json")));
+    assert.deepEqual(visualRanges, [[1,8],[1,4],[5,8],[9,10]], "整批失败后应只把失败批次继续拆小重试");
+    assert.ok(fs.existsSync(path.join(workDir, "llm-debug", "03-scenes-001-008-split-retry.json")));
     console.log("scene batch malformed-JSON split retry test passed");
   } finally {
     server.close();

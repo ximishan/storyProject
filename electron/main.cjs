@@ -266,7 +266,9 @@ app.on("window-all-closed", () => {
 });
 
 ipcMain.handle("tasks:list", () =>
-  db.prepare("SELECT * FROM tasks ORDER BY datetime(created_at) DESC").all().map(restoreStoredTaskPromptLayers)
+  db.prepare("SELECT * FROM tasks ORDER BY datetime(created_at) DESC").all()
+    .map(reconcileTaskPipelineLocalAssets)
+    .map(restoreStoredTaskPromptLayers)
 );
 ipcMain.handle("tasks:create", (_event, input) => createTask(db, input));
 ipcMain.handle("tasks:delete", (_event, id) => {
@@ -347,9 +349,25 @@ function isUsableLocalFile(filePath, minBytes = 512) {
   }
 }
 
-function normalizePipelineLocalAssets(pipeline) {
+function findIndexedLocalAsset(outputDir, folder, index, extensions) {
+  if (!outputDir || !index) return "";
+  for (const extension of extensions) {
+    const candidate = path.join(outputDir, folder, `${index}${extension}`);
+    if (isUsableLocalFile(candidate)) return candidate;
+  }
+  return "";
+}
+
+function normalizePipelineLocalAssets(pipeline, outputDir = "") {
   if (!Array.isArray(pipeline?.scenes)) return pipeline;
   for (const scene of pipeline.scenes) {
+    if (!scene?.image_path) {
+      const recovered = findIndexedLocalAsset(outputDir, "images", scene?.index, [".png", ".jpg", ".jpeg", ".webp"]);
+      if (recovered) {
+        scene.image_path = recovered;
+        scene.image_provider = scene.image_provider || "custom-local";
+      }
+    }
     if (scene?.image_path) {
       if (isUsableLocalFile(scene.image_path)) {
         scene.image_status = "completed";
@@ -360,6 +378,10 @@ function normalizePipelineLocalAssets(pipeline) {
         scene.image_status = "pending";
         scene.image_error = "本地图片文件不存在或不可用";
       }
+    }
+    if (!scene?.audio_path) {
+      const recovered = findIndexedLocalAsset(outputDir, "audio", scene?.index, [".mp3", ".wav", ".m4a", ".aac"]);
+      if (recovered) scene.audio_path = recovered;
     }
     if (scene?.audio_path) {
       if (isUsableLocalFile(scene.audio_path)) {
@@ -375,14 +397,43 @@ function normalizePipelineLocalAssets(pipeline) {
   return pipeline;
 }
 
+function reconcileTaskPipelineLocalAssets(task) {
+  if (!task?.pipeline_data || !task.output_dir) return task;
+  let pipeline;
+  try { pipeline = JSON.parse(task.pipeline_data); } catch { return task; }
+  const before = JSON.stringify(pipeline?.scenes?.map(scene => ({
+    index: scene.index,
+    image_path: scene.image_path || "",
+    image_status: scene.image_status || "",
+    audio_path: scene.audio_path || "",
+    audio_status: scene.audio_status || ""
+  })) || []);
+  pipeline = normalizePipelineLocalAssets(pipeline, task.output_dir);
+  const after = JSON.stringify(pipeline?.scenes?.map(scene => ({
+    index: scene.index,
+    image_path: scene.image_path || "",
+    image_status: scene.image_status || "",
+    audio_path: scene.audio_path || "",
+    audio_status: scene.audio_status || ""
+  })) || []);
+  if (before === after) return task;
+  const pipelineData = JSON.stringify(pipeline);
+  db.prepare("UPDATE tasks SET pipeline_data=?,last_checkpoint_at=? WHERE id=?").run(pipelineData, Date.now(), task.id);
+  try {
+    atomicWriteJson(path.join(task.output_dir, "script.json"), pipeline);
+    atomicWriteJson(path.join(task.output_dir, "pipeline.json"), pipeline);
+  } catch {}
+  return { ...task, pipeline_data: pipelineData };
+}
+
 ipcMain.handle("tasks:updatePipeline", (_event, id, pipeline) => {
-  pipeline = normalizePipelineLocalAssets(pipeline);
+  const task = db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
+  pipeline = normalizePipelineLocalAssets(pipeline, task?.output_dir || "");
   assertNoMojibakeQuestionRuns(pipeline);
   const runtime = pipeline?.runtime || {};
   db.prepare("UPDATE tasks SET pipeline_data=?,current_stage=?,current_step=?,last_checkpoint_at=? WHERE id=?")
     .run(JSON.stringify(pipeline), runtime.current_stage || "review", Number(runtime.current_step || 3), Date.now(), id);
-  const task = db.prepare("SELECT * FROM tasks WHERE id=?").get(id);
-  if (task.output_dir) {
+  if (task?.output_dir) {
     atomicWriteJson(path.join(task.output_dir, "script.json"), pipeline);
     atomicWriteJson(path.join(task.output_dir, "pipeline.json"), pipeline);
   }

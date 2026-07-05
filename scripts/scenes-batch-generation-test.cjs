@@ -44,7 +44,7 @@ function jsonReply(res, value) {
         const match = user.match(/固定镜头清单：\n([\s\S]*?)\n\n强制规则：/);
         assert.ok(match, "分镜批次请求必须包含固定镜头清单");
         const fixed = JSON.parse(match[1]);
-        assert.ok(fixed.length <= 5, "每个模型分镜请求最多处理5个镜头");
+        assert.ok(fixed.length <= 8, "每个模型分镜请求最多处理8个镜头");
         return jsonReply(res, {
           scenes: fixed.map(item => ({
             index: item.index,
@@ -92,9 +92,9 @@ function jsonReply(res, value) {
     assert.equal(result.scenes.length, 20);
     assert.equal(result.scenes.map(item => item.narration).join(""), narration);
     const sceneRequests = calls.filter(call => call.system.includes("专业短视频分镜师"));
-    assert.equal(sceneRequests.length, 4, "20个镜头应拆成4个批次请求");
-    assert.ok(fs.existsSync(path.join(workDir, "llm-debug", "03-scenes-001-005-checkpoint.json")));
-    assert.ok(fs.existsSync(path.join(workDir, "llm-debug", "03-scenes-016-020-checkpoint.json")));
+    assert.equal(sceneRequests.length, 3, "20个镜头应拆成3个批次请求");
+    assert.ok(fs.existsSync(path.join(workDir, "llm-debug", "03-scenes-001-008-checkpoint.json")));
+    assert.ok(fs.existsSync(path.join(workDir, "llm-debug", "03-scenes-017-020-checkpoint.json")));
 
     const callsBeforeResume = calls.length;
     const resumed = await planVideoScript({

@@ -715,10 +715,15 @@ async function renderVideo({
     const scene = scenes[scenePosition];
     onProgress({ phase: "clip", current: scenePosition + 1, total: scenes.length, sceneIndex: scene.index });
     const clip = path.join(renderDir, `${String(scene.index).padStart(3, "0")}.mp4`);
+    let sceneDuration = Number(scene.duration || 0);
+    if (!Number.isFinite(sceneDuration) || sceneDuration <= 0.05) {
+      sceneDuration = await mediaDuration(app, config, scene.audio_path);
+      scene.duration = sceneDuration;
+    }
     if (!forceRebuild && fileLooksUsable(clip, 1024)) {
       try {
         const existingDuration = await mediaDuration(app, config, clip);
-        if (existingDuration > 0.05 && Math.abs(existingDuration - Number(scene.duration || 0)) < 1.25) {
+        if (existingDuration > 0.05 && Math.abs(existingDuration - sceneDuration) < 1.25) {
           clips.push(clip);
           scene.render_clip_status = "completed";
           continue;
@@ -727,7 +732,7 @@ async function renderVideo({
       try { fs.rmSync(clip, { force: true }); } catch {}
     }
     scene.render_clip_status = "running";
-    const frames = Math.max(1, Math.ceil(Number(scene.duration || 0) * renderFps));
+    const frames = Math.max(1, Math.ceil(sceneDuration * renderFps));
     const fitMode = imageConfig.fit === "contain" ? "decrease" : "increase";
     const fitted = imageConfig.fit === "contain"
       ? `scale=${width}:${regionHeight}:force_original_aspect_ratio=${fitMode},pad=${width}:${regionHeight}:(ow-iw)/2:(oh-ih)/2:color=${ffBackgroundColor},setsar=1`
@@ -737,7 +742,7 @@ async function renderVideo({
     let visualFilter;
     if (hasGeneratedVideo) {
       const sourceDuration = Math.max(.1, await mediaDuration(app, config, scene.video_path));
-      const stretch = Math.max(.01, Number(scene.duration || sourceDuration) / sourceDuration);
+      const stretch = Math.max(.01, sceneDuration / sourceDuration);
       visualFilter = `${fitted},setpts=${stretch.toFixed(8)}*PTS,fps=${renderFps}`;
     } else {
       visualFilter = buildImageMotionFilter({
@@ -766,11 +771,15 @@ async function renderVideo({
     else clipArgs.push("-f", "lavfi", "-i", `color=c=${ffBackgroundColor}:s=${width}x${height}:r=${renderFps}`);
     clipArgs.push(
       "-filter_complex_threads", "2",
-      "-t", Number(scene.duration || 0).toFixed(3), "-filter_complex", filter, "-map", "[v]", "-map", "1:a",
+      "-t", sceneDuration.toFixed(3), "-filter_complex", filter, "-map", "[v]", "-map", "1:a",
       "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-threads", "4", "-r", String(renderFps),
       "-c:a", "aac", "-b:a", "160k", "-shortest", clip
     );
     await spawnAsync(ffmpeg, clipArgs);
+    const renderedDuration = await mediaDuration(app, config, clip);
+    if (!Number.isFinite(renderedDuration) || renderedDuration <= 0.05) {
+      throw new Error(`第 ${scene.index || scenePosition + 1} 镜合成了空视频，请检查配音时长和图片路径`);
+    }
     scene.render_clip_status = "completed";
     clips.push(clip);
   }

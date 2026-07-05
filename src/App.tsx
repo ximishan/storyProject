@@ -177,7 +177,7 @@ function Tasks({ tasks, onCreate, onRefresh, title = "任务队列", desc = "查
     </div> : <div className="task-grid">{filtered.map(task =>
       <article className="task-card" key={task.id} onClick={() => setSelected(task)}>
         <div className="task-top">
-          <div className="task-check"><input type="checkbox" checked={checked.includes(task.id)} onClick={e => e.stopPropagation()} onChange={e => setChecked(current => e.target.checked ? [...current, task.id] : current.filter(id => id !== task.id))} /><span className={`status ${task.status}`}>{["running", "cancelling"].includes(task.status) && <LoaderCircle size={13} className="spin" />}{statusText(task.status)}</span></div>
+          <div className="task-check"><input type="checkbox" checked={checked.includes(task.id)} onClick={e => e.stopPropagation()} onChange={e => setChecked(current => e.target.checked ? [...current, task.id] : current.filter(id => id !== task.id))} /><span className={`status ${task.status}`}>{["running", "cancelling"].includes(task.status) && <LoaderCircle size={13} className="spin" />}{statusText(task.status, task.current_stage)}</span></div>
           <button className="icon-btn"><MoreHorizontal size={18} /></button>
         </div>
         <h3>{task.title || "未命名任务"}</h3>
@@ -361,7 +361,7 @@ function TaskDetail({ task, onClose, onRefresh }: { task: TaskRecord; onClose: (
   return <div className="modal-backdrop" onClick={onClose}>
     <div className="task-detail" onClick={e => e.stopPropagation()}>
       <button className="modal-close" onClick={onClose}><X size={18} /></button>
-      <span className={`status ${task.status}`}>{statusText(task.status)}</span>
+      <span className={`status ${task.status}`}>{statusText(task.status, task.current_stage)}</span>
       <h2>{task.title}</h2>
       <p className="detail-source">{task.input_text}</p>
       {task.error_message && <div className="error-box">{task.error_message}</div>}
@@ -2120,7 +2120,15 @@ function TextLayerEditor({ title, config, canvasHeight, open, active, onToggle, 
   </DraftAccordion>;
 }
 
-const statusText = (status: TaskStatus) => ({ pending: "待处理", running: "进行中", cancelling: "取消收尾中", interrupted: "已中断", review: "待确认脚本", completed: "已完成", failed: "失败", cancelled: "已取消" }[status]);
+const statusText = (status: TaskStatus, stage = "") => {
+  if (status === "review") {
+    if (stage === "review_images" || stage === "review_images_partial") return "待确认画面";
+    if (stage === "review_audio") return "待确认配音";
+    if (stage === "review_script") return "待确认脚本";
+    return "待确认";
+  }
+  return { pending: "待处理", running: "进行中", cancelling: "取消收尾中", interrupted: "已中断", completed: "已完成", failed: "失败", cancelled: "已取消" }[status];
+};
 const assetStatusText = (status: string) => ({ pending: "待处理", running: "处理中", remote_running: "远程处理中", interrupted: "待恢复", completed: "完成", failed: "失败", failed_fallback: "失败已兜底", skipped: "已跳过" }[status] || status);
 const trackName = (track: string) => tracks.find(item => item.id === track)?.name || track;
 const styleGradient = (id: string) => {
