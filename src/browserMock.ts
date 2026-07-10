@@ -45,7 +45,7 @@ const defaultConfig: AppConfig = {
   },
   apimart: {
     display_name: "Apimart",
-    base_url: "https://api.apimart.ai/v1",
+    base_url: "https://api.apib.ai/v1",
     api_key: "",
     model: "gpt-image-2",
     ratio: "9:16",

@@ -57,7 +57,8 @@ const METADATA_BASE_PROMPT = `你是短视频视觉策划。请从旁白中抽�
   "visual_continuity": ["跨镜头必须保持的视觉规则"]
 }
 publish 必须依据旁白与赛道规则生成；没有副标题、标签或评论时返回空数组。不得编造旁白中不存在的人名、品牌、价格、疗效、身份、年份或历史事实。
-不明确的视觉信息必须写 unknown 或留空，不得猜测。`;
+不明确的视觉信息必须写 unknown 或留空，不得猜测。
+人物国籍、族裔、血统和面部种族特征必须严格来自旁白原文：只出现“法国、巴黎、法籍、外国人”等信息时，只能写法国/欧洲女性，不得因为中文姓名、中文旁白、来到中国或在中国生活就推断为华裔、华人、中国血统、中国面孔或亚洲面孔。`;
 
 const SCENE_BASE_PROMPT = `你是专业短视频分镜师和图片提示词工程师。请把旁白拆成连续分镜。
 只返回合法 JSON，不要输出 Markdown 代码块。JSON 字符串内部如需引用原话，优先使用中文引号“”，不得直接插入未转义的英文双引号。JSON 结构：
@@ -184,7 +185,7 @@ function normalizeProcessingMode(value) {
 }
 
 function splitSourceText(sourceText, targetScenes = 0) {
-  return splitNarrationForScenePlan(sourceText, targetScenes || inferAutoSceneCount(sourceText));
+  return splitNarrationForScenePlan(sourceText, clampStoryboardSceneCount(targetScenes) || inferAutoSceneCount(sourceText));
 }
 
 function podcastSpeakerRoleLine(line) {
@@ -739,6 +740,42 @@ function cardPrompt(card) {
     .filter(Boolean).join("，") || "");
 }
 
+function sourceHasChineseEthnicity(text) {
+  return /华裔|华人|中国裔|华侨|中国血统|祖籍中国|法籍华裔|美籍华裔|英籍华裔|华裔女性|华裔男子/.test(String(text || ""));
+}
+
+function sourceIndicatesFrenchWoman(text) {
+  const source = String(text || "");
+  return /(法国|法籍|巴黎)[\s\S]{0,80}(女孩|女性|女人|姑娘|女硕士)|(?:女孩|女性|女人|姑娘|女硕士)[\s\S]{0,80}(法国|法籍|巴黎)/.test(source);
+}
+
+function sanitizeUnsupportedCharacterEthnicity(character, sourceText) {
+  if (!character || typeof character !== "object" || character.enabled === false || sourceHasChineseEthnicity(sourceText)) return character;
+  const frenchWoman = sourceIndicatesFrenchWoman(sourceText);
+  const stripUnsupported = value => {
+    let text = String(value || "");
+    text = text
+      .replace(/法籍华裔女性/g, frenchWoman ? "法国女性，欧洲女性外貌" : "法籍女性")
+      .replace(/法籍华人女性/g, frenchWoman ? "法国女性，欧洲女性外貌" : "法籍女性")
+      .replace(/华裔女性|华人女性|中国裔女性|中国血统女性/g, frenchWoman ? "欧洲女性外貌" : "女性")
+      .replace(/中国女性|中国女孩|中国面孔|亚洲面孔|东亚面孔|亚裔面孔/g, frenchWoman ? "欧洲女性外貌" : "")
+      .replace(/具体外貌特征unknown[，,、]?/g, "")
+      .replace(/服装unknown[，,、]?/g, "");
+    if (frenchWoman && text && !/欧洲女性外貌|法国女性/.test(text)) {
+      text = `法国女性，欧洲女性外貌，${text}`;
+    }
+    return text.replace(/(?:\s*，\s*){2,}/g, "，").replace(/^，|，$/g, "").trim();
+  };
+
+  for (const key of ["identity", "face", "stable_prompt"]) {
+    if (character[key]) character[key] = stripUnsupported(character[key]);
+  }
+  if (frenchWoman) {
+    character.stable_prompt = stripUnsupported(character.stable_prompt || [character.name, character.identity, character.gender, character.face, character.hair, character.clothing].filter(Boolean).join("，"));
+  }
+  return character;
+}
+
 function normalizeStringArray(value, limit = 0) {
   const items = Array.isArray(value)
     ? value
@@ -780,7 +817,7 @@ function applyImagePromptTemplate({ scene, metadata, template, ratio, modules })
   return prompt;
 }
 
-function normalizeMetadata(raw, template) {
+function normalizeMetadata(raw, template, sourceText = "") {
   const metadata = raw && typeof raw === "object" ? { ...raw } : {};
   const rawPublish = metadata.publish && typeof metadata.publish === "object"
     ? metadata.publish
@@ -798,6 +835,7 @@ function normalizeMetadata(raw, template) {
     : { stable_prompt: typeof metadata.character_card === "string" ? metadata.character_card : "" };
   character.enabled = wantCharacter && character.enabled !== false;
   if (!wantCharacter) character.stable_prompt = "";
+  sanitizeUnsupportedCharacterEthnicity(character, sourceText);
   const product = metadata.product_card && typeof metadata.product_card === "object"
     ? { ...metadata.product_card }
     : { stable_prompt: typeof metadata.product_card === "string" ? metadata.product_card : "" };
@@ -887,7 +925,7 @@ function buildSceneUserPrompt(task, template, content, metadata, modules, seedPo
   const styleConfig = task.style_config || resolveVisualStyle(task.style);
   return `内容类型：${task.track}
 视频形态：${task.task_type === "podcast" ? "双人播客；每个镜头必须输出 speaker_role(A/B)" : "单人旁白"}
-目标分镜数：${task.target_scenes || `由大模型按自然语义决定，整体节奏约每分钟 ${TARGET_SCENES_PER_MINUTE} 镜（默认语速下通常约 ${AUTO_SCENE_TARGET_MIN_CHARS}～${AUTO_SCENE_TARGET_MAX_CHARS} 字/镜）`}
+目标分镜数：${task.target_scenes ? `${clampStoryboardSceneCount(task.target_scenes)}（分镜图片最多 ${MAX_STORYBOARD_IMAGE_SCENES} 张）` : `由大模型按自然语义决定，整体节奏约每分钟 ${TARGET_SCENES_PER_MINUTE} 镜（默认语速下通常约 ${AUTO_SCENE_TARGET_MIN_CHARS}～${AUTO_SCENE_TARGET_MAX_CHARS} 字/镜，分镜图片最多 ${MAX_STORYBOARD_IMAGE_SCENES} 张）`}
 画面比例：${task.ratio}
 当前画面风格：${styleConfig.name}（${styleConfig.id}）
 风格前缀：${styleConfig.prefix}
@@ -919,8 +957,8 @@ const SEMI_AUTO_SCENE_GROUP_PROMPT = `你是专业的短视频分镜导演。当
 程序已经把原文拆成带编号的连续原文单元。你只负责判断哪些相邻编号应合并为同一个分镜。
 
 核心节奏标准：
-- 整体控制在每分钟约 3 个分镜，每个镜头通常承载约 18～24 秒旁白。
-- 默认语速下，每镜通常约 80～110 个中文字符；字数只用于辅助判断，不能机械截断。
+- 整体控制在每分钟约 2 个分镜，每个镜头通常承载约 26～34 秒旁白。
+- 默认语速下，每镜通常约 110～150 个中文字符；字数只用于辅助判断，不能机械截断。
 - 同一时间、地点、人物动作和情绪中的短单元应主动合并。
 - 只有明确的时间跳转、地点切换、主体改变、关键动作或强情绪转折时，才提前切镜。
 - 不要生成十几二十字的碎片镜头，也不要把两个明显不同的画面强行合并。
@@ -937,8 +975,8 @@ const SEMI_AUTO_SCENE_GROUP_PROMPT = `你是专业的短视频分镜导演。当
 1. 只能返回编号，不得返回 narration、text、visual、desc_prompt 或任何原文文字。
 2. 所有编号必须按原顺序出现，且每个编号必须恰好使用一次，不能遗漏、重复、倒序或跳号。
 3. 每一组只能包含连续编号；不得把不相邻的编号放入同一组。
-4. 未明确指定数量时，根据整体时长和自然语义决定分镜数，整体尽量接近每分钟 3 镜。
-5. 用户明确指定分镜数时，groups 数量必须严格等于指定数量。`;
+4. 未明确指定数量时，根据整体时长和自然语义决定分镜数，整体尽量接近每分钟 2 镜。
+5. 用户明确指定分镜数时，groups 数量必须严格等于指定数量；但全片分镜图片最多 12 张，指定数量超过 12 时按 12 张执行。`;
 
 const SCENE_PLAN_PROMPT = `你是专业的短视频分镜导演。你的任务是把完整旁白切分成连续的分镜，每个分镜对应一个清晰、独立、可成画的画面。
 
@@ -948,8 +986,8 @@ const SCENE_PLAN_PROMPT = `你是专业的短视频分镜导演。你的任务�
 - 只有发生明确的转换时才切镜：时间跳转、地点切换、主体改变、关键动作发生、情绪转折、视角切换。
 
 # 节奏目标（用于把控总量，不是硬性字数）
-- 整体节奏约为每分钟 3 个分镜，按口播时长换算，而不是按字数硬切。
-- 默认语速下每镜通常承载约 18 到 24 秒口播，大约 80 到 110 个中文字符，但这只是参考，语义需要时可以适当超出或缩短。
+- 整体节奏约为每分钟 2 个分镜，按口播时长换算，而不是按字数硬切。
+- 默认语速下每镜通常承载约 26 到 34 秒口播，大约 110 到 150 个中文字符，但这只是参考，语义需要时可以适当超出或缩短。
 - 不要生成只有十几个字的碎片镜头，也不要把两个明显不同的画面强行塞进同一镜。
 
 # 切分判断标准（按优先级从高到低）
@@ -969,16 +1007,18 @@ const SCENE_PLAN_PROMPT = `你是专业的短视频分镜导演。你的任务�
 # 硬性约束
 1. narration 必须从原旁白按原顺序连续切分，完整覆盖原文，不得改写、漏字、添字、重复或改动标点。
 2. 把所有镜头的 narration 按顺序拼接，必须与原旁白逐字完全一致。
-3. 没有指定固定镜头数时，由你根据完整旁白的语义和预计时长决定数量，整体尽量接近每分钟 3 镜。
-4. 不要返回 visual、desc_prompt、caption_segments 等其他字段。`;
+3. 没有指定固定镜头数时，由你根据完整旁白的语义和预计时长决定数量，整体尽量接近每分钟 2 镜。
+4. 全片分镜图片最多 12 张；即使用户要求更多镜头，也必须合并到 12 个以内。
+5. 不要返回 visual、desc_prompt、caption_segments 等其他字段。`;
 
 
 const SCENE_BATCH_SIZE = 8;
-const TARGET_SCENES_PER_MINUTE = 3;
+const MAX_STORYBOARD_IMAGE_SCENES = 12;
+const TARGET_SCENES_PER_MINUTE = 2;
 const BASE_CHINESE_CHARS_PER_MINUTE = 230;
-const AUTO_SCENE_TARGET_MIN_CHARS = 80;
-const AUTO_SCENE_TARGET_MAX_CHARS = 110;
-const AUTO_SCENE_TARGET_CHARS = 95;
+const AUTO_SCENE_TARGET_MIN_CHARS = 110;
+const AUTO_SCENE_TARGET_MAX_CHARS = 150;
+const AUTO_SCENE_TARGET_CHARS = 130;
 
 function countSceneCharacters(text) {
   // 中文标点保留并计数，只忽略空格、制表符和换行。
@@ -996,11 +1036,17 @@ function estimateNarrationDurationSeconds(text, ttsSpeed = 1) {
   return characterCount / (BASE_CHINESE_CHARS_PER_MINUTE * normalizeTtsSpeed(ttsSpeed)) * 60;
 }
 
+function clampStoryboardSceneCount(value) {
+  const count = Number(value || 0);
+  if (!Number.isFinite(count) || count <= 0) return 0;
+  return Math.max(1, Math.min(MAX_STORYBOARD_IMAGE_SCENES, Math.floor(count)));
+}
+
 function inferAutoSceneCount(text, ttsSpeed = 1) {
   const durationSeconds = estimateNarrationDurationSeconds(text, ttsSpeed);
   if (!durationSeconds) return 1;
-  // 核心标准：每分钟约 3 个镜头。按预计口播时长换算，而不是先机械切字。
-  return Math.max(1, Math.round(durationSeconds / 60 * TARGET_SCENES_PER_MINUTE));
+  // 核心标准：每分钟约 2 个镜头。按预计口播时长换算，而不是先机械切字。
+  return Math.min(MAX_STORYBOARD_IMAGE_SCENES, Math.max(1, Math.round(durationSeconds / 60 * TARGET_SCENES_PER_MINUTE)));
 }
 
 function splitNarrationAtNaturalPoint(text) {
@@ -1065,7 +1111,7 @@ function splitNarrationForScenePlan(narration, requestedCount = 0, ttsSpeed = 1)
     .map(item => item.trim())
     .filter(Boolean);
   const inferredCount = inferAutoSceneCount(source, ttsSpeed);
-  const targetCount = Math.max(1, Number(requestedCount || inferredCount));
+  const targetCount = Math.max(1, clampStoryboardSceneCount(requestedCount) || inferredCount);
 
   while (parts.length < targetCount) {
     let longestIndex = -1;
@@ -1273,7 +1319,7 @@ async function resolveSemiAutoSceneNarrationAssignments({ config, task, content,
   const units = splitNarrationIntoAtomicUnits(narration);
   if (!units.length) throw new Error("半自动模式没有可用于分镜的原文单元");
 
-  const manualCount = Number(task.target_scenes || 0) > 0 ? Math.max(1, Number(task.target_scenes)) : 0;
+  const manualCount = clampStoryboardSceneCount(task.target_scenes);
   if (manualCount > units.length) {
     throw new Error(`手动分镜数 ${manualCount} 超过可用原文单元数 ${units.length}，请减少目标分镜数或增加自然标点`);
   }
@@ -1288,6 +1334,7 @@ async function resolveSemiAutoSceneNarrationAssignments({ config, task, content,
     manual_count: manualCount,
     estimated_count: estimatedCount,
     estimated_duration_seconds: Math.round(estimatedDurationSeconds),
+    max_storyboard_image_scenes: MAX_STORYBOARD_IMAGE_SCENES,
     target_scenes_per_minute: TARGET_SCENES_PER_MINUTE,
     tts_speed: normalizeTtsSpeed(task.tts_speed)
   };
@@ -1311,8 +1358,8 @@ async function resolveSemiAutoSceneNarrationAssignments({ config, task, content,
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     let countInstruction = "";
     countInstruction = manualCount
-      ? `用户明确指定分镜数：${manualCount}。groups 数量必须严格等于 ${manualCount}。`
-      : `预计旁白约 ${Math.round(estimatedDurationSeconds)} 秒，整体目标约每分钟 ${TARGET_SCENES_PER_MINUTE} 镜，参考数量约 ${estimatedCount} 镜。请主动合并同一时间、地点、人物动作和情绪中的相邻编号，最终 groups 数量应尽量接近 ${estimatedCount}，不要超过 ${estimatedCount + 1}。`;
+      ? `用户明确指定分镜数：${manualCount}。groups 数量必须严格等于 ${manualCount}。全片分镜图片最多 ${MAX_STORYBOARD_IMAGE_SCENES} 张。`
+      : `预计旁白约 ${Math.round(estimatedDurationSeconds)} 秒，整体目标约每分钟 ${TARGET_SCENES_PER_MINUTE} 镜，参考数量约 ${estimatedCount} 镜。请主动合并同一时间、地点、人物动作和情绪中的相邻编号，最终 groups 数量应尽量接近 ${estimatedCount}，不要超过 ${Math.min(MAX_STORYBOARD_IMAGE_SCENES, estimatedCount + 1)}。全片分镜图片最多 ${MAX_STORYBOARD_IMAGE_SCENES} 张。`;
     const correction = attempt === 1 || !lastError
       ? ""
       : `\n\n上一次编号分组未通过校验，原因：${lastError.message || String(lastError)}\n请只修正编号分组，不要返回任何文字。`;
@@ -1531,7 +1578,7 @@ function mergeSceneAssignments(left, right, index) {
 function compactAutoSceneAssignments(assignments, task, narration, requestedCount = 0) {
   if (Number(requestedCount) || task.task_type === "podcast") return assignments;
   const estimatedCount = inferAutoSceneCount(narration, task.tts_speed);
-  const maxCount = Math.max(1, estimatedCount + 1);
+  const maxCount = Math.max(1, Math.min(MAX_STORYBOARD_IMAGE_SCENES, estimatedCount + 1));
   let compacted = assignments.map(item => ({ ...item }));
   while (compacted.length > maxCount) {
     let bestIndex = 0;
@@ -1561,7 +1608,7 @@ async function resolveSceneNarrationAssignments({ config, task, content, debugDi
     return resolveSemiAutoSceneNarrationAssignments({ config, task, content, debugDir, modelIdentity });
   }
 
-  const manualCount = Number(task.target_scenes || 0) > 0 ? Math.max(1, Number(task.target_scenes)) : 0;
+  const manualCount = clampStoryboardSceneCount(task.target_scenes);
   const estimatedCount = inferAutoSceneCount(content.narration, task.tts_speed);
   const estimatedDurationSeconds = estimateNarrationDurationSeconds(content.narration, task.tts_speed);
   const input = {
@@ -1571,9 +1618,10 @@ async function resolveSceneNarrationAssignments({ config, task, content, debugDi
     manual_count: manualCount,
     estimated_count: estimatedCount,
     estimated_duration_seconds: Math.round(estimatedDurationSeconds),
+    max_storyboard_image_scenes: MAX_STORYBOARD_IMAGE_SCENES,
     target_scenes_per_minute: TARGET_SCENES_PER_MINUTE,
     tts_speed: normalizeTtsSpeed(task.tts_speed),
-    density: "about-3-scenes-per-minute-source-reconstruction",
+    density: "about-2-scenes-per-minute-source-reconstruction",
     task_type: task.task_type
   };
   const cached = readStageCache(debugDir, "03-scenes-plan", input);
@@ -1591,8 +1639,8 @@ async function resolveSceneNarrationAssignments({ config, task, content, debugDi
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     let countInstruction = "";
     countInstruction = manualCount
-      ? `用户明确指定镜头数：${manualCount}。必须严格返回 ${manualCount} 个镜头。`
-      : `没有指定固定镜头数。按当前语速预计旁白约 ${Math.round(estimatedDurationSeconds)} 秒，整体目标约每分钟 ${TARGET_SCENES_PER_MINUTE} 镜，参考数量约 ${estimatedCount} 镜。请以自然语义和真实画面变化为主，优先合并同一时间、地点、人物动作和情绪中的连续内容，不要生成十几二十字的碎片镜头。`;
+      ? `用户明确指定镜头数：${manualCount}。必须严格返回 ${manualCount} 个镜头。全片分镜图片最多 ${MAX_STORYBOARD_IMAGE_SCENES} 张。`
+      : `没有指定固定镜头数。按当前语速预计旁白约 ${Math.round(estimatedDurationSeconds)} 秒，整体目标约每分钟 ${TARGET_SCENES_PER_MINUTE} 镜，参考数量约 ${estimatedCount} 镜。请以自然语义和真实画面变化为主，优先合并同一时间、地点、人物动作和情绪中的连续内容，不要生成十几二十字的碎片镜头。全片分镜图片最多 ${MAX_STORYBOARD_IMAGE_SCENES} 张。`;
     const correction = attempt === 1 || !lastError
       ? ""
       : `\n\n上一次结果未通过校验，原因：${lastError.message || String(lastError)}\n请重新划分镜头，重点合并过短镜头。镜头边界确定后，程序会自动从原旁白恢复逐字内容。`;
@@ -1793,6 +1841,34 @@ function mergeAdjacentSimilarVisualScenes(scenes) {
     scenes: mergedScenes.map((scene, index) => ({ ...scene, index: index + 1 })),
     merges
   };
+}
+
+function capStoryboardImageScenes(scenes, limit = MAX_STORYBOARD_IMAGE_SCENES) {
+  let capped = (Array.isArray(scenes) ? scenes : []).map((scene, index) => ({ ...scene, index: index + 1 }));
+  const merges = [];
+  while (capped.length > limit) {
+    let bestIndex = 0;
+    let bestScore = Infinity;
+    for (let index = 0; index < capped.length - 1; index += 1) {
+      const leftLength = countSceneCharacters(capped[index].narration);
+      const rightLength = countSceneCharacters(capped[index + 1].narration);
+      const combinedLength = leftLength + rightLength;
+      const score = Math.abs(combinedLength - AUTO_SCENE_TARGET_CHARS)
+        + (Math.min(leftLength, rightLength) < AUTO_SCENE_TARGET_MIN_CHARS ? -40 : 0)
+        + (combinedLength > AUTO_SCENE_TARGET_MAX_CHARS * 2 ? 80 : 0);
+      if (score < bestScore) {
+        bestScore = score;
+        bestIndex = index;
+      }
+    }
+    merges.push({
+      from: [capped[bestIndex].index, capped[bestIndex + 1].index],
+      reason: `分镜图片数量超过 ${limit}，自动合并相邻镜头`
+    });
+    capped.splice(bestIndex, 2, mergeAdjacentScenePair(capped[bestIndex], capped[bestIndex + 1]));
+    capped = capped.map((scene, index) => ({ ...scene, index: index + 1 }));
+  }
+  return { scenes: capped, merges };
 }
 
 async function generateSceneBatch({ config, task, template, content, metadata, modules, seedPools, referenceKind, assignments, batchNumber, batchTotal, debugDir, modelIdentity }) {
@@ -2020,7 +2096,7 @@ async function planVideoScript({ config, task, outputDir, onStage = () => {} }) 
   if (!content.narration.trim()) throw new Error("文案处理阶段没有返回 narration");
 
   const metadataInput = {
-    version: 2,
+    version: 3,
     model: modelIdentity,
     content,
     track: task.track,
@@ -2044,7 +2120,7 @@ async function planVideoScript({ config, task, outputDir, onStage = () => {} }) 
   }
   throwIfCancelled();
   onStage("02-metadata", "completed");
-  const metadata = normalizeMetadata(rawMetadata, template);
+  const metadata = normalizeMetadata(rawMetadata, template, content.narration);
   const publish = metadata.publish || {};
   if (publish.title) content.title = publish.title;
   if (publish.summary) content.summary = publish.summary;
@@ -2114,7 +2190,18 @@ async function planVideoScript({ config, task, outputDir, onStage = () => {} }) 
       merges: visualMergeResult.merges
     });
   }
-  const scenes = visualMergeResult.scenes.map((scene, index) => normalizeScene(scene, index, task, metadata, template, modules));
+  const capResult = task.task_type === "podcast"
+    ? { scenes: visualMergeResult.scenes, merges: [] }
+    : capStoryboardImageScenes(visualMergeResult.scenes);
+  if (capResult.merges.length) {
+    writeDebug(debugDir, "03-scenes-image-cap-merged.json", {
+      limit: MAX_STORYBOARD_IMAGE_SCENES,
+      before_count: visualMergeResult.scenes.length,
+      after_count: capResult.scenes.length,
+      merges: capResult.merges
+    });
+  }
+  const scenes = capResult.scenes.map((scene, index) => normalizeScene(scene, index, task, metadata, template, modules));
   const narrationCoverage = scenes.map(scene => scene.narration).join(task.task_type === "podcast" ? "\n" : "");
   const result = {
     checkpoint_version: 2,
@@ -2162,5 +2249,6 @@ module.exports = {
   validateSceneAssignmentDensity,
   reconstructExactSceneAssignments,
   validateSceneNarrationAssignments,
+  sanitizeUnsupportedCharacterEthnicity,
   testModelConnection
 };

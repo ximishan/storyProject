@@ -356,17 +356,16 @@ async function completePipeline({ app, task, config, outputDir, script, emit, ch
 
   const singlePodcastImage = task.task_type === "podcast" && task.podcast_image_mode === "single";
   for (const scene of workingScenes) {
-  if (usableAsset(scene.image_path, 512)) {
-    scene.image_status = "completed";
-  } else {
-    // 没有可用图片的分镜：重置为待生成，并清空失效的远程任务ID，
-    // 补齐时强制重新提交，而不是去查中转站那个早已失败的旧任务。
-    scene.image_status = "pending";
-    scene.image_remote_task_id = "";
-    scene.image_remote_provider = "";
+    if (usableAsset(scene.image_path, 512)) {
+      scene.image_status = "completed";
+    } else {
+      // 没有可用图片的分镜：重置为待生成，并清空失效的远程任务ID，
+      // 补齐时强制重新提交，而不是去查中转站那个早已失败的旧任务。
+      scene.image_status = "pending";
+      scene.image_remote_task_id = "";
+      scene.image_remote_provider = "";
+    }
   }
-}
-
   if (singlePodcastImage && usableAsset(workingScenes[0]?.image_path, 512)) {
     workingScenes.forEach(scene => {
       scene.image_path = workingScenes[0].image_path;

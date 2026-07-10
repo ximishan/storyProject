@@ -1,5 +1,8 @@
 const assert = require('node:assert/strict');
-const { validateSceneNarrationAssignments } = require('../electron/llm-planner.cjs');
+const {
+  validateSceneAssignmentDensity,
+  validateSceneNarrationAssignments
+} = require('../electron/llm-planner.cjs');
 
 const task = { task_type: 'story', tts_speed: 1 };
 const goodParts = [
@@ -20,7 +23,12 @@ const badParts = [
 ];
 const badNarration = badParts.join('');
 assert.throws(
-  () => validateSceneNarrationAssignments({ scenes: badParts.map((narration, index) => ({ index: index + 1, narration })) }, task, badNarration, 0),
+  () => validateSceneAssignmentDensity(
+    badParts.map((narration, index) => ({ index: index + 1, narration })),
+    task,
+    badNarration,
+    0
+  ),
   /碎片化|密度/
 );
 

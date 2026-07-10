@@ -990,7 +990,8 @@ async function pollCustomImageTask({ section, baseUrl, taskId, destination }) {
 
 
 function apiMartBaseUrl(section = {}) {
-  const raw = String(section.base_url || "https://api.apimart.ai/v1").trim().replace(/\/+$/, "");
+  const raw = String(section.base_url || "").trim().replace(/\/+$/, "");
+  if (!raw) throw new Error("Apimart 尚未配置 Base URL");
   return raw
     .replace(/\/images\/generations$/i, "")
     .replace(/\/tasks\/[^/]+$/i, "");

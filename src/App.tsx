@@ -1205,7 +1205,7 @@ function ImageSettings({ draft, setDraft }: { draft: AppConfig; setDraft: (next:
         <div className="form-grid">
           <label>服务名称<input value="Apimart" disabled /></label>
           <label>模型<input value={draft.apimart.model || "gpt-image-2"} disabled /></label>
-          <label className="full">Base URL<input value={draft.apimart.base_url} onChange={e => updateApimart({ base_url: e.target.value })} placeholder="https://api.apimart.ai/v1" /></label>
+          <label className="full">Base URL<input value={draft.apimart.base_url} onChange={e => updateApimart({ base_url: e.target.value })} placeholder="https://api.apib.ai/v1" /></label>
           <label className="full">API Key<small>从 Apimart 控制台获取</small><div className="secret-input">
             <input type={showKey ? "text" : "password"} value={draft.apimart.api_key} onChange={e => updateApimart({ api_key: e.target.value })} placeholder="sk-xxxx" />
             <button title="显示或隐藏" onClick={() => setShowKey(value => !value)}><Eye size={16} /></button>

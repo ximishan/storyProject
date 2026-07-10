@@ -23,6 +23,7 @@ let mainWindow;
 let db;
 let queueRunning = false;
 const activeTaskRuns = new Map();
+const APIMART_DEFAULT_BASE_URL = "https://api.apib.ai/v1";
 
 const defaultConfig = {
   config_version: 6,
@@ -72,7 +73,7 @@ const defaultConfig = {
   },
   apimart: {
     display_name: "Apimart",
-    base_url: "https://api.apimart.ai/v1",
+    base_url: APIMART_DEFAULT_BASE_URL,
     api_key: "",
     model: "gpt-image-2",
     ratio: "9:16",
@@ -580,7 +581,12 @@ ipcMain.handle("config:save", (_event, config) => {
     gpt_image: { ...defaultConfig.gpt_image, ...config?.gpt_image },
     modelscope: { ...defaultConfig.modelscope, ...config?.modelscope },
     custom_image: { ...defaultConfig.custom_image, ...config?.custom_image, display_name: "foxcode" },
-    apimart: { ...defaultConfig.apimart, ...config?.apimart, display_name: "Apimart", model: "gpt-image-2" },
+    apimart: {
+      ...defaultConfig.apimart,
+      ...config?.apimart,
+      display_name: "Apimart",
+      model: "gpt-image-2"
+    },
     runninghub: { ...defaultConfig.runninghub, ...config?.runninghub },
     tts: {
       provider: ["system", "volcengine"].includes(config?.tts?.provider) ? config.tts.provider : "system",

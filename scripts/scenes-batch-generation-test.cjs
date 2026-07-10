@@ -3,7 +3,7 @@ const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
-const { planVideoScript } = require("../electron/llm-planner.cjs");
+const { planVideoScript, splitNarrationForScenePlan } = require("../electron/llm-planner.cjs");
 
 function jsonReply(res, value) {
   res.writeHead(200, { "content-type": "application/json" });
@@ -13,6 +13,7 @@ function jsonReply(res, value) {
 (async () => {
   const narrationParts = Array.from({ length: 20 }, (_, index) => `这是第${index + 1}个自然语义完整句子。`);
   const narration = narrationParts.join("");
+  const cappedParts = splitNarrationForScenePlan(narration, 20);
   const calls = [];
 
   const server = http.createServer((req, res) => {
@@ -37,7 +38,7 @@ function jsonReply(res, value) {
       }
       if (system.includes("专业的短视频分镜导演")) {
         return jsonReply(res, {
-          scenes: narrationParts.map((item, index) => ({ index: index + 1, narration: item }))
+          scenes: cappedParts.map((item, index) => ({ index: index + 1, narration: item }))
         });
       }
       if (system.includes("专业短视频分镜师")) {
@@ -89,12 +90,12 @@ function jsonReply(res, value) {
       outputDir: workDir
     });
 
-    assert.equal(result.scenes.length, 20);
+    assert.equal(result.scenes.length, 12);
     assert.equal(result.scenes.map(item => item.narration).join(""), narration);
     const sceneRequests = calls.filter(call => call.system.includes("专业短视频分镜师"));
-    assert.equal(sceneRequests.length, 3, "20个镜头应拆成3个批次请求");
+    assert.equal(sceneRequests.length, 2, "超过12个目标镜头应先压到12个，再拆成2个批次请求");
     assert.ok(fs.existsSync(path.join(workDir, "llm-debug", "03-scenes-001-008-checkpoint.json")));
-    assert.ok(fs.existsSync(path.join(workDir, "llm-debug", "03-scenes-017-020-checkpoint.json")));
+    assert.ok(fs.existsSync(path.join(workDir, "llm-debug", "03-scenes-009-012-checkpoint.json")));
 
     const callsBeforeResume = calls.length;
     const resumed = await planVideoScript({
@@ -103,8 +104,8 @@ function jsonReply(res, value) {
       outputDir: workDir
     });
     assert.equal(calls.length, callsBeforeResume, "重新运行应复用所有批次检查点");
-    assert.equal(resumed.scenes.length, 20);
-    console.log("20-scene batched generation and checkpoint reuse test passed");
+    assert.equal(resumed.scenes.length, 12);
+    console.log("12-scene capped batched generation and checkpoint reuse test passed");
   } finally {
     server.close();
     fs.rmSync(workDir, { recursive: true, force: true });
