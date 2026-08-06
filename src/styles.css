@@ -1053,6 +1053,13 @@ select, .form-grid input, .create-options input { height:39px; padding:0 11px; c
 .selected-voice-card b em, .settings-selected-voice b em { padding:1px 6px; border-radius:4px; background:#173c32; color:#5de0b2; font-size:9px; font-style:normal; }
 .selected-voice-card small { color:#838c99; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .voice-open-picker { display:flex; align-items:center; gap:6px; min-height:39px; padding:0 14px; border:1px solid #345448; border-radius:9px; background:#13231e; color:#68dfb6; cursor:pointer; }
+.voice-quick-row { width:100%; display:flex; align-items:center; gap:9px; flex-wrap:wrap; margin-top:10px; }
+.voice-quick-row > span { color:#7e8793; font-size:11px; font-weight:700; }
+.voice-quick-row button { min-height:38px; display:flex; align-items:center; gap:7px; padding:7px 12px; border:1px solid #303744; border-radius:9px; background:#141922; color:#e5ece9; cursor:pointer; }
+.voice-quick-row button > svg { color:#42d6a4; }
+.voice-quick-row button b { font-size:12px; }
+.voice-quick-row button small { color:#858f9b; font-size:10px; }
+.voice-quick-row button[data-active] { border-color:#11b882; background:#113027; color:#6ee7bd; }
 
 .voice-picker-overlay { position:fixed; inset:0; z-index:3000; display:grid; place-items:center; padding:24px; background:#020407c9; backdrop-filter:blur(5px); }
 .voice-picker-modal { width:min(980px,96vw); height:min(720px,92vh); display:flex; flex-direction:column; overflow:hidden; border:1px solid #303743; border-radius:15px; background:#0e1218; box-shadow:0 30px 90px #000c; }
@@ -1106,6 +1113,7 @@ select, .form-grid input, .create-options input { height:39px; padding:0 11px; c
   .voice-picker-actions { width:100%; justify-content:flex-end; }
   .voice-picker-toolbar span { display:none; }
   .selected-voice-card { min-width:0; width:100%; }
+  .voice-quick-row button { width:100%; justify-content:flex-start; }
 }
 .publish-edit-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin:12px 0; }
 .publish-edit-grid label, .publish-edit-block { display:grid; gap:6px; color:#8e94a1; font-size:10px; }

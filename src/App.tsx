@@ -45,12 +45,22 @@ const tracks = [
   { id: "picture-book", name: "绘本故事", desc: "儿童绘本与睡前故事", icon: BookOpenText },
   { id: "ecommerce", name: "电商带货", desc: "产品种草与好物推荐", icon: Sparkles },
   { id: "inspiration", name: "心灵鸡汤", desc: "情感治愈与励志感悟", icon: Sparkles },
+  { id: "family-emotion", name: "家庭情感", desc: "亲情人情与家庭关系短剧", icon: Sparkles },
   { id: "folk-tale", name: "民间故事", desc: "虚构传说与因果寓言", icon: BookOpenText },
   { id: "general", name: "通用故事", desc: "通用写实叙事内容", icon: FileText },
   { id: "food-vlog", name: "美食探店", desc: "小店烟火气与真实故事", icon: Clapperboard }
 ];
 
 const systemPromptTemplates = systemPromptTemplatesData as PromptTemplateRecord[];
+
+const FAMILY_EMOTION_VOICE_IDS = [
+  "zh_female_shuangkuaisisi_emo_v2_mars_bigtts",
+  "zh_female_zhixingnvsheng_mars_bigtts"
+];
+
+const FAMILY_EMOTION_VOICES = FAMILY_EMOTION_VOICE_IDS
+  .map(id => VOLC_VOICES.find(item => item.id === id))
+  .filter((item): item is VolcVoiceOption => Boolean(item));
 
 const STYLE_PREVIEW_ASSETS: Record<string, string> = {
   "black-white": "./style-previews/black-white-D1QqPH8b.webp",
@@ -177,7 +187,7 @@ function Tasks({ tasks, onCreate, onRefresh, title = "任务队列", desc = "查
     </div> : <div className="task-grid">{filtered.map(task =>
       <article className="task-card" key={task.id} onClick={() => setSelected(task)}>
         <div className="task-top">
-          <div className="task-check"><input type="checkbox" checked={checked.includes(task.id)} onClick={e => e.stopPropagation()} onChange={e => setChecked(current => e.target.checked ? [...current, task.id] : current.filter(id => id !== task.id))} /><span className={`status ${task.status}`}>{["running", "cancelling"].includes(task.status) && <LoaderCircle size={13} className="spin" />}{statusText(task.status, task.current_stage)}</span></div>
+          <div className="task-check"><input type="checkbox" disabled={history || ["running", "cancelling", "completed", "cancelled"].includes(task.status)} checked={checked.includes(task.id)} onClick={e => e.stopPropagation()} onChange={e => setChecked(current => e.target.checked ? [...current, task.id] : current.filter(id => id !== task.id))} /><span className={`status ${task.status}`}>{["running", "cancelling"].includes(task.status) && <LoaderCircle size={13} className="spin" />}{statusText(task.status, task.current_stage)}</span></div>
           <button className="icon-btn"><MoreHorizontal size={18} /></button>
         </div>
         <h3>{task.title || "未命名任务"}</h3>
@@ -201,7 +211,7 @@ function Tasks({ tasks, onCreate, onRefresh, title = "任务队列", desc = "查
           </button>
           {task.status === "running" && <button onClick={async e => { e.stopPropagation(); await window.storybound.cancelTask(task.id); onRefresh(); }}>取消</button>}{task.status === "cancelling" && <button disabled>等待已提交图片</button>}
           <button title="复制任务" onClick={async e => { e.stopPropagation(); await window.storybound.duplicateTask(task.id); onRefresh(); }}><Copy size={15} /></button>
-          <button className="danger" onClick={async e => { e.stopPropagation(); await window.storybound.deleteTask(task.id); onRefresh(); }}>
+          <button className="danger" disabled={["running", "cancelling"].includes(task.status)} title={["running", "cancelling"].includes(task.status) ? "请先取消任务" : "删除任务"} onClick={async e => { e.stopPropagation(); await window.storybound.deleteTask(task.id); onRefresh(); }}>
             <Trash2 size={15} />
           </button>
         </div>
@@ -666,7 +676,7 @@ function CreateTask({ onCreated, onNotice, onManageTemplates, onManageStyles }: 
   const [text, setText] = useState("");
   const trackStyles: Record<string, string> = {
     "character-story": "black-white", "health-book": "oil-painting", "culture-knowledge": "ancient-cinematic",
-    "picture-book": "pixar-3d", ecommerce: "realistic", inspiration: "cinematic",
+    "picture-book": "pixar-3d", ecommerce: "realistic", inspiration: "cinematic", "family-emotion": "cinematic",
     "folk-tale": "folk-tale-gongbi", general: "realistic", "food-vlog": "vintage-film"
   };
   const visualStyles = BUILTIN_VISUAL_STYLES.map(item => [item.id, item.name, item.tag] as const);
@@ -929,12 +939,20 @@ const [ttsProvider, setTtsProvider] = useState<"system" | "volcengine">("system"
             <Choice active={!speaker} onClick={() => setSpeaker("")} title="系统默认音色" desc="免费 · 无需 Key" />
             {systemVoices.filter(item => item.enabled).slice(0, 8).map(item => <Choice key={item.id} active={speaker === item.id} onClick={() => setSpeaker(item.id)} title={item.name} desc={item.culture || "本机音色"} />)}
             {!systemVoices.length && <p className="form-hint">没有读取到系统音色时会使用 Windows 默认声音；可在“设置 → TTS 配音”中测试。</p>}
-          </> : <div className="selected-voice-row">
-            {(() => { const selected = VOLC_VOICES.find(item => item.id === speaker) || VOLC_VOICES.find(item => item.id === DEFAULT_VOLC_VOICE_ID)!; return <>
-              <div className="selected-voice-card"><Volume2 size={17} /><div><b>{selected.name}<em>{selected.version}</em></b><small>{selected.tag} · {selected.id}</small></div></div>
-              <button type="button" className="voice-open-picker" onClick={() => setVoicePickerOpen(true)}><Search size={14} />选择音色 / 试听</button>
-            </>; })()}
-          </div>}
+          </> : <>
+            <div className="selected-voice-row">
+              {(() => { const selected = VOLC_VOICES.find(item => item.id === speaker) || VOLC_VOICES.find(item => item.id === DEFAULT_VOLC_VOICE_ID)!; return <>
+                <div className="selected-voice-card"><Volume2 size={17} /><div><b>{selected.name}<em>{selected.version}</em></b><small>{selected.tag} · {selected.id}</small></div></div>
+                <button type="button" className="voice-open-picker" onClick={() => setVoicePickerOpen(true)}><Search size={14} />选择音色 / 试听</button>
+              </>; })()}
+            </div>
+            <div className="voice-quick-row">
+              <span>家庭情感常用</span>
+              {FAMILY_EMOTION_VOICES.map(voice => <button key={voice.id} type="button" data-active={speaker === voice.id || undefined} title={voice.id} onClick={() => setSpeaker(voice.id)}>
+                <Volume2 size={14} /><b>{voice.name}</b><small>{voice.tag}</small>
+              </button>)}
+            </div>
+          </>}
         </OptionGroup>
           <OptionGroup title="配音语速"><Choice active={ttsSpeed === .85} onClick={() => setTtsSpeed(.85)} title="慢速" desc="0.85×" /><Choice active={ttsSpeed === 1} onClick={() => setTtsSpeed(1)} title="默认" desc="1.0×" /><Choice active={ttsSpeed === 1.15} onClick={() => setTtsSpeed(1.15)} title="快速" desc="1.15×" /><Choice active={ttsSpeed === 1.3} onClick={() => setTtsSpeed(1.3)} title="更快" desc="1.3×" /></OptionGroup></>}
         <OptionGroup title="背景音乐">{bgmItems.map(item => <Choice key={item.id} active={bgmId === item.id} onClick={() => setBgmId(item.id)} title={item.id === "builtin" ? "🎵 内置 BGM" : item.name} />)}<button className="choice-chip" onClick={async () => { const added = await window.storybound.addBgm(); if (added) { setBgmItems(await window.storybound.listBgm()); setBgmId(added.id); } }}><Plus size={14} />添加</button></OptionGroup>
@@ -1062,6 +1080,7 @@ function LlmSettings({ draft, setDraft }: { draft: AppConfig; setDraft: (next: A
     if (!editing?.id) return;
     const next = await window.storybound.deleteLlmProfile(editing.id);
     if (next) setDraft({ ...draft, llm: { ...draft.llm, provider: next.provider, protocol: next.protocol, base_url: next.base_url, api_key: next.api_key, model: next.model, proxy_url: next.proxy_url } });
+    else setDraft(await window.storybound.getConfig());
     setEditing(null);
     await refresh();
   };

@@ -206,9 +206,26 @@ function localSubjectPresence(text, referenceKind) {
   return "none";
 }
 
+function stripPromotionalContent(sourceText) {
+  const text = String(sourceText || "");
+  const promotionPatterns = [
+    /(?:点击|点开|打开).{0,16}(?:链接|主页|头像|橱窗|购买|下单)/i,
+    /(?:立即|马上|现在|赶快|赶紧|直接).{0,12}(?:购买|下单|抢购|领取|咨询)/i,
+    /(?:直播间|购物车|商品橱窗|橱窗).{0,16}(?:购买|下单|链接|同款|商品)/i,
+    /(?:扫码|私信|关注|点赞|转发).{0,16}(?:购买|领取|咨询|获取|支持)/i,
+    /(?:限时|限量|优惠券|包邮|福利价).{0,16}(?:购买|下单|领取|抢购)?/i
+  ];
+  return text
+    .split(/(?<=[。！？!?；;\n])/)
+    .filter(segment => !promotionPatterns.some(pattern => pattern.test(segment)))
+    .join("")
+    .trim();
+}
+
 function buildMechanicalScript(task, sourceText = task.input_text, template = {}) {
+  const effectiveSourceText = task.keep_promotion ? String(sourceText || "") : stripPromotionalContent(sourceText);
   const podcastLines = task.task_type === "podcast"
-    ? String(sourceText || "").split(/\r?\n/).map(line => line.trim()).filter(Boolean)
+    ? effectiveSourceText.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
     : [];
   const parsedPodcast = podcastLines.map(podcastSpeakerRoleLine).filter(Boolean);
   const taggedPodcastRequired = task.task_type === "podcast" && normalizeProcessingMode(task.processing_mode) !== "auto";
@@ -217,7 +234,7 @@ function buildMechanicalScript(task, sourceText = task.input_text, template = {}
   }
   const chunks = parsedPodcast.length
     ? parsedPodcast
-    : splitSourceText(sourceText, task.target_scenes).map((text, index) => ({ role: index % 2 ? "B" : "A", text }));
+    : splitSourceText(effectiveSourceText, task.target_scenes).map((text, index) => ({ role: index % 2 ? "B" : "A", text }));
   if (!chunks.length) throw new Error("原始文案为空");
   const referenceKind = normalizeReferenceKind(template.reference_kind);
   const scenes = chunks.map((item, index) => {
@@ -244,17 +261,17 @@ function buildMechanicalScript(task, sourceText = task.input_text, template = {}
     };
   });
   return {
-    title: task.title || String(sourceText || "").slice(0, 18),
-    summary: String(sourceText || "").slice(0, 80),
+    title: task.title || effectiveSourceText.slice(0, 18),
+    summary: effectiveSourceText.slice(0, 80),
     subtitle: [],
     tags: [],
     comments: [],
     narration: scenes.map(scene => scene.narration).join(task.task_type === "podcast" ? "\n" : ""),
     metadata: {
       publish: {
-        title: task.title || String(sourceText || "").slice(0, 18),
+        title: task.title || effectiveSourceText.slice(0, 18),
         subtitle: [],
-        summary: String(sourceText || "").slice(0, 80),
+        summary: effectiveSourceText.slice(0, 80),
         tags: [],
         comments: []
       },
@@ -2093,6 +2110,7 @@ async function planVideoScript({ config, task, outputDir, onStage = () => {} }) 
     summary: String(content.summary || "").slice(0, 200),
     narration: skipRewrite ? String(task.input_text || "") : String(content.narration || "").trim()
   };
+  if (!task.keep_promotion) content.narration = stripPromotionalContent(content.narration);
   if (!content.narration.trim()) throw new Error("文案处理阶段没有返回 narration");
 
   const metadataInput = {
@@ -2232,6 +2250,7 @@ async function planVideoScript({ config, task, outputDir, onStage = () => {} }) 
 module.exports = {
   planVideoScript,
   buildMechanicalScript,
+  stripPromotionalContent,
   cleanJsonText,
   resolveTemplate,
   normalizeProcessingMode,

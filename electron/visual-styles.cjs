@@ -18,6 +18,7 @@ const TRACK_DEFAULT_STYLES = Object.freeze({
   "picture-book": "pixar-3d",
   ecommerce: "realistic",
   inspiration: "cinematic",
+  "family-emotion": "cinematic",
   "folk-tale": "folk-tale-gongbi",
   general: "realistic",
   "food-vlog": "vintage-film"

@@ -18,6 +18,7 @@ const {
   canonicalStyleId, normalizeVisualStyle,
   resolveVisualStyle, styleSnapshot
 } = require("./visual-styles.cjs");
+const { taskDeletionBlocked, taskQueueEligible, clearActiveLlmConfig } = require("./task-controls.cjs");
 
 let mainWindow;
 let db;
@@ -273,8 +274,16 @@ ipcMain.handle("tasks:list", () =>
 );
 ipcMain.handle("tasks:create", (_event, input) => createTask(db, input));
 ipcMain.handle("tasks:delete", (_event, id) => {
-  db.prepare("DELETE FROM task_events WHERE task_id=?").run(id);
-  db.prepare("DELETE FROM tasks WHERE id=?").run(id);
+  const task = db.prepare("SELECT status FROM tasks WHERE id=?").get(id);
+  if (!task) return;
+  if (taskDeletionBlocked(task, activeTaskRuns.has(id))) {
+    throw new Error("任务正在运行，请先取消并等待任务停止后再删除");
+  }
+  const remove = db.transaction(taskId => {
+    db.prepare("DELETE FROM task_events WHERE task_id=?").run(taskId);
+    db.prepare("DELETE FROM tasks WHERE id=?").run(taskId);
+  });
+  remove(id);
 });
 ipcMain.handle("tasks:cancel", (_event, id) => {
   const controller = activeTaskRuns.get(id);
@@ -504,7 +513,9 @@ ipcMain.handle("profiles:list", () => {
     const now = new Date().toISOString();
     const id = crypto.randomUUID();
     const hasRemoteConfig = config.llm?.provider !== "local"
-      && ["openai", "anthropic"].includes(config.llm?.protocol);
+      && ["openai", "anthropic"].includes(config.llm?.protocol)
+      && Boolean(config.llm?.api_key && config.llm?.base_url && config.llm?.model);
+    if (!hasRemoteConfig) return rows;
     const protocol = hasRemoteConfig && config.llm?.protocol === "anthropic" ? "anthropic" : "openai";
     db.prepare(`INSERT INTO llm_profiles(id,name,provider,protocol,base_url,api_key,model,proxy_url,is_default,created_at,updated_at)
       VALUES(?,?,?,?,?,?,?,?,1,?,?)`).run(
@@ -552,11 +563,16 @@ ipcMain.handle("profiles:delete", (_event, id) => {
   const current = db.prepare("SELECT * FROM llm_profiles WHERE id=?").get(id);
   if (!current) return null;
   db.prepare("DELETE FROM llm_profiles WHERE id=?").run(id);
-  let next = db.prepare("SELECT * FROM llm_profiles ORDER BY updated_at DESC LIMIT 1").get();
+  let next = current.is_default
+    ? db.prepare("SELECT * FROM llm_profiles ORDER BY updated_at DESC LIMIT 1").get()
+    : db.prepare("SELECT * FROM llm_profiles WHERE is_default=1 LIMIT 1").get();
   if (current.is_default && next) {
     db.prepare("UPDATE llm_profiles SET is_default=1 WHERE id=?").run(next.id);
     next = db.prepare("SELECT * FROM llm_profiles WHERE id=?").get(next.id);
     applyProfile(next);
+  } else if (!next) {
+    const cleared = clearActiveLlmConfig(readConfig(), defaultConfig.llm);
+    fs.writeFileSync(configPath(), JSON.stringify(cleared, null, 2), "utf8");
   }
   return next || null;
 });
@@ -1397,10 +1413,12 @@ async function runQueuedTask(id) {
 
 async function startPersistedQueue(ids) {
   if (queueRunning) return { running: true };
-  let queueIds = Array.isArray(ids) ? ids.filter(Boolean) : [];
+  let queueIds = Array.isArray(ids) ? [...new Set(ids.filter(Boolean))] : [];
   if (!queueIds.length) {
-    queueIds = db.prepare(`SELECT id FROM tasks WHERE queue_order>0 AND status NOT IN ('completed','cancelled') ORDER BY queue_order ASC`).all().map(row => row.id);
+    queueIds = db.prepare("SELECT id FROM tasks WHERE queue_order>0 ORDER BY queue_order ASC").all().map(row => row.id);
   }
+  const loadQueueTask = db.prepare("SELECT id,status,cancel_requested FROM tasks WHERE id=?");
+  queueIds = queueIds.filter(id => taskQueueEligible(loadQueueTask.get(id), activeTaskRuns.has(id)));
   if (!queueIds.length) return { running: false, empty: true };
   const batchId = crypto.randomUUID();
   const setQueue = db.prepare("UPDATE tasks SET queue_order=?,queue_batch_id=? WHERE id=?");
@@ -1410,9 +1428,14 @@ async function startPersistedQueue(ids) {
   setImmediate(async () => {
     try {
       for (const id of queueIds) {
-        const row = db.prepare("SELECT status,cancel_requested FROM tasks WHERE id=?").get(id);
-        if (!row || row.status === "completed" || row.status === "cancelled" || row.cancel_requested) continue;
-        await runQueuedTask(id);
+        const row = loadQueueTask.get(id);
+        if (!taskQueueEligible(row, activeTaskRuns.has(id))) continue;
+        try {
+          await runQueuedTask(id);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          mainWindow?.webContents.send("task:event", { taskId: id, status: "failed", step: 0, message });
+        }
       }
     } finally {
       queueRunning = false;

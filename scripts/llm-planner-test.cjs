@@ -3,9 +3,19 @@ const fs = require("node:fs");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
-const { planVideoScript, normalizeCaptionSegments, mergeAdjacentSimilarVisualScenes } = require("../electron/llm-planner.cjs");
+const { planVideoScript, normalizeCaptionSegments, mergeAdjacentSimilarVisualScenes, stripPromotionalContent } = require("../electron/llm-planner.cjs");
 
 (async () => {
+  assert.equal(
+    stripPromotionalContent("我在橱窗里看到一盏灯，点击链接即可购买。后来我带着它走进雨夜。"),
+    "后来我带着它走进雨夜。",
+    "应删除带购买号召的推广句"
+  );
+  assert.equal(
+    stripPromotionalContent("他攒了三个月工资，终于购买了回家的车票。"),
+    "他攒了三个月工资，终于购买了回家的车票。",
+    "普通叙事中的购买行为不能被误删"
+  );
   assert.deepEqual(
     normalizeCaptionSegments("值得吗？后悔吗？", ["值得吗？后悔吗？"]),
     ["值得吗？", "后悔吗？"],
