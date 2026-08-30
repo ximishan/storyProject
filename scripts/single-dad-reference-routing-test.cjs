@@ -32,14 +32,24 @@ const defaults = applySingleDadTaskDefaults({
   targetScenes: 0,
   processingMode: "auto",
   pauseMode: "none",
-  characterConsistencyMode: "auto"
+  characterConsistencyMode: "auto",
+  bgmId: "builtin",
+  videoIntro: -1,
+  videoIntroDuration: 8,
+  coverImageMode: "titled"
 });
 assert.equal(defaults.track, "family-emotion");
 assert.equal(defaults.style, "single-dad-picturebook");
 assert.equal(defaults.targetScenes, 8);
 assert.equal(defaults.processingMode, "semi_auto");
 assert.equal(defaults.pauseMode, "script");
+assert.deepEqual(defaults.pausePoints, [4]);
 assert.equal(defaults.characterConsistencyMode, "off");
+assert.equal(defaults.bgmId, "none");
+assert.equal(defaults.videoIntro, 0);
+assert.equal(defaults.videoIntroDuration, 0);
+assert.equal(defaults.coverImageMode, "off");
+assert.equal(defaults.taskType, "story");
 
 const task = {
   track: "family-emotion",
