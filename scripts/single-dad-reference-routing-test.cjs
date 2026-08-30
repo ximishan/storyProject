@@ -3,9 +3,13 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
+const tinyPng = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZrV8AAAAASUVORK5CYII=",
+  "base64"
+);
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "storybound-single-dad-"));
-for (const file of ["DAD-001.webp", "CHILD-001.webp", "DUO-001.webp"]) {
-  fs.writeFileSync(path.join(tempDir, file), Buffer.alloc(1024, 1));
+for (const file of ["DAD-001.png", "CHILD-001.png", "DUO-001.png"]) {
+  fs.writeFileSync(path.join(tempDir, file), tinyPng);
 }
 process.env.STORYBOUND_SINGLE_DAD_ASSET_DIR = tempDir;
 
@@ -53,26 +57,27 @@ assert.deepEqual(inferSceneCharacterIds({ visual: "爸爸和女儿坐在餐桌�
 assert.deepEqual(inferSceneCharacterIds({ character_ids: ["CHILD-001"], visual: "爸爸在远处" }), ["CHILD-001"]);
 
 const dad = sceneReferencePaths({ task, scene: { use_reference: false, visual: "爸爸拿着梳子发愣" } });
-assert.equal(dad, path.join(tempDir, "DAD-001.webp"));
+assert.equal(dad, path.join(tempDir, "DAD-001.png"));
 
 const child = sceneReferencePaths({ task, scene: { use_reference: false, visual: "女儿扶了扶眼镜" } });
-assert.equal(child, path.join(tempDir, "CHILD-001.webp"));
+assert.equal(child, path.join(tempDir, "CHILD-001.png"));
 
 const duo = sceneReferencePaths({ task, scene: { use_reference: true, visual: "爸爸和女儿面对面说话" } }).split(";");
 assert.deepEqual(duo, [
-  path.join(tempDir, "DAD-001.webp"),
-  path.join(tempDir, "CHILD-001.webp"),
-  path.join(tempDir, "DUO-001.webp")
+  path.join(tempDir, "DAD-001.png"),
+  path.join(tempDir, "CHILD-001.png"),
+  path.join(tempDir, "DUO-001.png")
 ]);
 
 const explicitChild = sceneReferencePaths({
   task,
   scene: { use_reference: true, character_ids: ["CHILD-001"], visual: "爸爸不在镜头里，女儿看着镜子" }
 });
-assert.equal(explicitChild, path.join(tempDir, "CHILD-001.webp"));
+assert.equal(explicitChild, path.join(tempDir, "CHILD-001.png"));
 
 assert.equal(sceneReferencePaths({ task, scene: { use_reference: true, visual: "清晨窗外的天空" } }), "");
 assert.equal(coverReferencePaths(task).split(";").length, 3);
+assert.ok(coverReferencePaths(task).split(";").every(item => item.endsWith(".png")));
 
 fs.rmSync(tempDir, { recursive: true, force: true });
 console.log("single-dad-reference-routing-test: passed");
