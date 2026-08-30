@@ -14,6 +14,7 @@ for (const file of ["DAD-001.png", "CHILD-001.png", "DUO-001.png"]) {
 process.env.STORYBOUND_SINGLE_DAD_ASSET_DIR = tempDir;
 
 const {
+  isSingleDadStoryTask,
   applySingleDadTaskDefaults,
   inferSceneCharacterIds,
   singleDadSceneReferencePaths,
@@ -25,31 +26,41 @@ const {
   coverReferencePaths
 } = require("../electron/reference-routing.cjs");
 
+assert.equal(isSingleDadStoryTask({ style: "single-dad-picturebook" }), true);
+assert.equal(isSingleDadStoryTask({ style: "cinematic", promptTemplateId: "family-emotion" }), false);
+
 const defaults = applySingleDadTaskDefaults({
-  track: "family-emotion",
-  promptTemplateId: "single-dad-story",
-  style: "cinematic",
+  track: "health-book",
+  promptTemplateId: "health-book",
+  style: "single-dad-picturebook",
   targetScenes: 0,
-  processingMode: "auto",
+  processingMode: "semi_auto",
   pauseMode: "none",
   characterConsistencyMode: "auto",
+  materialSource: "network",
   bgmId: "builtin",
   videoIntro: -1,
   videoIntroDuration: 8,
-  coverImageMode: "titled"
+  coverImageMode: "titled",
+  taskType: "podcast"
 });
 assert.equal(defaults.track, "family-emotion");
 assert.equal(defaults.style, "single-dad-picturebook");
+assert.equal(defaults.promptTemplateId, "single-dad-story");
+assert.equal(defaults.materialSource, "ai");
 assert.equal(defaults.targetScenes, 8);
-assert.equal(defaults.processingMode, "semi_auto");
+assert.equal(defaults.rewriteIntensity, "standard");
+assert.equal(defaults.processingMode, "auto");
 assert.equal(defaults.pauseMode, "script");
 assert.deepEqual(defaults.pausePoints, [4]);
 assert.equal(defaults.characterConsistencyMode, "off");
+assert.equal(defaults.referenceImagePath, "");
 assert.equal(defaults.bgmId, "none");
 assert.equal(defaults.videoIntro, 0);
 assert.equal(defaults.videoIntroDuration, 0);
 assert.equal(defaults.coverImageMode, "off");
 assert.equal(defaults.taskType, "story");
+assert.equal(defaults.scriptFormat, "narration");
 
 const task = {
   track: "family-emotion",
