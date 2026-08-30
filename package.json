@@ -44,7 +44,7 @@
     "test:claude-storyboard": "node scripts/claude-storyboard-validation-test.cjs",
     "test:claude-boundary-recovery": "node scripts/claude-boundary-recovery-test.cjs",
     "test:semiauto-locked-text": "node scripts/semiauto-locked-text-test.cjs",
-    "test:single-dad": "node scripts/single-dad-reference-routing-test.cjs"
+    "test:single-dad": "node scripts/single-dad-reference-routing-test.cjs && node scripts/apimart-image-test.cjs"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.4.1",
