@@ -1,5 +1,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
+const os = require("node:os");
+const { spawnSync } = require("node:child_process");
 
 const SINGLE_DAD_TEMPLATE_ID = "single-dad-story";
 const SINGLE_DAD_STYLE_ID = "single-dad-picturebook";
@@ -44,11 +46,70 @@ function singleDadAssetDir() {
   return development;
 }
 
+function isReadablePng(filePath) {
+  if (!filePath || !fs.existsSync(filePath)) return false;
+  try {
+    const buffer = fs.readFileSync(filePath);
+    return buffer.length > 8
+      && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]));
+  } catch {
+    return false;
+  }
+}
+
+function singleDadFfmpegPath() {
+  const candidates = [];
+  if (typeof process.resourcesPath === "string") {
+    candidates.push(path.join(process.resourcesPath, "bin", "ffmpeg.exe"));
+    candidates.push(path.join(process.resourcesPath, "ffmpeg.exe"));
+  }
+  candidates.push(path.join(__dirname, "..", "resources", "bin", "ffmpeg.exe"));
+  const existing = candidates.find(candidate => fs.existsSync(candidate));
+  return existing || "ffmpeg";
+}
+
+function singleDadPngCacheDir() {
+  const dir = path.join(os.tmpdir(), "storybound-single-dad-story", "png-v1");
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+function ensurePngAsset(characterId) {
+  const sourceFile = ASSET_FILES[characterId];
+  if (!sourceFile) return "";
+
+  const assetDir = singleDadAssetDir();
+  const directPng = path.join(assetDir, `${characterId}.png`);
+  if (isReadablePng(directPng)) return directPng;
+
+  const sourcePath = path.join(assetDir, sourceFile);
+  if (!fs.existsSync(sourcePath)) return "";
+
+  const sourceStat = fs.statSync(sourcePath);
+  const cacheName = `${characterId}-${sourceStat.size}-${Math.trunc(sourceStat.mtimeMs)}.png`;
+  const cachePath = path.join(singleDadPngCacheDir(), cacheName);
+  if (isReadablePng(cachePath)) return cachePath;
+
+  const result = spawnSync(singleDadFfmpegPath(), [
+    "-hide_banner", "-loglevel", "error", "-y",
+    "-i", sourcePath,
+    "-frames:v", "1",
+    cachePath
+  ], {
+    windowsHide: true,
+    encoding: "utf8"
+  });
+
+  if (result.error || result.status !== 0 || !isReadablePng(cachePath)) {
+    try { if (fs.existsSync(cachePath)) fs.unlinkSync(cachePath); } catch {}
+    const detail = String(result.error?.message || result.stderr || result.stdout || "未知错误").trim();
+    throw new Error(`父女角色参考图转 PNG 失败（${characterId}）：${detail || "FFmpeg 未生成有效 PNG"}`);
+  }
+  return cachePath;
+}
+
 function assetPath(characterId) {
-  const file = ASSET_FILES[characterId];
-  if (!file) return "";
-  const candidate = path.join(singleDadAssetDir(), file);
-  return fs.existsSync(candidate) ? candidate : "";
+  return ensurePngAsset(characterId);
 }
 
 function normalizeCharacterIds(value) {
