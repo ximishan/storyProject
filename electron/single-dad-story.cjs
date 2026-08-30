@@ -36,7 +36,7 @@ function applySingleDadTaskDefaults(input) {
     rewriteIntensity: "standard",
     narrativePov: "original",
     keepPromotion: false,
-    processingMode: "semi_auto",
+    processingMode: "auto",
     pauseMode: "script",
     pausePoints: [4],
     characterConsistencyMode: "off",
