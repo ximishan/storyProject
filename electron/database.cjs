@@ -1,6 +1,7 @@
 const Database = require("better-sqlite3");
 const crypto = require("node:crypto");
 const { canonicalStyleId, resolveVisualStyle, styleSnapshot } = require("./visual-styles.cjs");
+const { seedSingleDadStory } = require("./single-dad-story.cjs");
 
 const schema = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -129,6 +130,7 @@ function openDatabase(path) {
   seedTemplates(db);
   refreshBuiltinTemplates(db);
   seedCoverTemplates(db);
+  seedSingleDadStory(db);
   return db;
 }
 
@@ -187,16 +189,13 @@ function migrateTasks(db) {
   }
 }
 
-
 function normalizeLegacyTaskValues(db) {
   db.prepare("UPDATE tasks SET processing_mode='semi_auto' WHERE processing_mode='semi'").run();
   db.prepare("UPDATE tasks SET cover_image_mode='titled' WHERE cover_image_mode='title'").run();
   db.prepare("UPDATE tasks SET cover_image_mode='plain' WHERE cover_image_mode='blank'").run();
-  // Earlier rebuilds used three IDs that do not exist in the original 1.7.0 registry.
   db.prepare("UPDATE tasks SET style='vintage-film' WHERE style='retro-film'").run();
   db.prepare("UPDATE tasks SET style='illustration' WHERE style='magazine'").run();
   db.prepare("UPDATE tasks SET style='folk-tale-gongbi' WHERE style='folk-illustration'").run();
-  // 旧版本没有把 TTS provider 写入任务，火山音色任务会被数据库默认值误标为 system。
   db.prepare("UPDATE tasks SET tts_provider='volcengine' WHERE speaker LIKE '%_bigtts%' AND COALESCE(tts_provider,'system')='system'").run();
   db.prepare("UPDATE user_prompt_templates SET style_id='vintage-film' WHERE style_id IN ('retro-film','food-cinematic')").run();
   db.prepare("UPDATE user_prompt_templates SET style_id='illustration' WHERE style_id='magazine'").run();
@@ -271,10 +270,7 @@ function seedTemplates(db) {
   `);
   const tx = db.transaction(() => {
     for (const { id, name, config } of builtinTemplateRows()) {
-      insert.run({
-        id, name, now,
-        config: JSON.stringify(config)
-      });
+      insert.run({ id, name, now, config: JSON.stringify(config) });
     }
   });
   tx();
