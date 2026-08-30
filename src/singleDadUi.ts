@@ -74,7 +74,8 @@ function applySingleDadUi() {
   root.dataset.singleDadMode = enabled ? "true" : "false";
 
   // 这两项必须同步到 React 状态，而不只是隐藏 UI：
-  // 否则旧的“播客”校验或“全自动”提交路径仍可能在点击生成时生效。
+  // “旁白视频”避免播客输入校验；“半自动”只用于让创建按钮先走 prepareTask。
+  // 真正保存到数据库的父女任务会在后端改回 processing_mode=auto，故事仍会正常整理改写。
   if (enabled) {
     chooseOption(root, "视频形态", "旁白视频");
     chooseOption(root, "处理模式", "半自动");
@@ -117,6 +118,13 @@ function applySingleDadUi() {
     const title = sectionTitle(section);
     const hide = enabled && (title === "配音" || title === "封面海报");
     setVisible(section, !hide);
+  });
+
+  // “半自动锁定原文”等是视频工作流提示，父女图文模式不展示。
+  root.querySelectorAll<HTMLElement>(".mode-note, .podcast-warning").forEach(item => setVisible(item, !enabled));
+  root.querySelectorAll<HTMLElement>(".form-hint").forEach(item => {
+    const irrelevant = /(动态视频|RunningHub|九宫格|主角档案生成)/i.test(textOf(item));
+    setVisible(item, !enabled || !irrelevant);
   });
 
   root.querySelectorAll<HTMLElement>(".reference-row").forEach(row => setVisible(row, !enabled));
