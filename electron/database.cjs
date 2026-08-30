@@ -1,7 +1,7 @@
 const Database = require("better-sqlite3");
 const crypto = require("node:crypto");
 const { canonicalStyleId, resolveVisualStyle, styleSnapshot } = require("./visual-styles.cjs");
-const { seedSingleDadStory } = require("./single-dad-story.cjs");
+const { seedSingleDadStory, applySingleDadTaskDefaults } = require("./single-dad-story.cjs");
 
 const schema = `
 CREATE TABLE IF NOT EXISTS tasks (
@@ -241,7 +241,7 @@ function builtinTemplateRows() {
         title: { visible: true, x: 0, y: 0.8357783211083945, fontSize: 20, color: "#FFDE00", alpha: 1, bold: true, underline: false, align: 1, letterSpacing: 0, lineSpacing: 0, border: { color: "#000000", width: 40, alpha: 1 } },
         subtitle: { visible: true, x: 0, y: 0.5953125, fontSize: 12, color: "#FFFFFF", alpha: 1, bold: false, underline: false, align: 1, letterSpacing: 2, lineSpacing: 4, border: { color: "#000000", width: 40, alpha: 1 } },
         caption: { visible: true, x: 0, y: -0.5572916666666666, fontSize: 12, color: "#FFDE00", alpha: 1, bold: false, underline: false, align: 1, letterSpacing: 0, lineSpacing: 0, border: { color: "#000000", width: 0, alpha: 0 }, maxCharsPerLine: 12, background: { color: "#000000", alpha: 0.5, roundRadius: 0.3 } },
-        disclaimer: { visible: true, x: 0, y: -0.8141628912685337, fontSize: 8, color: "#FFFFFF", alpha: 1, bold: false, underline: false, align: 1, letterSpacing: 0, lineSpacing: 5, border: { color: "#000000", width: 40, alpha: 1 }, text: "图片由AI生成与网络下载\n科普视频，无不良引导" },
+        disclaimer: { visible: true, x: 0, y: -0.8141628912685337, fontSize: 8, color: "#FFFFFF", alpha: 1, bold: false, underline: false, align: 1, letterSpacing: 2, lineSpacing: 4, border: { color: "#000000", width: 40, alpha: 1 }, text: "图片由AI生成与网络下载\n科普视频，无不良引导" },
         audio: { narrationVolume: 10, bgmVolume: 3, bgmFadeOutMs: 2000, defaultBgmId: "" }
       }
     },
@@ -298,6 +298,7 @@ function seedCoverTemplates(db) {
 }
 
 function createTask(db, input) {
+  input = applySingleDadTaskDefaults(input);
   const id = crypto.randomUUID();
   const rawStyle = String(input.style || "").trim();
   if (!rawStyle) throw new Error("创建任务时没有收到画面风格。为避免静默回退成黑白摄影，请重新选择风格后再创建任务。");
