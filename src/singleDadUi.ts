@@ -12,10 +12,27 @@ function sectionTitle(section: Element) {
   return textOf(section.querySelector(":scope > header h2"));
 }
 
+function setText(element: HTMLElement | null, value: string) {
+  if (element && element.textContent !== value) element.textContent = value;
+}
+
 function setVisible(element: HTMLElement | null, visible: boolean) {
   if (!element) return;
   const next = visible ? "" : "none";
   if (element.style.display !== next) element.style.display = next;
+}
+
+function findOptionGroup(root: HTMLElement, title: string) {
+  return Array.from(root.querySelectorAll<HTMLElement>(".option-group"))
+    .find(group => optionGroupTitle(group) === title);
+}
+
+function chooseOption(root: HTMLElement, groupTitle: string, optionText: string) {
+  const group = findOptionGroup(root, groupTitle);
+  if (!group) return;
+  const button = Array.from(group.querySelectorAll<HTMLButtonElement>("button"))
+    .find(item => textOf(item).startsWith(optionText));
+  if (button && !button.hasAttribute("data-active")) button.click();
 }
 
 function ensureModeNote(root: HTMLElement, enabled: boolean) {
@@ -56,17 +73,25 @@ function applySingleDadUi() {
   const enabled = Boolean(activeStyle);
   root.dataset.singleDadMode = enabled ? "true" : "false";
 
+  // 这两项必须同步到 React 状态，而不只是隐藏 UI：
+  // 否则旧的“播客”校验或“全自动”提交路径仍可能在点击生成时生效。
+  if (enabled) {
+    chooseOption(root, "视频形态", "旁白视频");
+    chooseOption(root, "处理模式", "半自动");
+  }
+
   const headingTitle = root.querySelector<HTMLElement>(".create-page-heading h1");
   const headingDesc = root.querySelector<HTMLElement>(".create-page-heading p");
-  if (headingTitle) headingTitle.textContent = enabled ? "创建父女日常图文" : "创建视频任务";
-  if (headingDesc) headingDesc.textContent = enabled
+  setText(headingTitle, enabled ? "创建父女日常图文" : "创建视频任务");
+  setText(headingDesc, enabled
     ? "记录一件真实小事，生成故事、分镜和连续图片"
-    : "粘贴一段人物故事，几分钟后在剪映里打开";
+    : "粘贴一段人物故事，几分钟后在剪映里打开");
 
   const textarea = root.querySelector<HTMLTextAreaElement>(".script-field textarea");
-  if (textarea) textarea.placeholder = enabled
+  const placeholder = enabled
     ? "写下今天真实发生的一件小事、几句对话或大概经过。AI 会整理成父女日常故事并拆成连续图片。"
     : "粘贴一段人物故事原始文案，AI 会自动改写为口播版、拆分分镜、配图配音。";
+  if (textarea && textarea.placeholder !== placeholder) textarea.placeholder = placeholder;
 
   const hiddenGroupTitles = new Set([
     "视频形态",
@@ -82,9 +107,9 @@ function applySingleDadUi() {
     const title = optionGroupTitle(group);
     setVisible(group, !enabled || !hiddenGroupTitles.has(title));
 
-    if (title === "草稿模板") {
+    if (title === "草稿模板" || title === "图片比例预设") {
       const label = group.querySelector<HTMLElement>(":scope > .option-label b");
-      if (label) label.textContent = enabled ? "图片比例预设" : "草稿模板";
+      setText(label, enabled ? "图片比例预设" : "草稿模板");
     }
   });
 
@@ -96,15 +121,6 @@ function applySingleDadUi() {
 
   root.querySelectorAll<HTMLElement>(".reference-row").forEach(row => setVisible(row, !enabled));
   setVisible(root.querySelector<HTMLElement>(".advanced-block"), !enabled);
-
-  const submitBar = root.querySelector<HTMLElement>(".create-submit-bar");
-  if (submitBar) {
-    const modelText = submitBar.querySelector<HTMLElement>(":scope > div:first-child small");
-    if (enabled && modelText && !textOf(modelText).includes("至少")) {
-      modelText.textContent = "父女日常图文 · 先生成故事与分镜";
-    }
-  }
-
   ensureModeNote(root, enabled);
 }
 
