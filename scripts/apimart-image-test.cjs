@@ -79,6 +79,8 @@ const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR
     };
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'storybound-apimart-test-'));
     const destination = path.join(dir, 'first.png');
+    const referencePath = path.join(dir, 'reference.png');
+    fs.writeFileSync(referencePath, png);
     let cancelRequested = false;
     let remote = null;
     const result = await generateSceneImage({
@@ -88,6 +90,7 @@ const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR
       destination,
       ratio: '9:16',
       materialSource: 'ai',
+      referenceImagePath: referencePath,
       shouldStopSubmitting: () => cancelRequested,
       onRemoteTask: value => {
         remote = value;
@@ -102,7 +105,10 @@ const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR
     assert.equal(submittedBodies[0].n, 1);
     assert.equal(submittedBodies[0].size, '9:16');
     assert.equal(submittedBodies[0].resolution, '2k');
-    assert.equal(submittedBodies[0].official_fallback, true);
+    assert.equal(submittedBodies[0].official_fallback, false);
+    assert.ok(Array.isArray(submittedBodies[0].image_urls));
+    assert.equal(submittedBodies[0].image_urls.length, 1);
+    assert.match(submittedBodies[0].image_urls[0], /^data:image\/png;base64,/);
 
     // A task that has not been submitted must be blocked after cancellation.
     const beforeBlockedPost = postCount;
@@ -140,6 +146,7 @@ const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR
     assert.equal(resumed.taskId, 'task-1');
     assert.ok(fs.existsSync(path.join(dir, 'resume.png')));
 
+    fs.rmSync(dir, { recursive: true, force: true });
     console.log('apimart-image-test: ok');
   } finally {
     server.close();
