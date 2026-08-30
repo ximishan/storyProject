@@ -1,3 +1,10 @@
+const {
+  isSingleDadStoryTask,
+  singleDadSceneReferencePaths,
+  singleDadCoverReferencePaths,
+  singleDadReferenceAvailable
+} = require("./single-dad-story.cjs");
+
 const PRODUCT_REFERENCE_TRACKS = new Set([
   "health-book",
   "culture-knowledge",
@@ -31,6 +38,10 @@ function productReferencePaths(task) {
 
 function taskReferenceAvailable(task, referenceKind = "auto") {
   const kind = String(referenceKind || "auto").toLowerCase();
+  if (isSingleDadStoryTask(task) && singleDadReferenceAvailable(task)) {
+    if (kind === "none" || kind === "product") return false;
+    return true;
+  }
   const characterAvailable = Boolean(
     task?.reference_image_path
     || task?.character_consistency_mode === "auto"
@@ -43,6 +54,14 @@ function taskReferenceAvailable(task, referenceKind = "auto") {
 }
 
 function sceneReferencePaths({ task, scene, generatedCharacterPaths = "" }) {
+  // 父女日常使用项目内置的长期人物母版。即使模型误把 use_reference
+  // 设成 false，只要镜头文本能识别出爸爸/女儿，也仍然强制使用对应母版。
+  if (isSingleDadStoryTask(task)) {
+    const fixed = singleDadSceneReferencePaths(task, scene);
+    if (fixed) return fixed;
+    return "";
+  }
+
   if (!scene?.use_reference) return "";
   const subject = String(scene?.subject_presence || "none").toLowerCase();
   const characterPaths = characterReferencePaths(task, generatedCharacterPaths);
@@ -60,6 +79,7 @@ function sceneReferencePaths({ task, scene, generatedCharacterPaths = "" }) {
 }
 
 function coverReferencePaths(task, referenceKind = "auto") {
+  if (isSingleDadStoryTask(task)) return singleDadCoverReferencePaths(task);
   const kind = String(referenceKind || "auto").toLowerCase();
   const characterPaths = characterReferencePaths(task);
   const productPaths = productReferencePaths(task);
