@@ -10,6 +10,7 @@ for (const file of ["DAD-001.webp", "CHILD-001.webp", "DUO-001.webp"]) {
 process.env.STORYBOUND_SINGLE_DAD_ASSET_DIR = tempDir;
 
 const {
+  applySingleDadTaskDefaults,
   inferSceneCharacterIds,
   singleDadSceneReferencePaths,
   singleDadReferenceAvailable
@@ -19,6 +20,22 @@ const {
   sceneReferencePaths,
   coverReferencePaths
 } = require("../electron/reference-routing.cjs");
+
+const defaults = applySingleDadTaskDefaults({
+  track: "family-emotion",
+  promptTemplateId: "single-dad-story",
+  style: "cinematic",
+  targetScenes: 0,
+  processingMode: "auto",
+  pauseMode: "none",
+  characterConsistencyMode: "auto"
+});
+assert.equal(defaults.track, "family-emotion");
+assert.equal(defaults.style, "single-dad-picturebook");
+assert.equal(defaults.targetScenes, 8);
+assert.equal(defaults.processingMode, "semi_auto");
+assert.equal(defaults.pauseMode, "script");
+assert.equal(defaults.characterConsistencyMode, "off");
 
 const task = {
   track: "family-emotion",
@@ -33,7 +50,7 @@ assert.equal(taskReferenceAvailable(task, "character"), true);
 assert.deepEqual(inferSceneCharacterIds({ visual: "爸爸站在厨房门口" }), ["DAD-001"]);
 assert.deepEqual(inferSceneCharacterIds({ visual: "女儿坐在餐桌旁写作业" }), ["CHILD-001"]);
 assert.deepEqual(inferSceneCharacterIds({ visual: "爸爸和女儿坐在餐桌旁说话" }), ["DAD-001", "CHILD-001"]);
-assert.deepEqual(inferSceneCharacterIds({ character_ids: ["CHILD-001"] , visual: "爸爸在远处" }), ["CHILD-001"]);
+assert.deepEqual(inferSceneCharacterIds({ character_ids: ["CHILD-001"], visual: "爸爸在远处" }), ["CHILD-001"]);
 
 const dad = sceneReferencePaths({ task, scene: { use_reference: false, visual: "爸爸拿着梳子发愣" } });
 assert.equal(dad, path.join(tempDir, "DAD-001.webp"));
