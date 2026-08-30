@@ -43,7 +43,8 @@
     "test:scene-density": "node scripts/scene-density-test.cjs",
     "test:claude-storyboard": "node scripts/claude-storyboard-validation-test.cjs",
     "test:claude-boundary-recovery": "node scripts/claude-boundary-recovery-test.cjs",
-    "test:semiauto-locked-text": "node scripts/semiauto-locked-text-test.cjs"
+    "test:semiauto-locked-text": "node scripts/semiauto-locked-text-test.cjs",
+    "test:single-dad": "node scripts/single-dad-reference-routing-test.cjs"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.4.1",
