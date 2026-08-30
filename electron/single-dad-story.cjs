@@ -31,7 +31,13 @@ function applySingleDadTaskDefaults(input) {
     targetScenes: Number(input?.targetScenes || 0) > 0 ? Number(input.targetScenes) : 8,
     processingMode: "semi_auto",
     pauseMode: "script",
-    characterConsistencyMode: "off"
+    pausePoints: [4],
+    characterConsistencyMode: "off",
+    bgmId: "none",
+    videoIntro: 0,
+    videoIntroDuration: 0,
+    coverImageMode: "off",
+    taskType: "story"
   };
 }
 
