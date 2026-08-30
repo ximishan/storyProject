@@ -15,9 +15,11 @@ const ASSET_FILES = Object.freeze({
 
 function isSingleDadStoryTask(task) {
   const track = String(task?.track || "").trim();
+  const style = String(task?.style || task?.style_config?.id || "").trim();
   const templateId = String(task?.prompt_template_id || task?.promptTemplateId || task?.prompt_template?.id || "").trim();
   const templateName = String(task?.prompt_template?.name || "").trim();
   return track === SINGLE_DAD_TEMPLATE_ID
+    || style === SINGLE_DAD_STYLE_ID
     || templateId === SINGLE_DAD_TEMPLATE_ID
     || templateName === SINGLE_DAD_TEMPLATE_NAME;
 }
@@ -28,16 +30,24 @@ function applySingleDadTaskDefaults(input) {
     ...input,
     track: "family-emotion",
     style: SINGLE_DAD_STYLE_ID,
+    promptTemplateId: SINGLE_DAD_TEMPLATE_ID,
+    materialSource: "ai",
     targetScenes: Number(input?.targetScenes || 0) > 0 ? Number(input.targetScenes) : 8,
+    rewriteIntensity: "standard",
+    narrativePov: "original",
+    keepPromotion: false,
     processingMode: "semi_auto",
     pauseMode: "script",
     pausePoints: [4],
     characterConsistencyMode: "off",
+    referenceImagePath: "",
+    productReferenceImagePath: "",
     bgmId: "none",
     videoIntro: 0,
     videoIntroDuration: 0,
     coverImageMode: "off",
-    taskType: "story"
+    taskType: "story",
+    scriptFormat: "narration"
   };
 }
 
