@@ -13,11 +13,24 @@ const ASSET_FILES = Object.freeze({
 
 function isSingleDadStoryTask(task) {
   const track = String(task?.track || "").trim();
-  const templateId = String(task?.prompt_template_id || task?.prompt_template?.id || "").trim();
+  const templateId = String(task?.prompt_template_id || task?.promptTemplateId || task?.prompt_template?.id || "").trim();
   const templateName = String(task?.prompt_template?.name || "").trim();
   return track === SINGLE_DAD_TEMPLATE_ID
     || templateId === SINGLE_DAD_TEMPLATE_ID
     || templateName === SINGLE_DAD_TEMPLATE_NAME;
+}
+
+function applySingleDadTaskDefaults(input) {
+  if (!isSingleDadStoryTask(input)) return input;
+  return {
+    ...input,
+    track: "family-emotion",
+    style: SINGLE_DAD_STYLE_ID,
+    targetScenes: Number(input?.targetScenes || 0) > 0 ? Number(input.targetScenes) : 8,
+    processingMode: "semi_auto",
+    pauseMode: "script",
+    characterConsistencyMode: "off"
+  };
 }
 
 function singleDadAssetDir() {
@@ -144,6 +157,7 @@ module.exports = {
   SINGLE_DAD_STYLE_ID,
   SINGLE_DAD_TEMPLATE_NAME,
   isSingleDadStoryTask,
+  applySingleDadTaskDefaults,
   singleDadAssetDir,
   normalizeCharacterIds,
   inferSceneCharacterIds,
